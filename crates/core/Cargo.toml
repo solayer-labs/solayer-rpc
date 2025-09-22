@@ -1,0 +1,62 @@
+[package]
+name = "infinisvm-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bincode.workspace = true
+async-channel.workspace = true
+crossbeam-channel.workspace = true
+bytes.workspace = true
+eyre.workspace = true
+thiserror.workspace = true
+infinisvm-db.workspace = true
+infinisvm-logger = { workspace = true }
+infinisvm-sync = { workspace = true }
+infinisvm-types = { workspace = true }
+rayon = "1.10.0"
+solana-hash.workspace = true
+solana-program-runtime.workspace = true
+solana-pubkey.workspace = true
+solana-runtime.workspace = true
+solana-sdk.workspace = true
+solana-svm.workspace = true
+solana-compute-budget.workspace = true
+solana-bpf-loader-program.workspace = true
+solana-builtins.workspace = true
+agave-feature-set.workspace = true
+
+rocksdb.workspace = true
+
+serde.workspace = true
+tokio.workspace = true
+rand.workspace = true
+hashbrown.workspace = true
+solana-transaction-status-client-types.workspace = true
+min-max-heap = "1.3.0"
+itertools = "0.14.0"
+ahash = "0.8.11"
+dashmap = { workspace = true }
+core_affinity = "0.8.3"
+metrics = { workspace = true }
+static_assertions = "1.1.0"
+sha2 = "0.10.8"
+borsh = "0.10.3"
+async-trait.workspace = true
+
+quinn.workspace = true
+rustls.workspace = true
+rcgen.workspace = true
+paste.workspace = true
+jsonrpsee.workspace = true
+solana-perf.workspace = true
+
+[dev-dependencies]
+tempfile = "3.10"
+
+[features]
+no_bind_cpu = []
+track_memory = []
+no_index = []
+in_memory_db = []
+debug_merger = []

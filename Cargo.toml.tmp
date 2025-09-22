@@ -1,0 +1,120 @@
+[workspace]
+members = [
+
+    "bins/rpc-v2",
+
+    # instead of using wildcard, list independently
+    "crates/db",
+    "crates/core",
+    "crates/indexer",
+    "crates/jsonrpc",
+    "crates/logger",
+    "crates/sequencer",
+    "crates/types",
+    "crates/sync",
+]
+resolver = "2"
+
+[workspace.dependencies]
+clap = { version = "4.5.35", features = ["derive"] }
+ctrlc = { version = "3.4.7", features = ["termination"] }
+tokio = { version = "1.36", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_derive = "1.0"
+semver = "1.0.23"
+thiserror = "1.0"
+tracing = "0.1"
+eyre = "0.6"
+rocksdb = "=0.23.0"
+bincode = "1.3.3"
+crossbeam-channel = "0.5.14"
+async-channel = "2.3.1"
+async-trait = "0.1.85"
+solana-pubkey = { version = "=2.2.1", default-features = false }
+solana-sdk = "=2.2.2"
+solana-program-runtime = { git = "ssh://git@github.com/solayer-labs/agave.git", rev = "6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a" }
+solana-svm = { git = "ssh://git@github.com/solayer-labs/agave.git", rev = "6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a" }
+solana-svm-transaction = { git = "ssh://git@github.com/solayer-labs/agave.git", rev = "6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a" }
+solana-bpf-loader-program = { git = "ssh://git@github.com/solayer-labs/agave.git", rev = "6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a" }
+solana-compute-budget = { git = "ssh://git@github.com/solayer-labs/agave.git", rev = "6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a" }
+solana-compute-budget-instruction = { git = "ssh://git@github.com/solayer-labs/agave.git", rev = "6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a" }
+solana-runtime = { git = "ssh://git@github.com/solayer-labs/agave.git", rev = "6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a" }
+solana-runtime-transaction = { git = "ssh://git@github.com/solayer-labs/agave.git", rev = "6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a" }
+solana-hash = "=2.2.1"
+solana-system-program = { git = "ssh://git@github.com/solayer-labs/agave.git", rev = "6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a" }
+solana-transaction-status = { git = "ssh://git@github.com/solayer-labs/agave.git", rev = "6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a" }
+solana-transaction-status-client-types = { git = "ssh://git@github.com/solayer-labs/agave.git", rev = "6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a" }
+solana-account-decoder-client-types = { git = "ssh://git@github.com/solayer-labs/agave.git", rev = "6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a" }
+solana-account-decoder = { git = "ssh://git@github.com/solayer-labs/agave.git", rev = "6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a" }
+solana-builtins = { git = "ssh://git@github.com/solayer-labs/agave.git", rev = "6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a" }
+agave-feature-set = { git = "ssh://git@github.com/solayer-labs/agave.git", rev = "6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a" }
+solana-transaction-context = { git = "ssh://git@github.com/solayer-labs/agave.git", rev = "6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a" }
+solana-streamer = { git = "ssh://git@github.com/solayer-labs/agave.git", rev = "6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a" }
+solana-perf = { git = "ssh://git@github.com/solayer-labs/agave.git", rev = "6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a" }
+
+axum = "0.8.3"
+
+klickhouse = { version = "0.13", features = ["default", "bb8"] }
+jsonrpsee = { version = "0.24.7", features = [
+    "macros",
+    "server",
+    "ws-client",
+    "client-ws-transport-tls",
+] }
+hex = "0.4.3"
+bs58 = "0.4.0"
+base64 = "0.22.1"
+zstd = "0.13.2"
+metrics = "0.24"
+reqwest = { version = "0.12.15", features = ["json", "gzip"] }
+
+infinisvm-db = { path = "./crates/db" }
+infinisvm-jsonrpc = { path = "./crates/jsonrpc" }
+infinisvm-indexer = { path = "./crates/indexer" }
+infinisvm-sequencer = { path = "./crates/sequencer" }
+infinisvm-core = { path = "./crates/core" }
+infinisvm-logger = { path = "./crates/logger" }
+infinisvm-types = { path = "crates/types" }
+infinisvm-sync = { path = "crates/sync" }
+
+tokio-postgres = { version = "0.7.13" }
+
+spl-token = "=6.0.0"
+spl-token-2022 = "=4.0.0"
+hashbrown = "0.14.5"
+tikv-jemallocator = "0.6"
+
+tonic = { version = "0.13.1", features = ["transport", "tls-webpki-roots"] }
+prost = "0.13.1"
+tonic-build = "0.13.1"
+tokio-stream = "0.1.17"
+
+quinn = { version = "0.11.7" }
+rustls = { version = "0.23.0" }
+rcgen = { version = "0.13.0" }
+bytes = "1.10.0"
+metrics-exporter-prometheus = { version = "0.16" }
+prometheus = "0.13.4"
+dashmap = { version = "6.1.0" }
+paste = "1.0.14"
+rand = "0.8.5"
+rayon = "1.10.0"
+indicatif = "0.18.0"
+futures-util = "0.3.31"
+tower-http = { version = "0.6.2", features = [
+    "cors",
+    "compression-full",
+    "sensitive-headers",
+    "trace",
+    "timeout",
+] }
+hyper = "1.6.0"
+pyroscope = { version = "0.5.8", default-features = true }
+pyroscope_pprofrs = { version = "0.2.10" }
+
+[profile.release]
+debug = true
+
+[patch.crates-io]
+hashbrown = { path = "./patches/hashbrown-0.14.5" }

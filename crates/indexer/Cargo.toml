@@ -1,0 +1,50 @@
+[package]
+name = "infinisvm-indexer"
+version = "0.1.0"
+edition = "2021"
+
+
+[dependencies]
+clap = { workspace = true }
+tokio = { workspace = true }
+solana-sdk = { workspace = true }
+eyre = { workspace = true }
+rocksdb = { workspace = true }
+bincode = { workspace = true }
+crossbeam-channel = { workspace = true }
+infinisvm-db = { workspace = true }
+infinisvm-types = { workspace = true }
+spl-token = { workspace = true }
+spl-token-2022 = { workspace = true }
+klickhouse = { workspace = true }
+hex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+solana-transaction-status-client-types = { workspace = true }
+hashbrown.workspace = true
+infinisvm-core = { workspace = true }
+infinisvm-jsonrpc = { workspace = true }
+solana-svm = { workspace = true }
+solana-hash.workspace = true
+rand.workspace = true
+solana-pubkey.workspace = true
+infinisvm-logger = { workspace = true }
+solana-account-decoder-client-types = { workspace = true }
+async-trait = { workspace = true }
+tokio-postgres = { workspace = true }
+futures-util = { version = "0.3.14", features = ["sink"] }
+bb8-postgres = { version = "0.9.0" }
+bb8 = { version = "0.9.0" }
+cdrs-tokio = "8.1.6"
+cassandra-protocol = "3.3.0"
+object_store = { version = "0.12.0", features = ["aws"] }
+zstd = "0.12"
+sorted-vec = "0.8.6"
+metrics = { workspace = true }
+rayon = "1.5.1"
+regex = "1.1.1"
+solana-transaction-context = { workspace = true }
+itertools = "0.10.0"
+
+[dev-dependencies]
+tempfile = "3.5.0"

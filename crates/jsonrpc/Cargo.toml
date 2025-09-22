@@ -1,0 +1,43 @@
+[package]
+name = "infinisvm-jsonrpc"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+infinisvm-db = { workspace = true }
+infinisvm-types = { workspace = true }
+infinisvm-core = { workspace = true }
+infinisvm-logger = { workspace = true }
+tokio = { workspace = true }
+solana-sdk = { workspace = true }
+eyre = { workspace = true }
+rocksdb = { workspace = true }
+bincode = { workspace = true }
+crossbeam-channel = { workspace = true }
+solana-account-decoder = { workspace = true }
+solana-hash = { workspace = true }
+solana-runtime-transaction = { workspace = true }
+solana-svm-transaction = { workspace = true }
+jsonrpsee = { workspace = true }
+spl-token = { workspace = true }
+spl-token-2022 = { workspace = true }
+bs58 = { workspace = true }
+base64 = { workspace = true }
+zstd = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+solana-transaction-status = { workspace = true }
+thiserror = { workspace = true }
+serde_derive = { workspace = true }
+semver = { workspace = true }
+tracing = { workspace = true }
+hashbrown.workspace = true
+async-trait = { workspace = true }
+metrics = { workspace = true }
+solana-svm = { workspace = true }
+reqwest = { workspace = true, features = ["blocking", "json"] }
+solana-compute-budget-instruction = { workspace = true }
+agave-feature-set = { workspace = true }
+dashmap = { workspace = true }
+
+paste = { workspace = true }
