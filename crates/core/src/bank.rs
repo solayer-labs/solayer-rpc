@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, VecDeque},
+    str::FromStr,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, RwLock,
@@ -56,7 +57,8 @@ use solana_svm::{
 
 use crate::wal;
 use crate::{
-    blockhash_generator::DummyRpcBlockhashGenerator, fork_graph::EmptyForkGraph, metrics::BankMetrics, subscription::Notifier,
+    blockhash_generator::DummyRpcBlockhashGenerator, fork_graph::EmptyForkGraph, metrics::BankMetrics,
+    subscription::Notifier,
 };
 use infinisvm_types::jobs::ConsumedJob;
 
@@ -64,143 +66,6 @@ pub fn get_feature_set() -> FeatureSet {
     let mut feature_set = FeatureSet::default();
     feature_set.activate(&agave_feature_set::move_precompile_verification_to_svm::id(), 1);
     feature_set
-}
-
-macro_rules! init_v2_program {
-    ($self:ident, $program_id_str:expr) => {{
-        let program_id = Pubkey::from_str_const($program_id_str);
-        let program_data = include_bytes!(concat!("../elf/", $program_id_str, ".bin"));
-        static_assertions::const_assert!(!include_bytes!(concat!("../elf/", $program_id_str, ".bin")).is_empty());
-
-        let program_account = {
-            AccountSharedData::from(Account {
-                lamports: Rent::default().minimum_balance(program_data.len()),
-                data: program_data.to_vec(),
-                owner: Pubkey::from_str_const("BPFLoader2111111111111111111111111111111111"),
-                executable: true,
-                ..Default::default()
-            })
-        };
-        $self.db.write().unwrap().write_account(program_id, program_account);
-
-        let v1_env = $self
-            .transaction_processor
-            .program_cache
-            .read()
-            .unwrap()
-            .environments
-            .program_runtime_v1
-            .clone();
-
-        $self
-            .transaction_processor
-            .program_cache
-            .write()
-            .unwrap()
-            .assign_program(
-                program_id,
-                Arc::new(
-                    ProgramCacheEntry::new(
-                        &Pubkey::from_str_const("BPFLoader2111111111111111111111111111111111"),
-                        v1_env,
-                        0, // deploy slot
-                        0, // effective slot
-                        program_data,
-                        program_data.len(),
-                        &mut LoadProgramMetrics::default(),
-                    )
-                    .unwrap(),
-                ),
-            );
-    }};
-}
-
-macro_rules! init_v3_program {
-    ($self:ident, $program_id_str:expr, $program_buffer_str:expr, $program_upgrade_authority_str:expr) => {{
-        // create program account
-        let program_id = Pubkey::from_str_const($program_id_str);
-        let program_account_data = include_bytes!(concat!("../elf/", $program_id_str, ".bin"));
-        static_assertions::const_assert!(!include_bytes!(concat!("../elf/", $program_id_str, ".bin")).is_empty());
-        let program_account = {
-            let mut account = AccountSharedData::default();
-            account.set_lamports(Rent::default().minimum_balance(program_account_data.len()));
-            account.set_owner(Pubkey::from_str_const("BPFLoaderUpgradeab1e11111111111111111111111"));
-            account.set_executable(true);
-            account.set_rent_epoch(u64::MAX);
-            account.set_data_from_slice(program_account_data);
-            account
-        };
-        $self.db.write().unwrap().write_account(program_id, program_account);
-
-        // create program buffer account
-        let program_buffer = Pubkey::from_str_const($program_buffer_str);
-
-        let program_buffer_data = include_bytes!(concat!("../elf/", $program_buffer_str, ".bin"));
-        static_assertions::const_assert!(!include_bytes!(concat!("../elf/", $program_buffer_str, ".bin")).is_empty());
-
-        let program_buffer_account = {
-            let mut account = AccountSharedData::default();
-            account.set_lamports(Rent::default().minimum_balance(program_buffer_data.len()));
-            account.set_owner(Pubkey::from_str_const("BPFLoaderUpgradeab1e11111111111111111111111"));
-            account.set_executable(false);
-            account.set_rent_epoch(u64::MAX);
-            account.set_data_from_slice(program_buffer_data);
-            account
-        };
-        $self
-            .db
-            .write()
-            .unwrap()
-            .write_account(program_buffer, program_buffer_account);
-
-        // create upgrade authority account (leave it empty)
-        let upgrade_authority = Pubkey::from_str_const($program_upgrade_authority_str);
-        if $self.db.read().unwrap().get_account(upgrade_authority).is_err() {
-            let upgrade_authority_account = {
-                let mut account = AccountSharedData::default();
-                account.set_rent_epoch(u64::MAX);
-                account
-            };
-            $self
-                .db
-                .write()
-                .unwrap()
-                .write_account(upgrade_authority, upgrade_authority_account);
-        }
-
-        let v1_env = $self
-            .transaction_processor
-            .program_cache
-            .read()
-            .unwrap()
-            .environments
-            .program_runtime_v1
-            .clone();
-
-        let elf_offset = 45; // UpgradeableLoaderState::size_of_programdata_metadata()
-        let elf_bytes = &program_buffer_data[elf_offset..];
-
-        $self
-            .transaction_processor
-            .program_cache
-            .write()
-            .unwrap()
-            .assign_program(
-                program_id,
-                Arc::new(
-                    ProgramCacheEntry::new(
-                        &Pubkey::from_str_const("BPFLoader2111111111111111111111111111111111"),
-                        v1_env,
-                        0,
-                        0,
-                        elf_bytes,
-                        elf_bytes.len(),
-                        &mut LoadProgramMetrics::default(),
-                    )
-                    .unwrap(),
-                ),
-            );
-    }};
 }
 
 /*
@@ -275,8 +140,6 @@ pub struct Bank {
 
 unsafe impl Send for Bank {}
 unsafe impl Sync for Bank {}
-
-
 
 
 impl Bank {
@@ -411,7 +274,8 @@ impl Bank {
             );
         }
 
-        bank.init_hardcoded_accounts();
+        // no genesis map for slave
+        bank.init_hardcoded_accounts(std::collections::HashMap::new());
 
         bank
     }
@@ -736,21 +600,6 @@ impl Bank {
         }
     }
 
-    pub fn get_latest_versions(&self, pubkeys: &[Pubkey]) -> Vec<(Pubkey, u64)> {
-        let db = self.db.read().unwrap();
-        pubkeys
-            .iter()
-            .map(|pubkey| {
-                let version = db
-                    .get_account_with_version(*pubkey)
-                    .unwrap_or_default()
-                    .unwrap_or_default()
-                    .1;
-                (*pubkey, version)
-            })
-            .collect()
-    }
-
     pub fn current_blockhash(&self) -> Hash {
         self.slot_hash_timestamp.1
     }
@@ -839,71 +688,7 @@ impl Bank {
         self.db.write().unwrap().write_account(wsol_ata, wsol_account);
     }
 
-    pub fn init_test_program_mint(&self) {
-        let layer_id = Pubkey::from_str_const("LAYER4xPpTCb3QL8S9u41EAhAX7mhBn8Q6xMTwY2Yzc");
-        let layer_account = {
-            let mut account = AccountSharedData::default();
-            let account_data = include_bytes!("../elf/LAYER4xPpTCb3QL8S9u41EAhAX7mhBn8Q6xMTwY2Yzc.bin");
-            account.set_lamports(Rent::default().minimum_balance(account_data.len()));
-            account.set_owner(Pubkey::from_str_const("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"));
-            account.set_executable(false);
-            account.set_rent_epoch(u64::MAX);
-            account.set_data_from_slice(account_data);
-            account
-        };
-        self.db.write().unwrap().write_account(layer_id, layer_account);
-
-        init_v3_program!(
-            self,
-            "rp7km3qAmYb8ciKKS23v5nmyYU9dFTc5RTAyx7zQSAz",
-            "4WzoXzrZBidLu1MTj26c1iyLBd7LN3Sj5HkugJ1AKVxw",
-            "SahScoe6eHCbC4a8M6BPp27bHqFVaQiDPqYpFeDCwFb"
-        );
-    }
-
-    fn init_hardcoded_accounts(&self) {
-        // todo(may 20): add metaplex
-
-        // Token, Token2022, WSOL
-        init_v2_program!(self, "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
-
-        // Associated Token Account
-        init_v2_program!(self, "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
-
-        init_v3_program!(
-            self,
-            "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
-            "DoU57AYuPFu2QU514RktNPG22QhApEjnKxnBcu4BHDTY",
-            "AeLmXCbPaQHGWRLr2saFsEVfmMNuKnxRAbWCT9P5twgz"
-        );
-
-        // metaplex but with our authority
-        init_v3_program!(
-            self,
-            "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s", /* note: data is from devnet
-                                                            * J4TccHQxYWJyUVCa6y66e1VE3TyNxaxZEJYNVpons7B */
-            "PwDiXFxQsGra4sFFTT8r1QWRMd4vfumiWC1jfWNfdYT", /* note: data is from devnet
-                                                            * BZ6amvSCuhc8whSasEppykuaVTbVXXAo8nP1hjSmp31i */
-            "SahScoe6eHCbC4a8M6BPp27bHqFVaQiDPqYpFeDCwFb"
-        );
-
-        // WSOL
-        let wsol_program_id = Pubkey::from_str_const("So11111111111111111111111111111111111111112");
-        let wsol_program_account = {
-            let mut account = AccountSharedData::default();
-            let account_data = include_bytes!("../elf/So11111111111111111111111111111111111111112.bin");
-            account.set_lamports(Rent::default().minimum_balance(account_data.len()));
-            account.set_owner(Pubkey::from_str_const("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"));
-            account.set_executable(false);
-            account.set_rent_epoch(u64::MAX);
-            account.set_data_from_slice(account_data);
-            account
-        };
-        self.db
-            .write()
-            .unwrap()
-            .write_account(wsol_program_id, wsol_program_account);
-
+    fn init_hardcoded_accounts(&self, genesis_map: std::collections::HashMap<String, AccountSharedData>) {
         self.add_precompile(&secp256k1_program::id(), b"secp256k1_program".to_vec());
         self.add_precompile(&ed25519_program::id(), b"ed25519_program".to_vec());
 
@@ -922,6 +707,13 @@ impl Bank {
                 rent_epoch: u64::MAX,
             }),
         );
+
+        for (key, value) in genesis_map {
+            self.db
+                .write()
+                .unwrap()
+                .write_account(Pubkey::from_str(&key).unwrap(), value);
+        }
     }
 
     fn add_precompile(&self, program_id: &Pubkey, data: Vec<u8>) {
