@@ -1,6 +1,7 @@
+use std::{fmt::Debug, marker::PhantomData};
+
 use bytes::{Buf, BufMut};
 use serde::{Deserialize, Serialize};
-use std::{fmt::Debug, marker::PhantomData};
 use tonic::{
     codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder},
     Status,
@@ -65,7 +66,7 @@ where
 
     fn encode(&mut self, item: Self::Item, dst: &mut EncodeBuf<'_>) -> Result<(), Self::Error> {
         let encoded =
-            bincode::serialize(&item).map_err(|e| Status::internal(format!("Failed to encode with bincode: {}", e)))?;
+            bincode::serialize(&item).map_err(|e| Status::internal(format!("Failed to encode with bincode: {e}")))?;
 
         dst.put_slice(&encoded);
         Ok(())
@@ -100,7 +101,7 @@ where
         let bytes = src.copy_to_bytes(len);
 
         let decoded = bincode::deserialize(&bytes)
-            .map_err(|e| Status::internal(format!("Failed to decode with bincode: {}", e)))?;
+            .map_err(|e| Status::internal(format!("Failed to decode with bincode: {e}")))?;
 
         Ok(Some(decoded))
     }

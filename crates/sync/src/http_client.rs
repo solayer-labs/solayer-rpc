@@ -1,16 +1,17 @@
-use eyre::Result;
-use hashbrown::HashMap;
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use infinisvm_db::{persistence::DBFile, versioned::AccountVersion};
-use infinisvm_logger::{debug, error, info};
-use reqwest::Client;
-use serde::Deserialize;
-use solana_sdk::{account::AccountSharedData, pubkey::Pubkey};
 use std::{
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
 };
+
+use eyre::Result;
+use hashbrown::HashMap;
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use infinisvm_db::persistence::DBFile;
+use infinisvm_logger::{error, info};
+use reqwest::Client;
+use serde::Deserialize;
+use solana_sdk::{account::AccountSharedData, pubkey::Pubkey};
 use tempfile::tempdir;
 use tokio::{fs, process::Command, sync::mpsc};
 
@@ -53,11 +54,13 @@ pub struct LargestCheckpoint {
 }
 
 impl Snapshots {
-    /// Returns the second largest checkpoint and its associated account files that should be downloaded.
+    /// Returns the second largest checkpoint and its associated account files
+    /// that should be downloaded.
     ///
-    /// This function finds the second largest checkpoint and all account files with slots between
-    /// that checkpoint and the largest account file. This ensures we get a consistent snapshot
-    /// while avoiding the most recent (potentially incomplete) checkpoint.
+    /// This function finds the second largest checkpoint and all account files
+    /// with slots between that checkpoint and the largest account file.
+    /// This ensures we get a consistent snapshot while avoiding the most
+    /// recent (potentially incomplete) checkpoint.
     ///
     /// Returns `None` if there are no checkpoints available.
     pub fn get_ckpts_to_download(&self) -> Option<LargestCheckpoint> {
@@ -187,21 +190,21 @@ pub struct Downloader {
     last_slot: u64,
 }
 
-pub fn parse_data(bytes: Vec<u8>) -> Result<Vec<(Pubkey, AccountSharedData, AccountVersion)>> {
+pub fn parse_data(bytes: Vec<u8>) -> Result<Vec<(Pubkey, AccountSharedData)>> {
     let checkpoint = bincode::deserialize(&bytes)?;
     Ok(checkpoint)
 }
 
 pub fn reduce_data(
-    data: HashMap<DBFile, Vec<(Pubkey, AccountSharedData, AccountVersion)>>,
-) -> Result<HashMap<Pubkey, (AccountSharedData, AccountVersion)>> {
+    data: HashMap<DBFile, Vec<(Pubkey, AccountSharedData)>>,
+) -> Result<HashMap<Pubkey, AccountSharedData>> {
     let mut sorted_data: Vec<_> = data.into_iter().collect();
     sorted_data.sort_by_key(|(file, _)| file.slot());
 
     let mut accounts = HashMap::new();
     for (_, account_data) in sorted_data {
-        for (pubkey, account, version) in account_data {
-            accounts.insert(pubkey, (account, version));
+        for (pubkey, account) in account_data {
+            accounts.insert(pubkey, account);
         }
     }
 
@@ -209,9 +212,9 @@ pub fn reduce_data(
 }
 
 fn parse_aria2c_version(version_output: &str) -> Option<(u32, u32, u32)> {
-    let version_line = version_output
-        .lines()
-        .find(|line| line.to_ascii_lowercase().contains("aria2c version"))?;
+    let version_line = version_output.lines().find(|line| {
+        line.to_ascii_lowercase().contains("aria2c version") || line.to_ascii_lowercase().contains("aria2 version")
+    })?;
     let version_str = version_line
         .split_whitespace()
         .find(|token| token.chars().next().is_some_and(|c| c.is_ascii_digit()))?;
@@ -249,7 +252,7 @@ async fn ensure_aria2c_ready() -> Result<()> {
     let stdout = String::from_utf8_lossy(&output.stdout);
     if let Some(version) = parse_aria2c_version(&stdout) {
         if version_is_supported(version) {
-            debug!("aria2c version {:?} detected", version);
+            info!("aria2c version {:?} detected", version);
             return Ok(());
         }
         return Err(eyre::eyre!(
@@ -277,7 +280,11 @@ impl Downloader {
         parser: Arc<impl Fn(Vec<u8>) -> Result<T> + Send + Sync + 'static>,
     ) -> Result<HashMap<DBFile, T>> {
         let base_url = http_client.base_url.clone();
-        // ensure_aria2c_ready().await?;
+        if let Err(e) = ensure_aria2c_ready().await {
+            error!("aria2c is not ready: {}", e);
+            return Err(e);
+        }
+        info!("Aria2c is ready to download files");
 
         let multi_progress = MultiProgress::new();
         let progress_style = ProgressStyle::default_bar()
@@ -377,7 +384,7 @@ impl Downloader {
                     )
                 })?;
                 if let Err(e) = fs::remove_file(&output_path).await {
-                    debug!(
+                    info!(
                         "failed to remove temporary file {} after parsing: {}",
                         output_path.display(),
                         e
@@ -456,11 +463,11 @@ impl Downloader {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         loop {
             interval.tick().await;
-            debug!("Polling for new files since slot {}", self.last_slot);
+            info!("Polling for new files since slot {}", self.last_slot);
             let snapshots = http_client.get_snapshots().await?;
             let files = snapshots.since_slot(self.last_slot);
             if files.is_empty() {
-                debug!("No new files found in this tick");
+                info!("No new files found in this tick");
             } else {
                 info!("Found {} new files since slot {}", files.len(), self.last_slot);
             }

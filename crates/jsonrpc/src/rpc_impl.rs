@@ -1,6 +1,5 @@
 use std::{borrow::Cow, collections::HashMap, io::Write, str::FromStr, sync::atomic::Ordering};
 
-use crate::rpc_state::RpcBank;
 use base64::{engine::general_purpose::STANDARD as b64, Engine};
 use infinisvm_core::bank::{get_feature_set, TransactionStatus};
 use infinisvm_types::{BlockWithTransactions, SignatureFilters, TransactionWithMetadata};
@@ -31,6 +30,7 @@ use solana_sdk::{
     pubkey::Pubkey,
     rent::Rent,
     signature::Signature,
+    signer::Signer,
     system_program,
     transaction::{MessageHash, SanitizedTransaction, Transaction, TransactionError, VersionedTransaction},
 };
@@ -44,7 +44,7 @@ use spl_token_2022::{extension::StateWithExtensions, state::Mint};
 use thiserror::Error;
 use tracing::error;
 
-use crate::rpc_state::RpcServerState;
+use crate::rpc_state::{RpcBank, RpcServerState};
 
 pub fn deserialize_checked(input: &[u8]) -> Option<VersionedTransaction> {
     match limited_deserialize::<VersionedTransaction>(input) {
@@ -1276,6 +1276,12 @@ pub trait Rpc {
         config: Option<RpcContextConfig>,
     ) -> RpcResult<RpcResponse<Option<u64>>>;
 
+    #[method(name = "getRecentPrioritizationFees")]
+    fn get_recent_prioritization_fees(&self, pubkey_strs: Option<Vec<String>>) -> RpcResult<Vec<RpcPrioritizationFee>>;
+
+    #[method(name = "getStakeMinimumDelegation")]
+    fn get_stake_minimum_delegation(&self, config: Option<RpcContextConfig>) -> RpcResult<RpcResponse<u64>>;
+
     #[method(name = "getSignatureStatuses")]
     async fn get_signature_statuses(
         &self,
@@ -1623,9 +1629,9 @@ impl RpcServer for RpcServerState {
                 error!("get_balance error: {:?}", e);
                 ErrorCode::InternalError
             })?
-            .get_account_with_version(pubkey)
+            .get_account(pubkey)
             .expect("Failed to get account")
-            .map_or(0, |a| a.0.lamports());
+            .map_or(0, |account| account.lamports());
 
         let rpc_response = RpcResponse::<u64> {
             context: RpcResponseContext { slot },
@@ -1687,11 +1693,7 @@ impl RpcServer for RpcServerState {
     async fn get_block_time(&self, slot: Slot) -> RpcResult<Option<u64>> {
         counter!("rpc", "method" => "getBlockTime").increment(1);
         let (current_slot, _, timestamp) = self.bank.read().unwrap().get_latest_slot_hash_timestamp();
-        let diff = if slot > current_slot {
-            slot - current_slot
-        } else {
-            current_slot - slot
-        };
+        let diff = slot.abs_diff(current_slot);
 
         Ok(Some(if slot > current_slot {
             (timestamp * 1000 + diff * 400) / 1000
@@ -1716,28 +1718,28 @@ impl RpcServer for RpcServerState {
                 error!("get_account_info error: {:?}", e);
                 ErrorCode::InternalError
             })?
-            .get_account_with_version(pubkey)
+            .get_account(pubkey)
             .expect("Failed to get account")
         {
-            Some((a, _)) => {
-                if a.data().is_empty() && a.owner() == &system_program::id() && a.lamports() == 0 {
+            Some(account) => {
+                if account.data().is_empty() && account.owner() == &system_program::id() && account.lamports() == 0 {
                     return Ok(RpcResponse::<Option<UiAccount>> {
                         context: RpcResponseContext { slot },
                         value: None,
                     });
                 }
 
-                let (encoded_sliced_data, encoding) = get_account_data_encoding_and_slice(&config, &a)?;
+                let (encoded_sliced_data, encoding) = get_account_data_encoding_and_slice(&config, &account)?;
 
                 RpcResponse::<Option<UiAccount>> {
                     context: RpcResponseContext { slot },
                     value: Some(UiAccount {
-                        lamports: a.lamports(),
+                        lamports: account.lamports(),
                         data: UiAccountData::Binary(encoded_sliced_data, encoding),
-                        owner: a.owner().to_string(),
-                        executable: a.executable(),
-                        rent_epoch: a.rent_epoch(),
-                        space: Some(a.data().len() as u64),
+                        owner: account.owner().to_string(),
+                        executable: account.executable(),
+                        rent_epoch: account.rent_epoch(),
+                        space: Some(account.data().len() as u64),
                     }),
                 }
             }
@@ -1777,39 +1779,31 @@ impl RpcServer for RpcServerState {
         }
 
         let slot = self.get_current_slot()?;
-        let accounts = pubkeys
-            .iter()
-            .map(|pubkey| {
-                self.db
-                    .read()
-                    .map_err(|e| {
-                        error!("get_account_info error: {:?}", e);
-                        ErrorCode::InternalError
-                    })?
-                    .get_account_with_version(*pubkey)
-            })
-            .collect::<Vec<_>>();
+        let db_guard = self.db.read().map_err(|e| {
+            error!("get_account_info error: {:?}", e);
+            ErrorCode::InternalError
+        })?;
+
+        let account_results: Vec<_> = pubkeys.iter().map(|pubkey| db_guard.get_account(*pubkey)).collect();
 
         // Map the reference to the desired return type
-        let accounts = accounts
-            .iter()
-            .map(|account_arc| {
-                if let Some((account_arc, _)) = account_arc.as_ref().expect("Failed to get account") {
-                    if account_arc.data().is_empty()
-                        && account_arc.owner() == &system_program::id()
-                        && account_arc.lamports() == 0
+        let accounts = account_results
+            .into_iter()
+            .map(|account_result| {
+                if let Some(account) = account_result.expect("Failed to get account") {
+                    if account.data().is_empty() && account.owner() == &system_program::id() && account.lamports() == 0
                     {
                         return None;
                     }
-                    let encoded_data_and_encoding = get_account_data_encoding_and_slice(&config, account_arc);
+                    let encoded_data_and_encoding = get_account_data_encoding_and_slice(&config, &account);
                     if let Ok((encoded_data, encoding)) = encoded_data_and_encoding {
                         Some(UiAccount {
-                            lamports: account_arc.lamports(),
+                            lamports: account.lamports(),
                             data: UiAccountData::Binary(encoded_data, encoding),
-                            owner: account_arc.owner().to_string(),
-                            executable: account_arc.executable(),
-                            rent_epoch: account_arc.rent_epoch(),
-                            space: Some(account_arc.data().len() as u64),
+                            owner: account.owner().to_string(),
+                            executable: account.executable(),
+                            rent_epoch: account.rent_epoch(),
+                            space: Some(account.data().len() as u64),
                         })
                     } else {
                         None
@@ -1837,7 +1831,8 @@ impl RpcServer for RpcServerState {
 
         // todo: add simulate tx
         // may 20: add simulate tx
-        if !config.skip_preflight {
+        // directly forward to sequencer if forward_to is set
+        if !config.skip_preflight && self.forward_to.is_some() {
             match self
                 .simulate_transaction(
                     data.clone(),
@@ -1888,7 +1883,7 @@ impl RpcServer for RpcServerState {
                 }
             },
             _ => {
-                return Err(invalid_params_error(format!("Unknown encoding: {:?}", encoding)));
+                return Err(invalid_params_error(format!("Unknown encoding: {encoding:?}")));
             }
         };
 
@@ -2001,6 +1996,27 @@ impl RpcServer for RpcServerState {
                 slot: self.get_current_slot()?,
             },
             value: Some(expected_fee),
+        })
+    }
+
+    fn get_recent_prioritization_fees(&self, pubkey_strs: Option<Vec<String>>) -> RpcResult<Vec<RpcPrioritizationFee>> {
+        counter!("rpc", "method" => "getRecentPrioritizationFees").increment(1);
+        let mut fees = vec![];
+        for _ in pubkey_strs.unwrap_or_default() {
+            fees.push(RpcPrioritizationFee {
+                slot: self.get_current_slot()?,
+                prioritization_fee: 0,
+            });
+        }
+        Ok(fees)
+    }
+
+    fn get_stake_minimum_delegation(&self, _config: Option<RpcContextConfig>) -> RpcResult<RpcResponse<u64>> {
+        Ok(RpcResponse::<u64> {
+            context: RpcResponseContext {
+                slot: self.get_current_slot()?,
+            },
+            value: 0,
         })
     }
 
@@ -2117,7 +2133,7 @@ impl RpcServer for RpcServerState {
 
     fn get_slot_leaders(&self, _start_slot: u64, _limit: u64) -> RpcResult<Vec<String>> {
         counter!("rpc", "method" => "getSlotLeaders").increment(1);
-        if _limit > 50 {
+        if _limit > 5000 {
             return Err(invalid_params_error("limit must be less than 50"));
         }
         let leader_pubkey = self.identity().to_base58_string();
@@ -2127,7 +2143,7 @@ impl RpcServer for RpcServerState {
     fn get_cluster_nodes(&self) -> RpcResult<Vec<RpcClusterNode>> {
         counter!("rpc", "method" => "getClusterNodes").increment(1);
         let nodes = vec![RpcClusterNode {
-            pubkey: self.identity().to_base58_string(),
+            pubkey: self.identity().pubkey().to_string(),
             gossip: "0.0.0.0:8001".to_string(),
             rpc: "0.0.0.0:8899".to_string(),
             tpu: self.tpu().to_string(),
@@ -2190,19 +2206,17 @@ impl RpcServer for RpcServerState {
 
         let token_account_pubkey = verify_pubkey(&pubkey_str)?;
 
-        let (token_account, _) = self
-            .db
-            .read()
-            .map_err(|e| {
-                error!("get_token_account_balance error: {:?}", e);
-                ErrorCode::InternalError
-            })?
-            .get_account_with_version(token_account_pubkey)
+        let db_guard = self.db.read().map_err(|e| {
+            error!("get_token_account_balance error: {:?}", e);
+            ErrorCode::InternalError
+        })?;
+
+        let token_account = db_guard
+            .get_account(token_account_pubkey)
             .expect("Failed to find token account in accounts_db")
             .ok_or_else(|| {
                 invalid_params_error(format!(
-                    "Failed to find token account in accounts_db {}",
-                    token_account_pubkey
+                    "Failed to find token account in accounts_db {token_account_pubkey}"
                 ))
             })?;
 
@@ -2218,20 +2232,11 @@ impl RpcServer for RpcServerState {
 
         let mint_account_key: Pubkey = Pubkey::new_from_array(token_account_data.base.mint.to_bytes());
 
-        let (mint_account, _) = self
-            .db
-            .read()
-            .map_err(|e| {
-                error!("get_token_account_balance error: {:?}", e);
-                ErrorCode::InternalError
-            })?
-            .get_account_with_version(mint_account_key)
+        let mint_account = db_guard
+            .get_account(mint_account_key)
             .expect("Failed to find mint account in accounts_db")
             .ok_or_else(|| {
-                invalid_params_error(format!(
-                    "Failed to find mint account in accounts_db {}",
-                    mint_account_key
-                ))
+                invalid_params_error(format!("Failed to find mint account in accounts_db {mint_account_key}"))
             })?;
 
         // spl_token and spl_token_22 seem to struggle with deserializing the mint
@@ -2256,18 +2261,16 @@ impl RpcServer for RpcServerState {
         let slot = self.get_current_slot()?;
         let mint_pubkey = verify_pubkey(&mint_str)?;
 
-        let (mint_account, _) = self
+        let mint_account = self
             .db
             .read()
             .map_err(|e| {
                 error!("get_token_supply error: {:?}", e);
                 ErrorCode::InternalError
             })?
-            .get_account_with_version(mint_pubkey)
+            .get_account(mint_pubkey)
             .expect("Failed to find mint account in accounts_db")
-            .ok_or_else(|| {
-                invalid_params_error(format!("Failed to find mint account in accounts_db {}", mint_pubkey))
-            })?;
+            .ok_or_else(|| invalid_params_error(format!("Failed to find mint account in accounts_db {mint_pubkey}")))?;
 
         let mint_account = StateWithExtensions::<Mint>::unpack(mint_account.data()).map_err(|e| {
             error!("Failed to unpack mint account data: {:?}", e);
@@ -2313,7 +2316,7 @@ impl RpcServer for RpcServerState {
         let mut parsed_token_accounts = vec![];
 
         for pubkey in token_accounts {
-            let (account, _) = db_reader.get_account_with_version(pubkey).unwrap().unwrap_or_default();
+            let account = db_reader.get_account(pubkey).unwrap().unwrap_or_default();
             let (encoded_sliced_data, encoding) = get_account_data_encoding_and_slice(&config, &account)?;
             parsed_token_accounts.push(RpcKeyedAccount {
                 pubkey: pubkey.to_string(),
@@ -2467,7 +2470,7 @@ impl RpcServer for RpcServerState {
                 }
             },
             _ => {
-                return Err(invalid_params_error(format!("Unknown encoding: {:?}", encoding)));
+                return Err(invalid_params_error(format!("Unknown encoding: {encoding:?}")));
             }
         };
 
@@ -2601,33 +2604,35 @@ impl RpcServer for RpcServerState {
 
         if let Some(forwards) = &self.forward_to {
             let client = reqwest::blocking::Client::new();
-            let result = client.post(forwards)
+            let result = client
+                .post(forwards)
                 .json(&serde_json::json!({
                     "jsonrpc": "2.0",
-                    "method": "getRecentPerformanceSamples", 
+                    "method": "getRecentPerformanceSamples",
                     "params": [limit],
                     "id": 1,
                 }))
                 .send()
                 .map_err(|e| RpcCustomError::ForwardingError(e.to_string()))?;
 
-            let result_json = result.json::<serde_json::Value>()
+            let result_json = result
+                .json::<serde_json::Value>()
                 .map_err(|e| RpcCustomError::ForwardingError(e.to_string()))?;
 
-            result_json.get("result")
+            result_json
+                .get("result")
                 .and_then(|v| v.as_array())
-                .map(|v| v.iter().map(|v| {
-                    RpcPerfSample {
-                        slot: v.get("slot").and_then(|v| v.as_u64()).unwrap(),
-                        num_transactions: v.get("numTransactions").and_then(|v| v.as_u64()).unwrap(),
-                        num_non_vote_transactions: match v.get("numNonVoteTransactions").and_then(|v| v.as_u64()) {
-                            Some(num) => Some(num),
-                            _ => None,
-                        },
-                        num_slots: v.get("numSlots").and_then(|v| v.as_u64()).unwrap(),
-                        sample_period_secs: v.get("samplePeriodSecs").and_then(|v| v.as_u64()).unwrap() as u16,
-                    }
-                }).collect())
+                .map(|v| {
+                    v.iter()
+                        .map(|v| RpcPerfSample {
+                            slot: v.get("slot").and_then(|v| v.as_u64()).unwrap(),
+                            num_transactions: v.get("numTransactions").and_then(|v| v.as_u64()).unwrap(),
+                            num_non_vote_transactions: v.get("numNonVoteTransactions").and_then(|v| v.as_u64()),
+                            num_slots: v.get("numSlots").and_then(|v| v.as_u64()).unwrap(),
+                            sample_period_secs: v.get("samplePeriodSecs").and_then(|v| v.as_u64()).unwrap() as u16,
+                        })
+                        .collect()
+                })
                 .ok_or_else(|| RpcCustomError::ForwardingError("Failed to parse response".to_string()).into())
         } else {
             let samples = self.samples.read().unwrap();
@@ -2886,20 +2891,16 @@ fn handle_simulation_err(tx_err: &TransactionError) -> String {
             // TokenError to get a human read-able message?
             match ix_err {
                 InstructionError::Custom(code) => format!(
-                    "Transaction simulation failed: Error processing Instruction {}: custom program error: 0x{:x}",
-                    idx, code
+                    "Transaction simulation failed: Error processing Instruction {idx}: custom program error: 0x{code:x}"
                 ),
                 _ => format!(
-                    "Transaction simulation failed: Error processing Instruction {}: {:?}: {}",
-                    idx,
-                    ix_err, // {:?} will print the enum variant, 'ExternalAccountLamportSpend'
-                    ix_err, /* {} will print the error message, 'instruction spent from the balance of an account it
+                    "Transaction simulation failed: Error processing Instruction {idx}: {ix_err:?}: {ix_err}", /* {} will print the error message, 'instruction spent from the balance of an account it
                              * does not own' */
                 ),
             }
         }
         _ => {
-            format!("Transaction simulation failed: {:?}: {}", tx_err, tx_err)
+            format!("Transaction simulation failed: {tx_err:?}: {tx_err}")
         }
     }
 }

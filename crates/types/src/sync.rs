@@ -54,19 +54,24 @@ pub struct CommitBatchNotification {
     pub compressed_transactions: Vec<u8>,
     pub compression_ratio: u64,
     pub job_id: u64,
+    pub worker_id: usize,
 }
 
 // Simple gRPC service definitions for bincode
 pub mod grpc {
-    pub use super::*;
+    use std::{
+        pin::Pin,
+        task::{Context, Poll},
+        time::Instant,
+    };
+
     use bytes::{Buf, BufMut};
     use futures_core::Stream;
     use http_body::Frame;
     use metrics::{counter, histogram};
-    use std::pin::Pin;
-    use std::task::{Context, Poll};
-    use std::time::Instant;
     use tonic::transport::Channel;
+
+    pub use super::*;
 
     // Service trait
     #[tonic::async_trait]
@@ -171,7 +176,7 @@ pub mod grpc {
                             let request: StartReceivingSlotsRequest =
                                 bincode::deserialize(message_bytes).map_err(|e| {
                                     counter!("grpc_server_errors_total", "method" => "StartReceivingSlots", "kind" => "deserialize").increment(1);
-                                    tonic::Status::internal(format!("Failed to deserialize request: {}", e))
+                                    tonic::Status::internal(format!("Failed to deserialize request: {e}"))
                                 })?;
 
                             // Call the service method
@@ -195,8 +200,7 @@ pub mod grpc {
                         Err(e) => {
                             counter!("grpc_server_errors_total", "method" => "StartReceivingSlots", "kind" => "serialize").increment(1);
                             Err(tonic::Status::internal(format!(
-                                "Failed to serialize response: {}",
-                                e
+                                "Failed to serialize response: {e}"
                             )))
                         }
                     },
@@ -219,7 +223,7 @@ pub mod grpc {
                             // Deserialize request
                             let request: GetLatestSlotRequest = bincode::deserialize(message_bytes).map_err(|e| {
                                 counter!("grpc_server_errors_total", "method" => "GetLatestSlot", "kind" => "deserialize").increment(1);
-                                tonic::Status::internal(format!("Failed to deserialize request: {}", e))
+                                tonic::Status::internal(format!("Failed to deserialize request: {e}"))
                             })?;
 
                             // Call the service method
@@ -229,7 +233,7 @@ pub mod grpc {
 
                             // Serialize response
                             let serialized = bincode::serialize(&response_data)
-                                .map_err(|e| tonic::Status::internal(format!("Failed to serialize response: {}", e)))?;
+                                .map_err(|e| tonic::Status::internal(format!("Failed to serialize response: {e}")))?;
 
                             // Create response with gRPC message framing
                             let mut frame = bytes::BytesMut::with_capacity(5 + serialized.len());
@@ -262,7 +266,7 @@ pub mod grpc {
                             let request: TransactionBatchRequest =
                                 bincode::deserialize(message_bytes).map_err(|e| {
                                     counter!("grpc_server_errors_total", "method" => "SubscribeTransactionBatches", "kind" => "deserialize").increment(1);
-                                    tonic::Status::internal(format!("Failed to deserialize request: {}", e))
+                                    tonic::Status::internal(format!("Failed to deserialize request: {e}"))
                                 })?;
 
                             // Call the service method
@@ -289,8 +293,7 @@ pub mod grpc {
                         Err(e) => {
                             counter!("grpc_server_errors_total", "method" => "SubscribeTransactionBatches", "kind" => "serialize").increment(1);
                             Err(tonic::Status::internal(format!(
-                                "Failed to serialize response: {}",
-                                e
+                                "Failed to serialize response: {e}"
                             )))
                         }
                     },
@@ -312,7 +315,7 @@ pub mod grpc {
                         "GetTransactionBatch" => {
                             // Deserialize request
                             let request: GetTransactionBatchRequest = bincode::deserialize(message_bytes).map_err(|e| {
-                                tonic::Status::internal(format!("Failed to deserialize request: {}", e))
+                                tonic::Status::internal(format!("Failed to deserialize request: {e}"))
                             })?;
 
                             // Call the service method
@@ -321,7 +324,7 @@ pub mod grpc {
 
                             // Serialize response
                             let serialized = bincode::serialize(&response_data)
-                                .map_err(|e| tonic::Status::internal(format!("Failed to serialize response: {}", e)))?;
+                                .map_err(|e| tonic::Status::internal(format!("Failed to serialize response: {e}")))?;
 
                             // Create response with gRPC message framing
                             let mut frame = bytes::BytesMut::with_capacity(5 + serialized.len());
@@ -343,7 +346,7 @@ pub mod grpc {
                         }
                         _ => {
                             // Unknown method
-                            let status = tonic::Status::unimplemented(format!("Unknown method: {}", method_name));
+                            let status = tonic::Status::unimplemented(format!("Unknown method: {method_name}"));
                             counter!("grpc_server_errors_total", "kind" => "unknown_method").increment(1);
                             let response = http::Response::builder()
                                 .status(200)
@@ -497,7 +500,7 @@ pub mod grpc {
 
             // Serialize request with bincode
             let serialized = bincode::serialize(&request_data)
-                .map_err(|e| tonic::Status::internal(format!("Failed to serialize request: {}", e)))?;
+                .map_err(|e| tonic::Status::internal(format!("Failed to serialize request: {e}")))?;
 
             // Add gRPC message framing
             let mut frame = bytes::BytesMut::with_capacity(5 + serialized.len());
@@ -508,7 +511,7 @@ pub mod grpc {
             // Create HTTP/2 request
             let uri = format!("{}/infinisvm.sync.InfiniSVMService/StartReceivingSlots", self.base_uri)
                 .parse::<hyper::Uri>()
-                .map_err(|e| tonic::Status::internal(format!("Failed to parse URI: {}", e)))?;
+                .map_err(|e| tonic::Status::internal(format!("Failed to parse URI: {e}")))?;
 
             let http_request = hyper::Request::builder()
                 .method("POST")
@@ -516,14 +519,14 @@ pub mod grpc {
                 .header("content-type", "application/grpc")
                 .header("te", "trailers")
                 .body(hyper::Body::from(frame.freeze()))
-                .map_err(|e| tonic::Status::internal(format!("Failed to build HTTP request: {}", e)))?;
+                .map_err(|e| tonic::Status::internal(format!("Failed to build HTTP request: {e}")))?;
 
             // Use the shared HTTP client
             let response = self
                 .http_client
                 .request(http_request)
                 .await
-                .map_err(|e| tonic::Status::internal(format!("HTTP request failed: {}", e)))?;
+                .map_err(|e| tonic::Status::internal(format!("HTTP request failed: {e}")))?;
 
             // Check response status
             if response.status() != hyper::StatusCode::OK {
@@ -574,8 +577,7 @@ pub mod grpc {
                                             counter!("grpc_client_errors_total", "method" => "StartReceivingSlots", "kind" => "deserialize").increment(1);
                                             let _ = tx
                                                 .send(Err(tonic::Status::internal(format!(
-                                                    "Failed to deserialize response: {}",
-                                                    e
+                                                    "Failed to deserialize response: {e}",
                                                 ))))
                                                 .await;
                                             return;
@@ -594,8 +596,7 @@ pub mod grpc {
                             counter!("grpc_client_errors_total", "method" => "StartReceivingSlots", "kind" => "http_body").increment(1);
                             let _ = tx
                                 .send(Err(tonic::Status::internal(format!(
-                                    "Failed to read response body: {}",
-                                    e
+                                    "Failed to read response body: {e}",
                                 ))))
                                 .await;
                             return;
@@ -619,7 +620,7 @@ pub mod grpc {
 
             // Serialize request with bincode
             let serialized = bincode::serialize(&request_data)
-                .map_err(|e| tonic::Status::internal(format!("Failed to serialize request: {}", e)))?;
+                .map_err(|e| tonic::Status::internal(format!("Failed to serialize request: {e}")))?;
 
             // Add gRPC message framing
             let mut frame = bytes::BytesMut::with_capacity(5 + serialized.len());
@@ -630,29 +631,30 @@ pub mod grpc {
             // Create HTTP request with hyper types
             let uri = format!("{}/infinisvm.sync.InfiniSVMService/GetLatestSlot", self.base_uri)
                 .parse::<hyper::Uri>()
-                .map_err(|e| tonic::Status::internal(format!("Failed to parse URI: {}", e)))?;
+                .map_err(|e| tonic::Status::internal(format!("Failed to parse URI: {e}")))?;
 
             let http_request = hyper::Request::builder()
                 .method("POST")
                 .uri(uri)
                 .header("content-type", "application/grpc")
                 .body(hyper::Body::from(frame.freeze()))
-                .map_err(|e| tonic::Status::internal(format!("Failed to build HTTP request: {}", e)))?;
+                .map_err(|e| tonic::Status::internal(format!("Failed to build HTTP request: {e}")))?;
 
             // Use the shared HTTP client
             let response = self
                 .http_client
                 .request(http_request)
                 .await
-                .map_err(|e| tonic::Status::internal(format!("HTTP request failed: {}", e)))?;
+                .map_err(|e| tonic::Status::internal(format!("HTTP request failed: {e}")))?;
 
             // Read response body
             let start = Instant::now();
             let body_bytes = hyper::body::to_bytes(response.into_body())
                 .await
-                .map_err(|e| tonic::Status::internal(format!("Failed to read response body: {}", e)))?;
+                .map_err(|e| tonic::Status::internal(format!("Failed to read response body: {e}")))?;
 
-            // Skip the gRPC message framing (5 bytes: 1 byte compression flag + 4 bytes length)
+            // Skip the gRPC message framing (5 bytes: 1 byte compression flag + 4 bytes
+            // length)
             let message_bytes = if body_bytes.len() > 5 {
                 &body_bytes[5..]
             } else {
@@ -661,7 +663,7 @@ pub mod grpc {
 
             // Deserialize response with bincode
             let response_data: GetLatestSlotResponse = bincode::deserialize(message_bytes)
-                .map_err(|e| tonic::Status::internal(format!("Failed to deserialize response: {}", e)))?;
+                .map_err(|e| tonic::Status::internal(format!("Failed to deserialize response: {e}")))?;
 
             // Metrics: client unary bytes/messages and latency
             counter!("grpc_client_messages_total", "method" => "GetLatestSlot").increment(1);
@@ -683,7 +685,7 @@ pub mod grpc {
 
             // Serialize request with bincode
             let serialized = bincode::serialize(&request_data)
-                .map_err(|e| tonic::Status::internal(format!("Failed to serialize request: {}", e)))?;
+                .map_err(|e| tonic::Status::internal(format!("Failed to serialize request: {e}")))?;
 
             // Add gRPC message framing
             let mut frame = bytes::BytesMut::with_capacity(5 + serialized.len());
@@ -697,7 +699,7 @@ pub mod grpc {
                 self.base_uri
             )
             .parse::<hyper::Uri>()
-            .map_err(|e| tonic::Status::internal(format!("Failed to parse URI: {}", e)))?;
+            .map_err(|e| tonic::Status::internal(format!("Failed to parse URI: {e}")))?;
 
             let http_request = hyper::Request::builder()
                 .method("POST")
@@ -705,14 +707,14 @@ pub mod grpc {
                 .header("content-type", "application/grpc")
                 .header("te", "trailers")
                 .body(hyper::Body::from(frame.freeze()))
-                .map_err(|e| tonic::Status::internal(format!("Failed to build HTTP request: {}", e)))?;
+                .map_err(|e| tonic::Status::internal(format!("Failed to build HTTP request: {e}")))?;
 
             // Use the shared HTTP client
             let response = self
                 .http_client
                 .request(http_request)
                 .await
-                .map_err(|e| tonic::Status::internal(format!("HTTP request failed: {}", e)))?;
+                .map_err(|e| tonic::Status::internal(format!("HTTP request failed: {e}")))?;
 
             // Check response status
             if response.status() != hyper::StatusCode::OK {
@@ -757,6 +759,7 @@ pub mod grpc {
                                                 slot: u64,
                                                 timestamp: u64,
                                                 batch_size: u32,
+                                                worker_id: usize,
                                                 compressed_transactions: Vec<u8>,
                                                 compression_ratio: u64,
                                             }
@@ -768,6 +771,7 @@ pub mod grpc {
                                                     compressed_transactions: legacy.compressed_transactions,
                                                     compression_ratio: legacy.compression_ratio,
                                                     job_id: 0,
+                                                    worker_id: legacy.worker_id,
                                                 },
                                             )
                                         });
@@ -784,8 +788,7 @@ pub mod grpc {
                                             counter!("grpc_client_errors_total", "method" => "SubscribeTransactionBatches", "kind" => "deserialize").increment(1);
                                             let _ = tx
                                                 .send(Err(tonic::Status::internal(format!(
-                                                    "Failed to deserialize response: {}",
-                                                    e
+                                                    "Failed to deserialize response: {e}",
                                                 ))))
                                                 .await;
                                             return;
@@ -804,8 +807,7 @@ pub mod grpc {
                             counter!("grpc_client_errors_total", "method" => "SubscribeTransactionBatches", "kind" => "http_body").increment(1);
                             let _ = tx
                                 .send(Err(tonic::Status::internal(format!(
-                                    "Failed to read response body: {}",
-                                    e
+                                    "Failed to read response body: {e}",
                                 ))))
                                 .await;
                             return;
@@ -828,7 +830,7 @@ pub mod grpc {
 
             // Serialize request with bincode
             let serialized = bincode::serialize(&request_data)
-                .map_err(|e| tonic::Status::internal(format!("Failed to serialize request: {}", e)))?;
+                .map_err(|e| tonic::Status::internal(format!("Failed to serialize request: {e}")))?;
 
             // Add gRPC framing
             let mut frame = bytes::BytesMut::with_capacity(5 + serialized.len());
@@ -838,7 +840,7 @@ pub mod grpc {
 
             let uri = format!("{}/infinisvm.sync.InfiniSVMService/GetTransactionBatch", self.base_uri)
                 .parse::<hyper::Uri>()
-                .map_err(|e| tonic::Status::internal(format!("Failed to parse URI: {}", e)))?;
+                .map_err(|e| tonic::Status::internal(format!("Failed to parse URI: {e}")))?;
 
             let http_request = hyper::Request::builder()
                 .method("POST")
@@ -846,13 +848,13 @@ pub mod grpc {
                 .header("content-type", "application/grpc")
                 .header("te", "trailers")
                 .body(hyper::Body::from(frame.freeze()))
-                .map_err(|e| tonic::Status::internal(format!("Failed to build HTTP request: {}", e)))?;
+                .map_err(|e| tonic::Status::internal(format!("Failed to build HTTP request: {e}")))?;
 
             let mut response = self
                 .http_client
                 .request(http_request)
                 .await
-                .map_err(|e| tonic::Status::internal(format!("HTTP request failed: {}", e)))?;
+                .map_err(|e| tonic::Status::internal(format!("HTTP request failed: {e}")))?;
 
             if response.status() != hyper::StatusCode::OK {
                 return Err(tonic::Status::internal(format!(
@@ -861,7 +863,8 @@ pub mod grpc {
                 )));
             }
 
-            // Check for gRPC error status in headers (server places status in headers on error)
+            // Check for gRPC error status in headers (server places status in headers on
+            // error)
             if let Some(gs) = response.headers().get("grpc-status") {
                 let code_i32 = gs.to_str().ok().and_then(|s| s.parse::<i32>().ok()).unwrap_or(2);
                 if code_i32 != 0 {
@@ -879,13 +882,14 @@ pub mod grpc {
             use futures_util::stream::StreamExt as _;
             let mut body_bytes = bytes::BytesMut::new();
             while let Some(chunk) = response.body_mut().next().await {
-                let chunk = chunk.map_err(|e| tonic::Status::internal(format!("Body read failed: {}", e)))?;
+                let chunk = chunk.map_err(|e| tonic::Status::internal(format!("Body read failed: {e}")))?;
                 body_bytes.extend_from_slice(&chunk);
             }
 
             let body_bytes = body_bytes.freeze();
             if body_bytes.len() < 5 {
-                // If grpc-status header indicated success but body is empty, treat as internal error
+                // If grpc-status header indicated success but body is empty, treat as internal
+                // error
                 return Err(tonic::Status::internal("Response too short"));
             }
             let message_bytes = &body_bytes[5..];
@@ -897,6 +901,7 @@ pub mod grpc {
                         slot: u64,
                         timestamp: u64,
                         batch_size: u32,
+                        worker_id: usize,
                         compressed_transactions: Vec<u8>,
                         compression_ratio: u64,
                     }
@@ -908,10 +913,11 @@ pub mod grpc {
                             compressed_transactions: legacy.compressed_transactions,
                             compression_ratio: legacy.compression_ratio,
                             job_id: 0,
+                            worker_id: legacy.worker_id,
                         }
                     })
                 })
-                .map_err(|e| tonic::Status::internal(format!("Failed to deserialize response: {}", e)))?;
+                .map_err(|e| tonic::Status::internal(format!("Failed to deserialize response: {e}")))?;
 
             Ok(tonic::Response::new(decoded))
         }
@@ -919,8 +925,7 @@ pub mod grpc {
 
     // Server module
     pub mod infini_svm_service_server {
-        pub use super::InfiniSvmService;
-        pub use super::InfiniSvmServiceServer;
+        pub use super::{InfiniSvmService, InfiniSvmServiceServer};
     }
 
     // Client module

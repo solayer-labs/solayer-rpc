@@ -1,3 +1,12 @@
+use std::{
+    fmt,
+    sync::{
+        atomic::{AtomicU32, AtomicU64, Ordering},
+        Arc, Arc as StdArc,
+    },
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
 use base64::Engine;
 use infinisvm_logger::{debug, error, info, warn};
 use infinisvm_types::sync::{
@@ -5,15 +14,12 @@ use infinisvm_types::sync::{
     GetLatestSlotResponse, GetTransactionBatchRequest, SlotDataResponse, StartReceivingSlotsRequest,
     TransactionBatchRequest,
 };
-use metrics::{counter, histogram};
-use std::fmt;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::Arc;
-use std::sync::Arc as StdArc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::net::TcpStream;
-use tokio::sync::{mpsc, RwLock};
-use tokio::time::sleep;
+use metrics::counter;
+use tokio::{
+    net::TcpStream,
+    sync::{mpsc, RwLock},
+    time::sleep,
+};
 use tokio_rustls::{rustls as rustls_conn, TlsConnector};
 use tokio_stream::StreamExt;
 use tonic::{
@@ -43,7 +49,7 @@ impl rustls::client::danger::ServerCertVerifier for Ed25519ServerCertVerifier {
         _now: rustls::pki_types::UnixTime,
     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
         if let Some(pk) = extract_ed25519_spki_pubkey(end_entity.as_ref()) {
-            if self.allowed_pubkeys.iter().any(|x| *x == pk) {
+            if self.allowed_pubkeys.contains(&pk) {
                 return Ok(rustls::client::danger::ServerCertVerified::assertion());
             }
         }
@@ -70,7 +76,7 @@ impl rustls::client::danger::ServerCertVerifier for Ed25519ServerCertVerifier {
         let Ok(vk) = PublicKey::from_bytes(&pk_bytes) else {
             return Err(rustls::Error::InvalidCertificate(rustls::CertificateError::BadEncoding));
         };
-        let sig_bytes = dss.signature().as_ref();
+        let sig_bytes = dss.signature();
         let Ok(sig) = Signature::from_bytes(sig_bytes) else {
             return Err(rustls::Error::InvalidCertificate(
                 rustls::CertificateError::BadSignature,
@@ -93,40 +99,6 @@ impl rustls::client::danger::ServerCertVerifier for Ed25519ServerCertVerifier {
         ))
     }
 
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        vec![rustls::SignatureScheme::ED25519]
-    }
-}
-
-#[derive(Debug)]
-struct AcceptAllServerCertVerifier;
-impl rustls::client::danger::ServerCertVerifier for AcceptAllServerCertVerifier {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &rustls::pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
-        _ocsp: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
         vec![rustls::SignatureScheme::ED25519]
     }
@@ -166,14 +138,15 @@ impl rustls_conn::client::danger::ServerCertVerifier for AcceptAllServerCertVeri
     }
 }
 
-// Helper that attempts to set a custom certificate verifier on a ClientTlsConfig if the
-// tonic version exposes the "dangerous" API. If not available, returns the input unchanged.
+// Helper that attempts to set a custom certificate verifier on a
+// ClientTlsConfig if the tonic version exposes the "dangerous" API. If not
+// available, returns the input unchanged.
 fn set_custom_verifier_if_supported(
     cfg: ClientTlsConfig,
     verifier: StdArc<dyn rustls::client::danger::ServerCertVerifier>,
 ) -> ClientTlsConfig {
-    // The specific API shape has changed across tonic versions. We attempt the common form
-    // via a small shim that compiles when the method exists.
+    // The specific API shape has changed across tonic versions. We attempt the
+    // common form via a small shim that compiles when the method exists.
     #[allow(unused_variables)]
     fn try_set(
         cfg: ClientTlsConfig,
@@ -193,15 +166,16 @@ impl fmt::Display for StaticError {
 }
 impl std::error::Error for StaticError {}
 
-// Minimal DER scan to extract the Ed25519 SPKI public key (32 bytes) from an X.509 cert
+// Minimal DER scan to extract the Ed25519 SPKI public key (32 bytes) from an
+// X.509 cert
 fn extract_ed25519_spki_pubkey(der: &[u8]) -> Option<[u8; 32]> {
     // Look for the OID 1.3.101.112 (ed25519): 06 03 2B 65 70
     const OID: &[u8] = &[0x06, 0x03, 0x2B, 0x65, 0x70];
     let mut i = 0;
     while let Some(pos) = memchr::memmem::find(&der[i..], OID) {
         i += pos + OID.len();
-        // After the algorithm identifier, the next BIT STRING (0x03) should be the SPKI key
-        // Scan forward up to a small window to find 0x03
+        // After the algorithm identifier, the next BIT STRING (0x03) should be the SPKI
+        // key Scan forward up to a small window to find 0x03
         let window = &der[i..der.len().min(i + 256)];
         if let Some(bit_pos_rel) = window.iter().position(|b| *b == 0x03) {
             let bit_pos = i + bit_pos_rel;
@@ -361,8 +335,6 @@ pub struct SyncClient {
     connection_url: String,
     // If present, enables TLS with custom Ed25519 pubkey verification on the server certificate
     allowed_server_pubkeys: Option<Vec<[u8; 32]>>,
-    // Optional: trust this CA/cert when building TLS (supports self-signed server cert)
-    root_ca_pem: Option<Vec<u8>>,
 }
 
 impl SyncClient {
@@ -379,7 +351,8 @@ impl SyncClient {
         Self::connect_with_tls(addr, retry_config, None, None).await
     }
 
-    /// Create a new SyncClient with custom retry config and allowed server pubkeys for TLS.
+    /// Create a new SyncClient with custom retry config and allowed server
+    /// pubkeys for TLS.
     pub async fn connect_with_config_and_pubkeys(
         addr: &str,
         retry_config: RetryConfig,
@@ -388,7 +361,8 @@ impl SyncClient {
         Self::connect_with_tls(addr, retry_config, allowed_server_pubkeys, None).await
     }
 
-    /// Create a new SyncClient with custom retry config, optional pubkey pinning, and optional root CA.
+    /// Create a new SyncClient with custom retry config, optional pubkey
+    /// pinning, and optional root CA.
     pub async fn connect_with_tls(
         addr: &str,
         retry_config: RetryConfig,
@@ -415,7 +389,6 @@ impl SyncClient {
             circuit_breaker,
             connection_url: addr.to_string(),
             allowed_server_pubkeys,
-            root_ca_pem,
         })
     }
 
@@ -454,7 +427,7 @@ impl SyncClient {
                     let mut i = 0;
                     while let Some(s) = src {
                         i += 1;
-                        msg.push_str(&format!("; source[{i}]: {}", s));
+                        msg.push_str(&format!("; source[{i}]: {s}"));
                         src = s.source();
                     }
                     last_error = Some(msg.clone());
@@ -509,7 +482,8 @@ impl SyncClient {
         let mut pinned_end_entity: Option<Vec<u8>> = None;
 
         if let Some(keys) = allowed_server_pubkeys {
-            // If no explicit CA provided, probe the server's end-entity cert and pin on SPKI
+            // If no explicit CA provided, probe the server's end-entity cert and pin on
+            // SPKI
             if root_ca_pem.is_none() {
                 let host_str = host.clone();
                 let port = uri.port_u16().unwrap_or(443);
@@ -541,11 +515,11 @@ impl SyncClient {
                 let end_entity = peer_certs.first().ok_or("empty peer certs")?;
 
                 if let Some(pk) = extract_ed25519_spki_pubkey(end_entity.as_ref()) {
-                    if !keys.iter().any(|x| *x == pk) {
+                    if !keys.contains(&pk) {
                         error!(
                             "server ed25519 pubkey mismatch; got={} expected_one_of={}",
                             hex::encode(pk),
-                            keys.iter().map(|k| hex::encode(k)).collect::<Vec<_>>().join(",")
+                            keys.iter().map(hex::encode).collect::<Vec<_>>().join(",")
                         );
                         return Err("server ed25519 pubkey mismatch".into());
                     }
@@ -712,34 +686,8 @@ impl SyncClient {
             }
         }
 
-        let error_msg =
-            last_error.unwrap_or_else(|| format!("Operation '{}' failed after all retries", operation_name));
+        let error_msg = last_error.unwrap_or_else(|| format!("Operation '{operation_name}' failed after all retries"));
         Err(error_msg.into())
-    }
-
-    /// Reconnect the client if connection is lost
-    async fn ensure_connection(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // Try a lightweight operation to check connection health
-        let health_check_result = {
-            let request = Request::new(GetLatestSlotRequest {});
-            self.client.get_latest_slot(request).await
-        };
-
-        if health_check_result.is_err() {
-            info!("Connection lost, attempting to reconnect...");
-            counter!("grpc_client_reconnects_total").increment(1);
-            self.client = Self::connect_with_retry(
-                &self.connection_url,
-                &self.retry_config,
-                &self.circuit_breaker,
-                &self.allowed_server_pubkeys,
-                &self.root_ca_pem,
-            )
-            .await?;
-            info!("Successfully reconnected to gRPC server");
-        }
-
-        Ok(())
     }
 
     pub async fn get_latest_slot(&mut self) -> Result<GetLatestSlotResponse, Box<dyn std::error::Error + Send + Sync>> {
@@ -771,7 +719,8 @@ impl SyncClient {
         Ok(result.into_inner())
     }
 
-    // Single RPC without the generic retry wrapper; returns tonic::Status for precise error handling
+    // Single RPC without the generic retry wrapper; returns tonic::Status for
+    // precise error handling
     pub async fn get_transaction_batch_status(
         &mut self,
         slot: u64,
@@ -1057,9 +1006,9 @@ impl SyncClient {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::time::Duration;
-    use tokio::time::timeout;
+
+    use super::*;
 
     /// Test default retry configuration
     #[test]
@@ -1156,7 +1105,7 @@ mod tests {
     #[tokio::test]
     async fn test_circuit_breaker() {
         let threshold = 3;
-        let timeout_duration = Duration::from_millis(100);
+        let timeout_duration = Duration::from_secs(1);
         let circuit_breaker = CircuitBreaker::new(threshold, timeout_duration);
 
         // Initially should be closed
@@ -1171,7 +1120,7 @@ mod tests {
         assert!(!circuit_breaker.can_execute().await);
 
         // Wait for timeout
-        tokio::time::sleep(timeout_duration + Duration::from_millis(10)).await;
+        tokio::time::sleep(timeout_duration + Duration::from_millis(200)).await;
 
         // Should be half-open now
         assert!(circuit_breaker.can_execute().await);

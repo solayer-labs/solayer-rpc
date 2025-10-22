@@ -7,6 +7,7 @@ pub struct SerializableBatch {
     pub timestamp: u64,
     pub job_id: usize,
     pub transactions: Vec<SerializableTxRow>,
+    pub worker_id: usize,
 }
 
 impl SerializableBatch {
@@ -17,6 +18,7 @@ impl SerializableBatch {
                 timestamp: 0,
                 job_id: 0,
                 transactions: Vec::new(),
+                worker_id: 0,
             };
         }
 
@@ -36,6 +38,7 @@ impl SerializableBatch {
             timestamp: first_job.timestamp,
             job_id: first_job.job_id,
             transactions,
+            worker_id: first_job.worker_id,
         }
     }
 }

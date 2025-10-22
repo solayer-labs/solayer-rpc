@@ -11,12 +11,10 @@ infinisvm-logger = { workspace = true }
 tokio = { workspace = true }
 solana-sdk = { workspace = true }
 eyre = { workspace = true }
-rocksdb = { workspace = true }
 bincode = { workspace = true }
 crossbeam-channel = { workspace = true }
 solana-account-decoder = { workspace = true }
 solana-hash = { workspace = true }
-solana-runtime-transaction = { workspace = true }
 solana-svm-transaction = { workspace = true }
 jsonrpsee = { workspace = true }
 spl-token = { workspace = true }

@@ -10,22 +10,43 @@ use std::{
     time::{Duration, Instant},
 };
 
+use base64::Engine;
 use clap::Parser;
 use infinisvm_core::{bank::Bank, indexer::Indexer, subscription::SubscriptionProcessor};
-use infinisvm_indexer::{
-    db::{ClickhouseIndexerDB, MultiDatabaseIndexer},
-    s3::S3FsClient,
-};
+use infinisvm_indexer::{db::{MultiDatabaseIndexer, NoopIndexer}, in_memory::InMemoryIndexer, s3::S3FsClient};
 use infinisvm_jsonrpc::{rpc_impl::RpcServer, rpc_state::RpcIndexer};
 use infinisvm_logger::{error, info, trace};
-use infinisvm_sync::{grpc::client::SyncClient, http_client::HttpClient};
+use infinisvm_sync::{
+    grpc::{client::SyncClient, server::InfiniSVMServiceImpl, TransactionBatchBroadcaster},
+    http_client::HttpClient,
+    SyncState,
+};
 use jsonrpsee::server::Server;
-use klickhouse::{bb8::Pool, ConnectionManager};
 use metrics_exporter_prometheus::PrometheusBuilder;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex, RwLock as TokioRwLock};
+use tonic::transport::Server as TonicServer;
 
 mod bank;
 mod cold_start;
+
+
+#[cfg(not(feature = "track_memory"))]
+#[global_allocator]
+static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+#[cfg(feature = "track_oom")]
+#[allow(non_upper_case_globals)]
+#[export_name = "malloc_conf"]
+pub static malloc_conf: &[u8] = b"prof:true,prof_active:true,lg_prof_sample:19\0";
+
+#[cfg(feature = "track_memory")]
+#[global_allocator]
+static ALLOCATOR: cap::Cap<tikv_jemallocator::Jemalloc> = cap::Cap::new(tikv_jemallocator::Jemalloc, usize::MAX);
+
+#[cfg(feature = "track_memory")]
+#[no_mangle]
+pub extern "C" fn get_memory_usage() -> usize {
+    ALLOCATOR.allocated()
+}
 
 #[cfg(feature = "pyroscope")]
 fn init_pyroscope(service_name: &str) {
@@ -85,17 +106,13 @@ fn init_pyroscope(_service_name: &str) {}
 fn parse_socket_addr(s: &str) -> Result<SocketAddr, String> {
     match s.parse() {
         Ok(addr) => Ok(addr),
-        Err(_) => Err(format!("Invalid socket address: {}", s)),
+        Err(_) => Err(format!("Invalid socket address: {s}")),
     }
 }
 
 #[derive(Parser, Debug)]
 #[command()]
 struct Args {
-    /// Cluster mode
-    #[arg(long, default_value = "false")]
-    cluster: bool,
-
     /// gRPC server address (e.g., "http://localhost:5005")
     #[arg(short = 'o', long, default_value = "localhost")]
     host: String,
@@ -104,21 +121,17 @@ struct Args {
     #[arg(short, long, default_value = "5005")]
     port: u16,
 
-    /// HTTP server address (e.g., "http://localhost:8080")
-    #[arg(long, default_value = "localhost")]
-    http_host: String,
+    /// Local gRPC listen address for downstream subscribers
+    #[arg(long, value_parser = parse_socket_addr, default_value = "0.0.0.0:15005")]
+    grpc_listen_addr: SocketAddr,
 
-    /// HTTP server port
-    #[arg(long, default_value = "6005")]
-    http_port: u16,
+    /// HTTP sync server (host:port)
+    #[arg(long, default_value = "localhost:6005")]
+    http_addr: String,
 
-    /// RPC server address (e.g., "http://localhost:8899")
-    #[arg(long, default_value = "127.0.0.1")]
-    rpc_host: String,
-
-    /// RPC server port
-    #[arg(long, default_value = "18899")]
-    rpc_port: u16,
+    /// JSON-RPC listen addr (host:port)
+    #[arg(long, default_value = "127.0.0.1:18899")]
+    rpc_addr: String,
 
     /// Prometheus metrics listen address
     #[arg(long, default_value = "127.0.0.1:3002")]
@@ -136,13 +149,14 @@ struct Args {
     #[arg(long, default_value = "http://127.0.0.1:8899")]
     sequencer_host: String,
 
-    /// Cassandra host addresses
-    #[arg(long, value_delimiter = ',', default_value = "127.0.0.1:9042")]
-    pub cassandra_hosts: Vec<String>,
+    /// Cassandra host addresses (optional, comma-delimited). If omitted, uses in-memory indexer.
+    /// default_value = "127.0.0.1:9042"
+    #[arg(long, value_delimiter = ',')]
+    pub cassandra_hosts: Option<Vec<String>>,
 
-    /// Cassandra instance replication factor
-    #[arg(long, default_value = "1")]
-    pub cassandra_replication_factor: u8,
+    /// Cassandra instance replication factor (optional, defaults to 1)
+    #[arg(long)]
+    pub cassandra_replication_factor: Option<u8>,
 
     #[arg(long, default_value = "s3://infinisvm-dev/")]
     pub s3_path: String,
@@ -155,30 +169,42 @@ struct Args {
     #[arg(long)]
     pub s3_secret_key: Option<String>,
 
-    /// One or more Ed25519 server public keys (hex/base58/base64) for TLS verification
+    /// One or more Ed25519 server public keys (hex/base58/base64) for TLS
+    /// verification
     #[arg(long, value_delimiter = ',')]
     pub grpc_server_pubkeys: Vec<String>,
 
-    /// Trust this server certificate/CA for TLS (PEM). Useful for self-signed certs.
+    /// Trust this server certificate/CA for TLS (PEM). Useful for self-signed
+    /// certs.
     #[arg(long)]
     pub grpc_server_cert: Option<String>,
 }
 
 async fn create_indexer(args: &Args) -> (Arc<Mutex<dyn Indexer>>, Arc<dyn RpcIndexer>) {
+    // Fallback to in-memory indexer if Cassandra hosts are not provided
+    let hosts = args.cassandra_hosts.as_ref().map(|v| v.as_slice()).unwrap_or(&[]);
+    if hosts.is_empty() {
+        info!("No Cassandra hosts provided; using in-memory indexer");
+        let indexer = Arc::new(Mutex::new(NoopIndexer));
+        let rpc_indexer = Arc::new(InMemoryIndexer::new());
+        return (indexer, rpc_indexer);
+    }
+
     let s3 = S3FsClient::new_with_credentials(
         PathBuf::from(args.s3_path.clone()),
         args.s3_access_key_id.clone(),
         args.s3_secret_key.clone(),
     );
 
-    let mut pools = Vec::with_capacity(args.cassandra_hosts.len());
-    let mut readonly_pools = Vec::with_capacity(args.cassandra_hosts.len());
-    for host in &args.cassandra_hosts {
-        for _ in 0..args.cassandra_replication_factor {
+    let rep_factor = args.cassandra_replication_factor.unwrap_or(1);
+    let mut pools = Vec::with_capacity(hosts.len());
+    let mut readonly_pools = Vec::with_capacity(hosts.len());
+    for host in hosts {
+        for _ in 0..rep_factor {
             {
                 // Create a connection to Cassandra
                 let host_splitted = host.split(':').collect::<Vec<&str>>();
-                assert!(host_splitted.len() == 2, "Invalid host: {}", host);
+                assert!(host_splitted.len() == 2, "Invalid host: {host}");
                 let host = host_splitted[0];
                 let port = host_splitted[1].parse::<u16>().unwrap();
                 let cassandra_pool = infinisvm_indexer::db::CassandraIndexerDB::new(host, port).await;
@@ -216,9 +242,93 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     let args = Args::parse();
 
+
+    #[cfg(feature = "track_oom")]
+    {
+        use axum::{http::StatusCode, response::IntoResponse};
+
+        std::thread::Builder::new()
+            .name("seqPprof".to_string())
+            .spawn(move || {
+                let runtime = tokio::runtime::Runtime::new().unwrap();
+                runtime.block_on(async {
+                    pub async fn handle_get_heap() -> Result<impl IntoResponse, (StatusCode, String)> {
+                        let mut prof_ctl = jemalloc_pprof::PROF_CTL.as_ref().unwrap().lock().await;
+                        require_profiling_activated(&prof_ctl)?;
+                        let pprof = prof_ctl
+                            .dump_pprof()
+                            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+                        Ok(pprof)
+                    }
+
+                    /// Checks whether jemalloc profiling is activated an
+                    /// returns an error response if not.
+                    fn require_profiling_activated(
+                        prof_ctl: &jemalloc_pprof::JemallocProfCtl,
+                    ) -> Result<(), (StatusCode, String)> {
+                        if prof_ctl.activated() {
+                            Ok(())
+                        } else {
+                            Err((axum::http::StatusCode::FORBIDDEN, "heap profiling not activated".into()))
+                        }
+                    }
+
+                    pub async fn handle_get_heap_flamegraph() -> Result<impl IntoResponse, (StatusCode, String)> {
+                        use axum::{body::Body, http::header::CONTENT_TYPE, response::Response};
+
+                        let mut prof_ctl = jemalloc_pprof::PROF_CTL.as_ref().unwrap().lock().await;
+                        require_profiling_activated(&prof_ctl)?;
+                        let svg = prof_ctl
+                            .dump_flamegraph()
+                            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+                        Response::builder()
+                            .header(CONTENT_TYPE, "image/svg+xml")
+                            .body(Body::from(svg))
+                            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))
+                    }
+
+                    let a = jemalloc_pprof::PROF_CTL.as_ref();
+                    if a.is_some() {
+                        println!("Jemalloc profiling activated");
+                    } else {
+                        println!("Jemalloc profiling not activated");
+                    }
+
+                    let app = axum::Router::new()
+                        .route("/debug/pprof/heap", axum::routing::get(handle_get_heap))
+                        .route(
+                            "/debug/pprof/heap/flamegraph",
+                            axum::routing::get(handle_get_heap_flamegraph),
+                        );
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await.unwrap();
+                    axum::serve(listener, app).await.unwrap();
+                });
+            })
+            .unwrap();
+    }
+
     // Start Prometheus metrics exporter
     let builder = PrometheusBuilder::new().with_http_listener(args.metric_addr);
     builder.install().expect("Failed to install recorder/exporter");
+
+    let batch_broadcaster = Arc::new(TransactionBatchBroadcaster::new());
+    let (sync_state_inner, latest_slot_receiver) = SyncState::new((0, vec![], vec![], 0, vec![]));
+    let sync_state = Arc::new(TokioRwLock::new(sync_state_inner));
+    let grpc_service_impl =
+        InfiniSVMServiceImpl::new(sync_state.clone(), latest_slot_receiver, batch_broadcaster.clone()).await;
+    let grpc_service = grpc_service_impl.into_service();
+    let grpc_listen_addr = args.grpc_listen_addr;
+    tokio::spawn(async move {
+        info!("rpc-v2 gRPC server listening on {}", grpc_listen_addr);
+        if let Err(e) = TonicServer::builder()
+            .tcp_nodelay(true)
+            .add_service(grpc_service)
+            .serve(grpc_listen_addr)
+            .await
+        {
+            error!("rpc-v2 gRPC server failed: {}", e);
+        }
+    });
 
     info!(
         "Connecting to gRPC server at: {}:({}-{})",
@@ -246,7 +356,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             }
         }
         // base64
-        if let Ok(bytes) = base64::decode(s) {
+        if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(s) {
             if bytes.len() == 32 {
                 let mut arr = [0u8; 32];
                 arr.copy_from_slice(&bytes);
@@ -265,7 +375,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         Some(path) => match std::fs::read(path) {
             Ok(bytes) => Some(bytes),
             Err(e) => {
-                eprintln!("Failed to read --grpc-server-cert {}: {}", path, e);
+                eprintln!("Failed to read --grpc-server-cert {path}: {e}");
                 None
             }
         },
@@ -312,7 +422,61 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         slot_receivers.push(slot_receiver);
     }
 
-    let http_client = Arc::new(HttpClient::new(format!("http://{}:{}", args.http_host, args.http_port)));
+    let tx_receivers = tx_receivers
+        .into_iter()
+        .enumerate()
+        .map(|(i, mut upstream_rx)| {
+            let (forward_tx, forward_rx) = mpsc::channel(1024);
+            let broadcaster_clone = batch_broadcaster.clone();
+            tokio::spawn(async move {
+                info!("Transaction forwarder {} started", i);
+                while let Some(batch) = upstream_rx.recv().await {
+                    let shared_batch = Arc::new(batch);
+                    if let Err(e) = broadcaster_clone.publish_notification(shared_batch.clone()) {
+                        error!("Forwarder {} failed to publish batch: {}", i, e);
+                    }
+                    if forward_tx.send(shared_batch).await.is_err() {
+                        break;
+                    }
+                }
+                info!("Transaction forwarder {} terminated", i);
+            });
+            forward_rx
+        })
+        .collect::<Vec<_>>();
+
+    let slot_receivers = slot_receivers
+        .into_iter()
+        .enumerate()
+        .map(|(i, mut upstream_rx)| {
+            let (forward_tx, forward_rx) = mpsc::channel(1024);
+            let sync_state_clone = sync_state.clone();
+            tokio::spawn(async move {
+                info!("Slot forwarder {} started", i);
+                while let Some(slot) = upstream_rx.recv().await {
+                    let slot_tuple = (
+                        slot.slot,
+                        slot.blockhash.clone(),
+                        slot.parent_blockhash.clone(),
+                        slot.timestamp,
+                        slot.job_ids.clone(),
+                    );
+                    {
+                        let mut state = sync_state_clone.write().await;
+                        state.latest_slot = slot_tuple.clone();
+                        state.notify_new_slot(slot_tuple);
+                    }
+                    if forward_tx.send(slot).await.is_err() {
+                        break;
+                    }
+                }
+                info!("Slot forwarder {} terminated", i);
+            });
+            forward_rx
+        })
+        .collect::<Vec<_>>();
+
+    let http_client = Arc::new(HttpClient::new(format!("http://{}", args.http_addr)));
 
     let snapshots = http_client.get_snapshots().await?;
     info!("Successfully got snapshots: {:?}", snapshots.get_ckpts_to_download());
@@ -373,10 +537,12 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     }
 
     let (tx_sender, tx_receiver) = crossbeam_channel::unbounded();
-    // Drain the local sendTransaction channel to avoid unbounded growth; follower forwards writes upstream
+    // Drain the local sendTransaction channel to avoid unbounded growth; follower
+    // forwards writes upstream
     std::thread::spawn(move || {
         while let Ok((_tx, _prio)) = tx_receiver.recv() {
-            // Intentionally drop; rpc-v2 forwards writes to the sequencer via HTTP
+            // Intentionally drop; rpc-v2 forwards writes to the sequencer via
+            // HTTP
         }
     });
 
@@ -415,10 +581,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .max_connections(10000)
         .max_subscriptions_per_connection(5000)
         .set_http_middleware(middleware)
-        .build(format!("{}:{}", args.rpc_host, args.rpc_port))
+        .build(args.rpc_addr.clone())
         .await
         .unwrap();
-    info!("Starting RPC server on {}:{}", args.rpc_host, args.rpc_port);
+    info!("Starting RPC server on {}", args.rpc_addr);
     let handle = server.start(module);
     info!("Background task count: {}", handles.len());
     // Wait for any handle to exit, then crash

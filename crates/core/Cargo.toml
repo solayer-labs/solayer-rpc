@@ -5,7 +5,6 @@ edition = "2021"
 
 [dependencies]
 bincode.workspace = true
-async-channel.workspace = true
 crossbeam-channel.workspace = true
 bytes.workspace = true
 eyre.workspace = true
@@ -18,15 +17,15 @@ rayon = "1.10.0"
 solana-hash.workspace = true
 solana-program-runtime.workspace = true
 solana-pubkey.workspace = true
-solana-runtime.workspace = true
 solana-sdk.workspace = true
 solana-svm.workspace = true
+solana-svm-transaction.workspace = true
+solana-fee.workspace = true
 solana-compute-budget.workspace = true
 solana-bpf-loader-program.workspace = true
 solana-builtins.workspace = true
 agave-feature-set.workspace = true
 
-rocksdb.workspace = true
 
 serde.workspace = true
 tokio.workspace = true
@@ -49,14 +48,14 @@ rustls.workspace = true
 rcgen.workspace = true
 paste.workspace = true
 jsonrpsee.workspace = true
-solana-perf.workspace = true
 
 [dev-dependencies]
 tempfile = "3.10"
 
 [features]
+default = []
 no_bind_cpu = []
 track_memory = []
-no_index = []
 in_memory_db = []
-debug_merger = []
+mainnet = []
+devnet = []

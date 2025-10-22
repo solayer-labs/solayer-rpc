@@ -90,6 +90,12 @@ impl<T: std::hash::Hash + Eq + Send + Sync> ConnectionRateLimiter<T> {
     }
 }
 
+impl<T: std::hash::Hash + Eq + Send + Sync> Default for ConnectionRateLimiter<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub struct WebSocketMiddleware {
     rate_limiter: Arc<ConnectionRateLimiter<jsonrpsee::ConnectionId>>,
 }
@@ -118,21 +124,20 @@ impl WebSocketMiddleware {
     }
 }
 
+impl Default for WebSocketMiddleware {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
 
-    use infinisvm_core::bank::TransactionStatus;
-    use infinisvm_types::{BlockWithTransactions, TransactionWithMetadata};
+    use infinisvm_types::BlockWithTransactions;
     use solana_sdk::{
-        account::{Account, AccountSharedData, ReadableAccount},
+        account::{Account, AccountSharedData},
         pubkey::Pubkey,
-        signature::Signature,
-        transaction::VersionedTransaction,
     };
-    use tokio::time::timeout;
-
-    use super::*;
 
     fn create_test_account() -> AccountSharedData {
         AccountSharedData::from(Account {

@@ -15,6 +15,6 @@ impl DummyRpcBlockhashGenerator {
     pub fn next(&mut self) -> Hash {
         let mut hash_buffer = [0u8; 32];
         self.rng.fill(&mut hash_buffer);
-        Hash::new(&hash_buffer)
+        Hash::new_from_array(hash_buffer)
     }
 }

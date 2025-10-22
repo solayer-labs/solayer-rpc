@@ -20,7 +20,7 @@ const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub fn process_commit_notification(
-    notification: CommitBatchNotification,
+    notification: &CommitBatchNotification,
 ) -> Result<SerializableBatch, Box<dyn std::error::Error + Send + Sync>> {
     info!(
         "Received batch notification: slot={}, batch_size={}, compression_ratio={}%",
@@ -35,6 +35,7 @@ pub fn process_commit_notification(
             timestamp: notification.timestamp,
             job_id: notification.job_id as usize,
             transactions: Vec::new(),
+            worker_id: notification.worker_id,
         });
     }
 
@@ -136,7 +137,7 @@ impl TransactionBatchSubscriber {
         &self,
         notification: CommitBatchNotification,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let batch = process_commit_notification(notification)?;
+        let batch = process_commit_notification(&notification)?;
 
         self.notification_sender.send(batch)?;
 

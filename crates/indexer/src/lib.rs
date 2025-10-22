@@ -12,17 +12,6 @@ use solana_svm::{
 };
 use solana_transaction_status_client_types::{InnerInstruction, InnerInstructions, TransactionStatusMeta};
 
-// Configure tests only when running tests
-#[cfg(test)]
-mod tests {
-    // Path to the clickhouse_test module in the current directory
-    use crate::db_test;
-}
-
-// Add the clickhouse_test module but only for tests
-#[cfg(test)]
-pub mod db_test;
-
 pub fn map_inner_instructions(inner_instructions: InnerInstructionsList) -> impl Iterator<Item = InnerInstructions> {
     inner_instructions
         .into_iter()

@@ -4,24 +4,24 @@ use std::{
     fs::File,
     io::Write,
     path::{Path, PathBuf},
+    sync::{Arc, OnceLock},
     thread::JoinHandle,
     time::Instant,
 };
 
+use bytes::Bytes;
 use hashbrown::HashMap;
 use infinisvm_logger::{error, info};
-use rayon::prelude::*;
+use object_store::{path::Path as ObjectStorePath, ObjectStore, PutPayload};
+use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
 use solana_sdk::{account::AccountSharedData, pubkey::Pubkey};
 
-use crate::{
-    encoding,
-    versioned::{AccountVersion, VersionedDB},
-};
+use crate::{encoding, Database};
 
 #[derive(Default)]
 pub struct PersistedInMemoryDB {
-    accounts: HashMap<Pubkey, (AccountSharedData, AccountVersion)>,
-    uncommitted_accounts: HashMap<Pubkey, (AccountSharedData, AccountVersion)>,
+    accounts: HashMap<Pubkey, AccountSharedData>,
+    uncommitted_accounts: HashMap<Pubkey, AccountSharedData>,
 
     persisted: bool,
     tasks: VecDeque<JoinHandle<()>>,
@@ -29,6 +29,7 @@ pub struct PersistedInMemoryDB {
 
 pub const DB_DIRECTORY: &str = "/mnt/data/chaindata";
 pub const CHECKPOINT_PREFIX: &str = "ckpt_";
+pub const KEEP_CHECKPOINTS: u64 = 1200;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum DBFile {
@@ -74,11 +75,12 @@ impl DBFile {
         }
     }
 
+    #[allow(clippy::inherent_to_string)]
     pub fn to_string(&self) -> String {
         match self {
-            DBFile::Checkpoint(slot) => format!("{}{:018}.bin", CHECKPOINT_PREFIX, slot),
-            DBFile::Account(slot) => format!("accounts_{:018}.bin", slot),
-            DBFile::Shred(slot, shred_idx) => format!("shred_{:018}_{:018}.bin", slot, shred_idx),
+            DBFile::Checkpoint(slot) => format!("{CHECKPOINT_PREFIX}{slot:018}.bin"),
+            DBFile::Account(slot) => format!("accounts_{slot:018}.bin"),
+            DBFile::Shred(slot, shred_idx) => format!("shred_{slot:018}_{shred_idx:018}.bin"),
         }
     }
 
@@ -120,6 +122,48 @@ impl Drop for PersistedInMemoryDB {
     }
 }
 
+fn s3_runtime() -> &'static tokio::runtime::Runtime {
+    static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("Failed to create S3 runtime")
+    })
+}
+
+fn upload_account_file_to_s3(config: &Arc<crate::merger::S3UploadConfig>, path: &Path) -> std::io::Result<()> {
+    let file_name = path.file_name().and_then(|name| name.to_str()).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("Invalid account file name: {path:?}"),
+        )
+    })?;
+
+    let data = std::fs::read(path)?;
+    let bytes = Bytes::from(data);
+    let object_key = config.object_key(file_name);
+    let client = config.client();
+    let object_path = ObjectStorePath::from(object_key.clone());
+    let payload: PutPayload = bytes.into();
+
+    info!("Uploading account file {:?} to S3 at {}", path, object_key);
+
+    let upload_future = async move {
+        client
+            .put(&object_path, payload)
+            .await
+            .map(|_| ())
+            .map_err(|err| std::io::Error::other(format!("Failed to upload account file to S3: {err}")))
+    };
+
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.block_on(upload_future)
+    } else {
+        s3_runtime().block_on(upload_future)
+    }
+}
+
 impl PersistedInMemoryDB {
     pub fn persisted_db_from_disk() -> (Self, u64, Vec<PathBuf>) {
         let mut db = Self::default();
@@ -136,12 +180,10 @@ impl PersistedInMemoryDB {
         if let Ok(entries) = std::fs::read_dir(DB_DIRECTORY) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if let Some(db_file) = DBFile::from_path(&path) {
-                    if let DBFile::Checkpoint(slot) = db_file {
-                        if slot > latest_slot {
-                            latest_slot = slot;
-                            latest_path = path.clone();
-                        }
+                if let Some(DBFile::Checkpoint(slot)) = DBFile::from_path(&path) {
+                    if slot > latest_slot {
+                        latest_slot = slot;
+                        latest_path = path.clone();
                     }
                 }
             }
@@ -150,13 +192,11 @@ impl PersistedInMemoryDB {
         (latest_slot, latest_path)
     }
 
-    pub fn load_accounts_from_file(path: &Path) -> std::io::Result<Vec<(Pubkey, AccountSharedData, AccountVersion)>> {
-        let file = File::open(path)?;
-        let buf_reader = std::io::BufReader::new(file);
-        let result =
-            bincode::deserialize_from(buf_reader).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
+    pub fn load_accounts_from_file(path: &Path) -> std::io::Result<Vec<(Pubkey, AccountSharedData)>> {
+        let data = std::fs::read(path)?;
+        let result = encoding::decode(&data).map_err(std::io::Error::other)?;
         info!("Deserialized accounts from file {:?}", path);
-        result
+        Ok(result)
     }
 
     pub fn list_incremental_files(since_slot: u64) -> Vec<PathBuf> {
@@ -175,6 +215,21 @@ impl PersistedInMemoryDB {
             }
         }
 
+        files
+    }
+
+    pub fn list_ckpt_files() -> Vec<DBFile> {
+        let mut files = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(DB_DIRECTORY) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if let Some(db_file) = DBFile::from_path(&path) {
+                    if let DBFile::Checkpoint(_) = db_file {
+                        files.push(db_file);
+                    }
+                }
+            }
+        }
         files
     }
 
@@ -241,8 +296,8 @@ impl PersistedInMemoryDB {
             info!("Loading checkpoint from slot {}", slot);
             match Self::load_accounts_from_file(&checkpoint_path) {
                 Ok(accounts) => {
-                    for (pubkey, account, version) in accounts {
-                        self.accounts.insert(pubkey, (account, version));
+                    for (pubkey, account) in accounts {
+                        self.accounts.insert(pubkey, account);
                     }
                     loaded_latest_slot = slot;
                 }
@@ -298,12 +353,10 @@ impl PersistedInMemoryDB {
         for (nth, (slot, accounts)) in loaded_accounts.into_iter().enumerate() {
             assert!(
                 slot > loaded_latest_slot,
-                "slot {} is not greater than loaded_latest_slot {}",
-                slot,
-                loaded_latest_slot
+                "slot {slot} is not greater than loaded_latest_slot {loaded_latest_slot}",
             );
-            for (pubkey, account, version) in accounts {
-                self.accounts.insert(pubkey, (account, version));
+            for (pubkey, account) in accounts {
+                self.accounts.insert(pubkey, account);
             }
             loaded_latest_slot = slot;
             info!(
@@ -340,9 +393,7 @@ impl PersistedInMemoryDB {
 
         assert!(
             loaded_latest_slot == load_until,
-            "loaded_latest_slot {} is not equal to load_until {}",
-            loaded_latest_slot,
-            load_until
+            "loaded_latest_slot {loaded_latest_slot} is not equal to load_until {load_until}",
         );
         info!("Finished loading {} accounts", self.accounts.len());
         (loaded_latest_slot, files)
@@ -350,24 +401,39 @@ impl PersistedInMemoryDB {
 
     pub fn merge_accounts() -> std::io::Result<()> {
         let (mut db, commited_slot, files) = PersistedInMemoryDB::persisted_db_from_disk();
-        let checkpoint_path = format!("{}/{}{:018}.wip", DB_DIRECTORY, CHECKPOINT_PREFIX, commited_slot);
+        let checkpoint_path = format!("{DB_DIRECTORY}/{CHECKPOINT_PREFIX}{commited_slot:018}.wip");
         let mut file = File::create(&checkpoint_path)?;
 
         // Serialize all accounts to the checkpoint file
         let accounts = std::mem::take(&mut db.accounts);
-        let bytes =
-            encoding::encode_hashmap(accounts).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let bytes = encoding::encode_hashmap(accounts).map_err(std::io::Error::other)?;
 
         file.write_all(&bytes)?;
         file.sync_all()?;
         file.flush()?;
         std::fs::rename(
             &checkpoint_path,
-            format!("{}/{}{:018}.bin", DB_DIRECTORY, CHECKPOINT_PREFIX, commited_slot),
+            format!("{DB_DIRECTORY}/{CHECKPOINT_PREFIX}{commited_slot:018}.bin"),
         )?;
 
+        let s3_config = crate::merger::current_s3_upload_config();
+
         for file in files {
+            if let Some(config) = s3_config.as_ref() {
+                upload_account_file_to_s3(config, &file)?;
+            }
             std::fs::remove_file(file)?;
+        }
+
+        for f in PersistedInMemoryDB::list_ckpt_files() {
+            if let DBFile::Checkpoint(slot) = f {
+                if slot < commited_slot - KEEP_CHECKPOINTS {
+                    info!("Removing checkpoint file {}", f.to_string());
+                    std::fs::remove_file(format!("{}/{}", DB_DIRECTORY, f.to_string()))?;
+                } else {
+                    info!("Keeping checkpoint file {}", f.to_string());
+                }
+            }
         }
 
         Ok(())
@@ -381,16 +447,15 @@ impl PersistedInMemoryDB {
             let accounts = std::mem::take(&mut self.uncommitted_accounts);
 
             // Extend the accounts map with the uncommitted accounts
-            self.accounts.extend(
-                accounts
-                    .iter()
-                    .map(|(pubkey, (account, version))| (*pubkey, (account.clone(), *version))),
-            );
+            for (pubkey, account) in accounts.iter() {
+                self.accounts.insert(*pubkey, account.clone());
+            }
 
             if self.persisted {
+                let accounts = accounts;
                 // Use std::thread instead of tokio to avoid runtime dependency
                 let task = std::thread::spawn(move || {
-                    let filename = format!("{}/accounts_{:018}.bin", DB_DIRECTORY, slot);
+                    let filename = format!("{DB_DIRECTORY}/accounts_{slot:018}.bin");
                     info!("Committing accounts to disk for slot {}", slot);
 
                     // Unlikely to fail, unless under critical error
@@ -416,46 +481,37 @@ impl PersistedInMemoryDB {
         true
     }
 
-    pub fn active_account_db_delta(&self) -> HashMap<Pubkey, (AccountSharedData, AccountVersion)> {
+    pub fn active_account_db_delta(&self) -> HashMap<Pubkey, AccountSharedData> {
         self.uncommitted_accounts.clone()
     }
 }
 
-impl VersionedDB for PersistedInMemoryDB {
-    fn get_account_with_version(&self, pubkey: Pubkey) -> eyre::Result<Option<(AccountSharedData, AccountVersion)>> {
-        // Check uncommitted accounts first, then committed accounts
-        if let Some((account, version)) = self
+impl Database for PersistedInMemoryDB {
+    fn get_account(&self, pubkey: Pubkey) -> eyre::Result<Option<AccountSharedData>> {
+        Ok(self
             .uncommitted_accounts
             .get(&pubkey)
             .or_else(|| self.accounts.get(&pubkey))
-        {
-            return Ok(Some((account.clone(), *version)));
-        }
-        Ok(None)
+            .cloned())
     }
 
-    fn write_account_with_version(&mut self, pubkey: Pubkey, account: AccountSharedData, version: AccountVersion) {
-        self.uncommitted_accounts.insert(pubkey, (account, version));
+    fn write_account(&mut self, pubkey: Pubkey, account: AccountSharedData) {
+        self.uncommitted_accounts.insert(pubkey, account);
     }
 
-    fn tx_version(&self) -> u64 {
-        unreachable!("tx_version should not be called on PersistedInMemoryDB")
+    fn get_slot_info(&self) -> eyre::Result<crate::SlotHash> {
+        Ok((0, Default::default()))
     }
 
-    fn set_tx_version(&mut self, _version: u64) {
-        unreachable!("set_tx_version should not be called on PersistedInMemoryDB")
+    fn update_slot_info(&mut self, _slot_info: crate::SlotHash) {
+        // PersistedInMemoryDB does not currently track slot info.
     }
 
     fn commit(&mut self, slot: u64) {
         self.commit_changes(slot);
     }
 
-    fn commit_changes_raw(&mut self, changes: Vec<(Pubkey, AccountSharedData, AccountVersion)>) {
-        // Extend the accounts map with the uncommitted accounts
-        self.accounts.extend(
-            changes
-                .iter()
-                .map(|(pubkey, account, version)| (*pubkey, (account.clone(), *version))),
-        );
+    fn commit_changes_raw(&mut self, changes: Vec<(Pubkey, AccountSharedData)>) {
+        self.accounts.extend(changes);
     }
 }

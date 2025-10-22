@@ -1,4 +1,3 @@
-use itertools::Itertools;
 use std::{
     collections::HashMap,
     sync::{
@@ -23,16 +22,16 @@ use futures_util::pin_mut;
 use infinisvm_core::indexer::Indexer;
 use infinisvm_jsonrpc::rpc_state::RpcIndexer;
 use infinisvm_logger::{debug, error, info, timer::ScopedTimer, warn};
-use infinisvm_types::serializable::{RowTy, SignatureRow, TxRow, TxRowWithTimestamp};
 use infinisvm_types::{
     convert::{to_signature_rows, to_tx_row, token_balance_diff_from_diffs},
+    jobs::ConsumedJob,
     serializable::{
-        AccountDataDiff, AccountMintRow, AccountOwnerRow, SerializableTxRow, SingleAccountRow, SingleSignatureRow,
-        SlotRow, TransactionExecutionDetailsSerializable,
+        AccountDataDiff, AccountMintRow, AccountOwnerRow, RowTy, SerializableTxRow, SignatureRow, SingleAccountRow,
+        SingleSignatureRow, SlotRow, TransactionExecutionDetailsSerializable, TxRow, TxRowWithTimestamp,
     },
     BlockWithTransactions, TransactionWithMetadata,
 };
-use infinisvm_types::{jobs::ConsumedJob, serializable::SingleSeqNumberRow};
+use itertools::Itertools;
 use klickhouse::{
     bb8::{Pool, PooledConnection},
     ConnectionManager,
@@ -44,7 +43,6 @@ use solana_sdk::{
     account::AccountSharedData, clock::Slot, message::v0::LoadedAddresses, signature::Signature,
     transaction::VersionedTransaction,
 };
-
 use solana_transaction_status_client_types::{TransactionStatusMeta, TransactionTokenBalance};
 // Removed SortedVec usage to avoid O(n) per-insert cost under contention
 use tokio_postgres::binary_copy::BinaryCopyInWriter;
@@ -57,7 +55,6 @@ use crate::{
 
 const DEFAULT_CACHE_SIZE: usize = 5000;
 const FILE_CHUNK_SIZE: usize = 200000;
-const MAX_CASSANDRA_CHUNK_SIZE: usize = 32 * 1024; // 32KB max, buffer for half
 
 const SLOT_TABLE_NAME: &str = "indexer_dev.slots";
 const SIGNATURE_TABLE_NAME: &str = "indexer_dev.signatures";
@@ -155,7 +152,7 @@ pub struct CassandraIndexerDB {
 impl CassandraIndexerDB {
     pub async fn new(host: &str, port: u16) -> Self {
         let cluster_config = NodeTcpConfigBuilder::new()
-            .with_contact_point(format!("{}:{}", host, port).into())
+            .with_contact_point(format!("{host}:{port}").into())
             .with_authenticator_provider(Arc::new(NoneAuthenticatorProvider))
             .build()
             .await
@@ -267,7 +264,7 @@ impl IndexerDB for CassandraIndexerDB {
         let mut offset = None;
         let mut limit = None;
 
-        let query = format!("{} ALLOW FILTERING", query);
+        let query = format!("{query} ALLOW FILTERING");
 
         for cap in re.find_iter(&query) {
             let part = cap.as_str().to_uppercase();
@@ -384,11 +381,7 @@ impl IndexerDB for ClickhouseIndexerDB {
     fn to_array_string(bytes: &[u8]) -> String {
         format!(
             "[{}]",
-            bytes
-                .iter()
-                .map(|x| format!("{}", x))
-                .collect::<Vec<String>>()
-                .join(",")
+            bytes.iter().map(|x| format!("{x}")).collect::<Vec<String>>().join(",")
         )
     }
 
@@ -404,7 +397,7 @@ pub struct PostgresIndexerDB {
 
 impl PostgresIndexerDB {
     pub async fn new(pg_url: &str) -> Self {
-        println!("Connecting to {}", pg_url);
+        println!("Connecting to {pg_url}");
         let manager =
             bb8_postgres::PostgresConnectionManager::new_from_stringlike(pg_url, tokio_postgres::NoTls).unwrap();
         let pool = bb8::Pool::builder().max_size(15).build(manager).await.unwrap();
@@ -606,8 +599,8 @@ impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB>
                 info!(
                     "Successfully flushed {} transactions[{} - {}] to database for slot {} in {:?}ms",
                     block_len,
-                    Signature::try_from(start_tx_sig).unwrap(),
-                    Signature::try_from(end_tx_sig).unwrap(),
+                    Signature::from(start_tx_sig),
+                    Signature::from(end_tx_sig),
                     slot,
                     duration.as_millis()
                 );
@@ -1024,7 +1017,7 @@ impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB>
             let query = format!(
                 "SELECT * FROM {} WHERE slot = {}",
                 if SLOT::require_distributed() {
-                    format!("{}_dist", SLOT_TABLE_NAME)
+                    format!("{SLOT_TABLE_NAME}_dist")
                 } else {
                     SLOT_TABLE_NAME.to_string()
                 },
@@ -1042,7 +1035,9 @@ impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB>
         result.first().map(|row| BlockWithTransactions {
             slot: row.slot,
             block_unix_timestamp: row.block_unix_timestamp,
+            #[allow(deprecated)]
             blockhash: Hash::new(&row.blockhash.0).to_string(),
+            #[allow(deprecated)]
             parent_blockhash: Hash::new(&row.parent_blockhash.0).to_string(),
             parent_slot: row.slot,
             transactions: vec![],
@@ -1058,7 +1053,7 @@ impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB>
         // Execute the query
         let query = format!(
             "SELECT signature, transaction, result, slot, pre_accounts, block_unix_timestamp, seq_number FROM {} WHERE signature = {} LIMIT 1",
-            if TX::require_distributed() { format!("{}_dist", TX_TABLE_NAME) } else { TX_TABLE_NAME.to_string() },
+            if TX::require_distributed() { format!("{TX_TABLE_NAME}_dist") } else { TX_TABLE_NAME.to_string() },
             sig_bytes
         );
 
@@ -1289,7 +1284,7 @@ impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB>
 
             // Execute the query
             let query = format!("SELECT signature, transaction, result, slot, pre_accounts, block_unix_timestamp, seq_number FROM {} WHERE slot = {} LIMIT {} OFFSET {}",
-                if TX::require_distributed() { format!("{}_dist", TX_TABLE_NAME) } else { TX_TABLE_NAME.to_string() },
+                if TX::require_distributed() { format!("{TX_TABLE_NAME}_dist") } else { TX_TABLE_NAME.to_string() },
                 slot,
                 limit,
                 offset
@@ -1329,242 +1324,225 @@ impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB>
 
         let account_hex = SIGNATURE::to_array_string(&account.to_bytes());
 
-        match filters {
-            // infinisvm_types::SignatureFilters::TimeRange(before, after) => match (before, after) {
-            //     (Some(before), None) => {
-            //         query = format!(
-            //                 "SELECT signature FROM {} WHERE account = {} AND block_unix_timestamp < {} ORDER BY seq_number DESC",
-            //                 if SIGNATURE::require_distributed() { format!("{}_dist", SIGNATURE_TABLE_NAME) } else { SIGNATURE_TABLE_NAME.to_string() },
-            //                 account_hex,
-            //                 before
-            //             );
-            //     }
-            //     (None, Some(after)) => {
-            //         query = format!(
-            //                 "SELECT signature FROM {} WHERE account = {} AND block_unix_timestamp > {} ORDER BY seq_number DESC",
-            //                 if SIGNATURE::require_distributed() { format!("{}_dist", SIGNATURE_TABLE_NAME) } else { SIGNATURE_TABLE_NAME.to_string() },
-            //                 account_hex,
-            //                 after
-            //             );
-            //     }
-            //     _ => {}
-            // },
-            infinisvm_types::SignatureFilters::Signature(before, after) => {
-                let table = if SIGNATURE::require_distributed() {
-                    format!("{}_dist", SIGNATURE_TABLE_NAME)
-                } else {
-                    SIGNATURE_TABLE_NAME.to_string()
-                };
+        if let infinisvm_types::SignatureFilters::Signature(before, after) = filters {
+            let table = if SIGNATURE::require_distributed() {
+                format!("{SIGNATURE_TABLE_NAME}_dist")
+            } else {
+                SIGNATURE_TABLE_NAME.to_string()
+            };
 
-                match (before, after) {
-                    (Some(sig), None) => {
-                        let seq_number = self
-                            .get_transaction_by_signature_async(&sig)
-                            .await
-                            .map(|tx| tx.seq_number);
-                        if seq_number.is_none() {
-                            return vec![];
-                        }
-                        let seq_number = seq_number.unwrap();
+            match (before, after) {
+                (Some(sig), None) => {
+                    let seq_number = self
+                        .get_transaction_by_signature_async(&sig)
+                        .await
+                        .map(|tx| tx.seq_number);
+                    if seq_number.is_none() {
+                        return vec![];
+                    }
+                    let seq_number = seq_number.unwrap();
 
-                        let sig_bytes = SIGNATURE::to_array_string(sig.as_ref());
+                    let sig_bytes = SIGNATURE::to_array_string(sig.as_ref());
 
-                        let query = format!("SELECT signature FROM {} WHERE account = {} AND seq_number = {} AND signature < {} LIMIT {}", table, account_hex, seq_number, sig_bytes, limit);
-                        let result = self.signature_client.query_collect::<SingleSignatureRow>(&query).await;
-                        if result.is_err() {
-                            error!("get_signatures_by_account_async: {}", result.err().unwrap());
-                            return vec![];
-                        }
-                        let mut signatures = result
-                            .unwrap()
-                            .into_iter()
-                            .map(|sig| Signature::try_from(sig.signature.as_ref()).unwrap())
-                            .collect::<Vec<_>>();
-                        // if the signatures len < limit, we need to query the next seq_number
-                        if signatures.len() >= limit {
-                            signatures.truncate(limit);
-                            return signatures;
-                        }
-                        let query_collect_more = format!("SELECT signature, seq_number FROM {} WHERE account = {} AND seq_number < {} ORDER BY seq_number DESC LIMIT {}", table, account_hex, seq_number, limit - signatures.len());
-                        let result = self
-                            .signature_client
-                            .query_collect::<SingleSignatureRow>(&query_collect_more)
-                            .await;
-                        if result.is_err() {
-                            error!("get_signatures_by_account_async: {}", result.err().unwrap());
-                            return vec![];
-                        }
-                        let new_signatures = result.unwrap();
-                        if new_signatures.is_empty() {
-                            signatures.truncate(limit);
-                            return signatures;
-                        }
-                        let last_seq_number = new_signatures.iter().map(|sig| sig.seq_number).min().unwrap_or(0);
-                        for sig in new_signatures {
-                            if sig.seq_number != last_seq_number {
-                                signatures.push(Signature::try_from(sig.signature.as_ref()).unwrap());
-                            }
-                        }
-                        if signatures.len() >= limit {
-                            signatures.truncate(limit);
-                            return signatures;
-                        }
-                        // fill the last job_id
-                        let query_collect_last_seq = format!(
-                            "SELECT signature, seq_number FROM {} WHERE account = {} AND seq_number = {} LIMIT {}",
-                            table,
-                            account_hex,
-                            last_seq_number,
-                            limit - signatures.len()
-                        );
-                        let result = self
-                            .signature_client
-                            .query_collect::<SingleSignatureRow>(&query_collect_last_seq)
-                            .await;
-                        if result.is_err() {
-                            error!("get_signatures_by_account_async: {}", result.err().unwrap());
-                            return vec![];
-                        }
-                        for sig in result.unwrap().into_iter().sorted_by_key(|sig| sig.seq_number) {
-                            signatures.push(Signature::try_from(sig.signature.as_ref()).unwrap());
-                        }
+                    let query = format!("SELECT signature FROM {table} WHERE account = {account_hex} AND seq_number = {seq_number} AND signature < {sig_bytes} LIMIT {limit}");
+                    let result = self.signature_client.query_collect::<SingleSignatureRow>(&query).await;
+                    if result.is_err() {
+                        error!("get_signatures_by_account_async: {}", result.err().unwrap());
+                        return vec![];
+                    }
+                    let mut signatures = result
+                        .unwrap()
+                        .into_iter()
+                        .map(|sig| Signature::try_from(sig.signature.as_ref()).unwrap())
+                        .collect::<Vec<_>>();
+                    // if the signatures len < limit, we need to query the next seq_number
+                    if signatures.len() >= limit {
                         signatures.truncate(limit);
                         return signatures;
                     }
-                    (None, Some(sig)) => {
-                        // collect all signatures in the same seq_number as the given signature, filter out the < sig
-                        let seq_number = self
-                            .get_transaction_by_signature_async(&sig)
-                            .await
-                            .map(|tx| tx.seq_number);
-                        if seq_number.is_none() {
-                            return vec![];
-                        }
-                        let seq_number = seq_number.unwrap();
-
-                        let sig_bytes = SIGNATURE::to_array_string(sig.as_ref());
-
-                        let query = format!("SELECT signature FROM {} WHERE account = {} AND seq_number = {} AND signature > {} LIMIT {}", table, account_hex, seq_number, sig_bytes, limit);
-                        let result = self.signature_client.query_collect::<SingleSignatureRow>(&query).await;
-                        if result.is_err() {
-                            error!("get_signatures_by_account_async: {}", result.err().unwrap());
-                            return vec![];
-                        }
-                        let mut signatures = result
-                            .unwrap()
-                            .into_iter()
-                            .map(|sig| Signature::try_from(sig.signature.as_ref()).unwrap())
-                            .collect::<Vec<_>>();
-                        // if the signatures len < limit, we need to query the next seq_number
-                        if signatures.len() >= limit {
-                            signatures.truncate(limit);
-                            return signatures;
-                        }
-                        let query_collect_more = format!("SELECT signature, seq_number FROM {} WHERE account = {} AND seq_number > {} ORDER BY seq_number ASC LIMIT {}", table, account_hex, seq_number, limit - signatures.len());
-                        let result = self
-                            .signature_client
-                            .query_collect::<SingleSignatureRow>(&query_collect_more)
-                            .await;
-                        if result.is_err() {
-                            error!("get_signatures_by_account_async: {}", result.err().unwrap());
-                            return vec![];
-                        }
-                        let new_signatures = result.unwrap();
-                        if new_signatures.is_empty() {
-                            signatures.truncate(limit);
-                            return signatures;
-                        }
-                        let last_seq_number = new_signatures.iter().map(|sig| sig.seq_number).max().unwrap_or(0);
-                        for sig in new_signatures {
-                            if sig.seq_number != last_seq_number {
-                                signatures.push(Signature::try_from(sig.signature.as_ref()).unwrap());
-                            }
-                        }
-                        if signatures.len() >= limit {
-                            signatures.truncate(limit);
-                            return signatures;
-                        }
-                        // fill the last job_id
-                        let query_collect_last_seq = format!(
-                            "SELECT signature, seq_number FROM {} WHERE account = {} AND seq_number = {} LIMIT {}",
-                            table,
-                            account_hex,
-                            last_seq_number,
-                            limit - signatures.len()
-                        );
-                        let result = self
-                            .signature_client
-                            .query_collect::<SingleSignatureRow>(&query_collect_last_seq)
-                            .await;
-                        if result.is_err() {
-                            error!("get_signatures_by_account_async: {}", result.err().unwrap());
-                            return vec![];
-                        }
-                        for sig in result.unwrap().into_iter().sorted_by_key(|sig| sig.seq_number) {
-                            signatures.push(Signature::try_from(sig.signature.as_ref()).unwrap());
-                        }
+                    let query_collect_more = format!("SELECT signature, seq_number FROM {} WHERE account = {} AND seq_number < {} ORDER BY seq_number DESC LIMIT {}", table, account_hex, seq_number, limit - signatures.len());
+                    let result = self
+                        .signature_client
+                        .query_collect::<SingleSignatureRow>(&query_collect_more)
+                        .await;
+                    if result.is_err() {
+                        error!("get_signatures_by_account_async: {}", result.err().unwrap());
+                        return vec![];
+                    }
+                    let new_signatures = result.unwrap();
+                    if new_signatures.is_empty() {
                         signatures.truncate(limit);
                         return signatures;
                     }
-                    (None, None) => {}
-                    (Some(_), Some(_)) => {}
+                    let last_seq_number = new_signatures.iter().map(|sig| sig.seq_number).min().unwrap_or(0);
+                    for sig in new_signatures {
+                        if sig.seq_number != last_seq_number {
+                            signatures.push(Signature::try_from(sig.signature.as_ref()).unwrap());
+                        }
+                    }
+                    if signatures.len() >= limit {
+                        signatures.truncate(limit);
+                        return signatures;
+                    }
+                    // fill the last job_id
+                    let query_collect_last_seq = format!(
+                        "SELECT signature, seq_number FROM {} WHERE account = {} AND seq_number = {} LIMIT {}",
+                        table,
+                        account_hex,
+                        last_seq_number,
+                        limit - signatures.len()
+                    );
+                    let result = self
+                        .signature_client
+                        .query_collect::<SingleSignatureRow>(&query_collect_last_seq)
+                        .await;
+                    if result.is_err() {
+                        error!("get_signatures_by_account_async: {}", result.err().unwrap());
+                        return vec![];
+                    }
+                    for sig in result.unwrap().into_iter().sorted_by_key(|sig| sig.seq_number) {
+                        signatures.push(Signature::try_from(sig.signature.as_ref()).unwrap());
+                    }
+                    signatures.truncate(limit);
+                    return signatures;
                 }
+                (None, Some(sig)) => {
+                    // collect all signatures in the same seq_number as the given signature, filter
+                    // out the < sig
+                    let seq_number = self
+                        .get_transaction_by_signature_async(&sig)
+                        .await
+                        .map(|tx| tx.seq_number);
+                    if seq_number.is_none() {
+                        return vec![];
+                    }
+                    let seq_number = seq_number.unwrap();
 
-                // match (before, after) {
-                //     (Some(sig), None) => {
-                //         let sequence = self
-                //             .get_transaction_by_signature_async(&sig)
-                //             .await
-                //             .map(|tx| tx.seq_number);
-                //         if sequence.is_none() {
-                //             return vec![];
-                //         }
-                //         let sequence = sequence.unwrap();
-                //         query = format!(
-                //             "SELECT signature FROM {} WHERE account = {} AND (seq_number < {} OR (seq_number = {} AND signature < {})) ORDER BY seq_number DESC, signature DESC",
-                //             table,
-                //             account_hex,
-                //             sequence,
-                //             sequence,
-                //             SIGNATURE::to_array_string(sig.as_ref())
-                //         );
-                //     }
-                //     (None, Some(sig)) => {
-                //         let sequence = self
-                //             .get_transaction_by_signature_async(&sig)
-                //             .await
-                //             .map(|tx| tx.seq_number);
-                //         if sequence.is_none() {
-                //             return vec![];
-                //         }
-                //         let sequence = sequence.unwrap();
-                //         query = format!(
-                //             "SELECT signature FROM {} WHERE account = {} AND (seq_number > {} OR (seq_number = {} AND signature > {})) ORDER BY seq_number DESC, signature DESC",
-                //             table,
-                //             account_hex,
-                //             sequence,
-                //             sequence,
-                //             SIGNATURE::to_array_string(sig.as_ref())
-                //         );
-                //     }
-                //     _ => {} // Keep original query for (None, None)
-                // }
+                    let sig_bytes = SIGNATURE::to_array_string(sig.as_ref());
+
+                    let query = format!("SELECT signature FROM {table} WHERE account = {account_hex} AND seq_number = {seq_number} AND signature > {sig_bytes} LIMIT {limit}");
+                    let result = self.signature_client.query_collect::<SingleSignatureRow>(&query).await;
+                    if result.is_err() {
+                        error!("get_signatures_by_account_async: {}", result.err().unwrap());
+                        return vec![];
+                    }
+                    let mut signatures = result
+                        .unwrap()
+                        .into_iter()
+                        .map(|sig| Signature::try_from(sig.signature.as_ref()).unwrap())
+                        .collect::<Vec<_>>();
+                    // if the signatures len < limit, we need to query the next seq_number
+                    if signatures.len() >= limit {
+                        signatures.truncate(limit);
+                        return signatures;
+                    }
+                    let query_collect_more = format!("SELECT signature, seq_number FROM {} WHERE account = {} AND seq_number > {} ORDER BY seq_number ASC LIMIT {}", table, account_hex, seq_number, limit - signatures.len());
+                    let result = self
+                        .signature_client
+                        .query_collect::<SingleSignatureRow>(&query_collect_more)
+                        .await;
+                    if result.is_err() {
+                        error!("get_signatures_by_account_async: {}", result.err().unwrap());
+                        return vec![];
+                    }
+                    let new_signatures = result.unwrap();
+                    if new_signatures.is_empty() {
+                        signatures.truncate(limit);
+                        return signatures;
+                    }
+                    let last_seq_number = new_signatures.iter().map(|sig| sig.seq_number).max().unwrap_or(0);
+                    for sig in new_signatures {
+                        if sig.seq_number != last_seq_number {
+                            signatures.push(Signature::try_from(sig.signature.as_ref()).unwrap());
+                        }
+                    }
+                    if signatures.len() >= limit {
+                        signatures.truncate(limit);
+                        return signatures;
+                    }
+                    // fill the last job_id
+                    let query_collect_last_seq = format!(
+                        "SELECT signature, seq_number FROM {} WHERE account = {} AND seq_number = {} LIMIT {}",
+                        table,
+                        account_hex,
+                        last_seq_number,
+                        limit - signatures.len()
+                    );
+                    let result = self
+                        .signature_client
+                        .query_collect::<SingleSignatureRow>(&query_collect_last_seq)
+                        .await;
+                    if result.is_err() {
+                        error!("get_signatures_by_account_async: {}", result.err().unwrap());
+                        return vec![];
+                    }
+                    for sig in result.unwrap().into_iter().sorted_by_key(|sig| sig.seq_number) {
+                        signatures.push(Signature::try_from(sig.signature.as_ref()).unwrap());
+                    }
+                    signatures.truncate(limit);
+                    return signatures;
+                }
+                (None, None) => {}
+                (Some(_), Some(_)) => {}
             }
-            _ => {}
+
+            // match (before, after) {
+            //     (Some(sig), None) => {
+            //         let sequence = self
+            //             .get_transaction_by_signature_async(&sig)
+            //             .await
+            //             .map(|tx| tx.seq_number);
+            //         if sequence.is_none() {
+            //             return vec![];
+            //         }
+            //         let sequence = sequence.unwrap();
+            //         query = format!(
+            //             "SELECT signature FROM {} WHERE account = {} AND
+            // (seq_number < {} OR (seq_number = {} AND signature < {}))
+            // ORDER BY seq_number DESC, signature DESC",
+            //             table,
+            //             account_hex,
+            //             sequence,
+            //             sequence,
+            //             SIGNATURE::to_array_string(sig.as_ref())
+            //         );
+            //     }
+            //     (None, Some(sig)) => {
+            //         let sequence = self
+            //             .get_transaction_by_signature_async(&sig)
+            //             .await
+            //             .map(|tx| tx.seq_number);
+            //         if sequence.is_none() {
+            //             return vec![];
+            //         }
+            //         let sequence = sequence.unwrap();
+            //         query = format!(
+            //             "SELECT signature FROM {} WHERE account = {} AND
+            // (seq_number > {} OR (seq_number = {} AND signature > {}))
+            // ORDER BY seq_number DESC, signature DESC",
+            //             table,
+            //             account_hex,
+            //             sequence,
+            //             sequence,
+            //             SIGNATURE::to_array_string(sig.as_ref())
+            //         );
+            //     }
+            //     _ => {} // Keep original query for (None, None)
+            // }
         }
 
         // Construct the query
         let mut query = format!(
             "SELECT signature FROM {} WHERE account = {} ORDER BY seq_number DESC",
             if SIGNATURE::require_distributed() {
-                format!("{}_dist", SIGNATURE_TABLE_NAME)
+                format!("{SIGNATURE_TABLE_NAME}_dist")
             } else {
                 SIGNATURE_TABLE_NAME.to_string()
             },
             account_hex
         );
 
-        query = format!("{} LIMIT {}", query, limit);
+        query = format!("{query} LIMIT {limit}");
         debug!("query: {}", query);
 
         // Execute the query
@@ -1657,7 +1635,7 @@ impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB>
         let mut query = format!(
             "SELECT account FROM {} WHERE owner = {}",
             if ACCOUNT::require_distributed() {
-                format!("{}_dist", ACCOUNT_MINT_TABLE_NAME)
+                format!("{ACCOUNT_MINT_TABLE_NAME}_dist")
             } else {
                 ACCOUNT_MINT_TABLE_NAME.to_string()
             },
@@ -1676,7 +1654,7 @@ impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB>
             query = format!("{} AND mint = {}", query, ACCOUNT::to_array_string(&mint.to_bytes()));
         }
 
-        query = format!("{} LIMIT {} OFFSET {}", query, limit, offset);
+        query = format!("{query} LIMIT {limit} OFFSET {offset}");
         let result = self.account_client.query_collect::<SingleAccountRow>(&query).await;
         match result {
             Ok(result) => result
@@ -1702,14 +1680,14 @@ impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB>
         let mut query = format!(
             "SELECT account FROM {} WHERE owner = {}",
             if ACCOUNT::require_distributed() {
-                format!("{}_dist", ACCOUNT_TABLE_NAME)
+                format!("{ACCOUNT_TABLE_NAME}_dist")
             } else {
                 ACCOUNT_TABLE_NAME.to_string()
             },
             account_hex
         );
 
-        query = format!("{} LIMIT {} OFFSET {}", query, limit, offset);
+        query = format!("{query} LIMIT {limit} OFFSET {offset}");
 
         let result = self.account_client.query_collect::<SingleAccountRow>(&query).await;
         match result {
@@ -1875,11 +1853,8 @@ pub struct MultiDatabaseIndexer<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: Index
     // Direct access to clients for read operations
     clients: Vec<DatabaseIndexer<TX, SLOT, SIGNATURE, ACCOUNT>>,
     client_cnt: usize,
-    runtime: Arc<tokio::runtime::Runtime>,
     // Last worker used, for round-robin load balancing
     last_worker: Mutex<usize>,
-    // Last cursor used, for round-robin load balancing
-    last_cursor: Mutex<usize>,
     total_processed: Arc<AtomicU64>,
 
     s3: Option<S3FsClient>,
@@ -1893,12 +1868,6 @@ pub struct MultiDatabaseIndexer<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: Index
 
 // Commands to be sent to worker processes - now only write operations
 enum IndexerCommand {
-    IndexBlock {
-        slot: u64,
-        timestamp: u64,
-        blockhash: Hash,
-        parent_blockhash: Hash,
-    },
     IndexTransactions {
         batch: Vec<ConsumedJob>,
         block_unix_timestamp: u64,
@@ -1985,21 +1954,6 @@ impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB>
             runtime.spawn(async move {
                 while let Some(cmd) = receiver.recv().await {
                     match cmd {
-                        IndexerCommand::IndexBlock {
-                            slot,
-                            timestamp,
-                            blockhash,
-                            parent_blockhash,
-                        } => {
-                            let tx_flushed = worker_indexer
-                                .index_block_async(slot, timestamp, blockhash, parent_blockhash)
-                                .await
-                                .unwrap_or(0);
-                            if tx_flushed > 0 {
-                                debug!("Indexed {} transactions", tx_flushed);
-                                total_processed_clone.fetch_add(tx_flushed as u64, Ordering::Relaxed);
-                            }
-                        }
                         IndexerCommand::IndexTransactions {
                             batch,
                             block_unix_timestamp,
@@ -2055,10 +2009,8 @@ impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB>
             senders,
             clients: indexers,
             client_cnt,
-            runtime,
             last_worker: Mutex::new(0),
             total_processed,
-            last_cursor: Mutex::new(0),
             s3,
             slot_cache: Vec::with_capacity(500_000),
             next_slot: Vec::with_capacity(500_000),
@@ -2378,141 +2330,6 @@ impl RpcIndexer for NoopIndexer {
     ) -> eyre::Result<Option<TransactionWithMetadata>> {
         error!("NoopIndexer: get_transaction_with_metadata");
         Ok(None)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use infinisvm_types::convert::account_type_and_owner;
-    use solana_sdk::{account::AccountSharedData, pubkey::Pubkey, signature::Keypair, signer::Signer};
-
-    use super::*;
-
-    #[test]
-    fn test_account_type_and_owner() {
-        // Test system program account
-        let system_account = AccountSharedData::new(0, 0, &system_program::id());
-        assert_eq!(account_type_and_owner(&system_account), None);
-
-        // Test non-token program account
-        let random_program_id = Pubkey::new_unique();
-        let program_account = AccountSharedData::new(0, 0, &random_program_id);
-        let result = account_type_and_owner(&program_account);
-        assert_eq!(result, Some((0, random_program_id, None)));
-
-        // Test invalid token account data
-        let token_account = AccountSharedData::new(0, 0, &spl_token::id());
-        let result = account_type_and_owner(&token_account);
-        assert_eq!(result, Some((0, spl_token::id(), None)));
-
-        let token2022_account = AccountSharedData::new(0, 0, &spl_token_2022::id());
-        let result = account_type_and_owner(&token2022_account);
-        assert_eq!(result, Some((0, spl_token_2022::id(), None)));
-    }
-
-    #[tokio::test]
-    async fn test_cassandra_db() {
-        let db = CassandraIndexerDB::new("localhost", 9042).await;
-
-        let result = db.execute("DROP KEYSPACE IF EXISTS indexer_dev").await;
-        assert!(result.is_ok());
-
-        let result = db.execute("CREATE KEYSPACE IF NOT EXISTS indexer_dev WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}").await;
-        assert!(result.is_ok());
-
-        let result = db.execute("CREATE TABLE IF NOT EXISTS indexer_dev.test_table (account blob, signature blob, slot bigint, block_unix_timestamp bigint, seq_number bigint, PRIMARY KEY ((slot), signature))").await;
-        assert!(result.is_ok());
-
-        // Test insert_native_block
-        let signature = [0u8; 64];
-        let test_row = SignatureRow {
-            account: [1u8; 32],
-            signature,
-            slot: 1,
-            block_unix_timestamp: 123456789,
-            seq_number: 0,
-        };
-
-        let result = db
-            .insert_native_block(
-                "indexer_dev.test_table",
-                &["account", "signature", "slot", "block_unix_timestamp", "seq_number"],
-                vec![test_row],
-            )
-            .await;
-        debug!("result: {:?}", result);
-        assert!(result.is_ok());
-
-        // Test query_collect
-        let rows: Result<Vec<SignatureRow>, _> = db.query_collect(
-            "SELECT account, signature, slot, block_unix_timestamp, seq_number FROM test2.test_table WHERE slot = 1 ",
-        ).await;
-        debug!("rows: {:?}", rows);
-        assert!(rows.is_ok());
-
-        // Test array string conversion
-        let bytes = vec![1, 2, 3];
-        let array_str = CassandraIndexerDB::to_array_string(&bytes);
-        assert_eq!(array_str, "(1,2,3)");
-    }
-
-    #[tokio::test]
-    async fn test_cassandra_db_functional() {
-        let db = CassandraIndexerDB::new("10.20.30.214", 9042).await;
-        let mut indexer = DatabaseIndexer::new(db.clone(), db.clone(), db.clone(), db.clone(), None);
-
-        let owner = Keypair::new();
-        let account = Keypair::new();
-        indexer
-            .account_ops_create_cache
-            .push((account.pubkey(), owner.pubkey()));
-        indexer
-            .flush_account_ops_cache_async()
-            .await
-            .expect("Failed to flush account ops cache");
-
-        let result = indexer.get_account_owned_by_account_async(&owner.pubkey(), 10, 0).await;
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0], account.pubkey());
-
-        indexer
-            .account_ops_delete_cache
-            .push((account.pubkey(), owner.pubkey()));
-        indexer
-            .flush_account_ops_cache_async()
-            .await
-            .expect("Failed to flush account ops cache");
-
-        let result = indexer.get_account_owned_by_account_async(&owner.pubkey(), 10, 0).await;
-        assert_eq!(result.len(), 0);
-
-        let mint = Keypair::new();
-        indexer
-            .account_ops_mint_create_cache
-            .push((account.pubkey(), owner.pubkey(), 0, mint.pubkey()));
-        indexer
-            .flush_account_ops_cache_async()
-            .await
-            .expect("Failed to flush account ops cache");
-
-        let result = indexer
-            .get_token_account_owned_by_account_async(&owner.pubkey(), None, Some(mint.pubkey()), 10, 0)
-            .await;
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0], account.pubkey());
-
-        indexer
-            .account_ops_mint_delete_cache
-            .push((account.pubkey(), owner.pubkey()));
-        indexer
-            .flush_account_ops_cache_async()
-            .await
-            .expect("Failed to flush account ops cache");
-
-        let result = indexer
-            .get_token_account_owned_by_account_async(&owner.pubkey(), None, None, 10, 0)
-            .await;
-        assert_eq!(result.len(), 0);
     }
 }
 

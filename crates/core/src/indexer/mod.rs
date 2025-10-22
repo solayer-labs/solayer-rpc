@@ -1,8 +1,7 @@
 use async_trait::async_trait;
+use infinisvm_types::{jobs::ConsumedJob, serializable::SerializableTxRow};
 use solana_hash::Hash;
 use solana_sdk::signature::Signature;
-
-use infinisvm_types::{jobs::ConsumedJob, serializable::SerializableTxRow};
 
 pub mod index_worker;
 

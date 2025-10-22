@@ -13,10 +13,9 @@ use ahash::{HashSet, HashSetExt};
 use crossbeam_channel::{Receiver, Sender};
 use dashmap::DashMap;
 use hashbrown::HashMap;
-use infinisvm_db::{
-    merger, persistence::PersistedInMemoryDB, versioned::AccountVersion, SlotHashTimestamp, VersionedDB,
-};
+use infinisvm_db::{merger, persistence::PersistedInMemoryDB, Database, SlotHashTimestamp};
 use infinisvm_logger::{info, warn};
+use infinisvm_types::jobs::ConsumedJob;
 use metrics::gauge;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use solana_bpf_loader_program::syscalls::{
@@ -24,8 +23,9 @@ use solana_bpf_loader_program::syscalls::{
 };
 use solana_builtins::BUILTINS;
 use solana_compute_budget::compute_budget::ComputeBudget;
+use solana_fee::FeeFeatures;
 use solana_hash::Hash;
-use solana_program_runtime::loaded_programs::{LoadProgramMetrics, ProgramCacheEntry};
+use solana_program_runtime::loaded_programs::ProgramCacheEntry;
 use solana_pubkey::Pubkey;
 use solana_sdk::{
     account::{Account, AccountSharedData, ReadableAccount, WritableAccount},
@@ -33,7 +33,7 @@ use solana_sdk::{
     ed25519_program,
     epoch_rewards::EpochRewards,
     epoch_schedule::EpochSchedule,
-    fee::FeeStructure,
+    fee::{FeeBin, FeeDetails, FeeStructure},
     native_loader,
     rent::Rent,
     secp256k1_program,
@@ -54,19 +54,103 @@ use solana_svm::{
         TransactionProcessingEnvironment,
     },
 };
+use solana_svm_transaction::svm_message::SVMMessage;
 
-use crate::wal;
 use crate::{
     blockhash_generator::DummyRpcBlockhashGenerator, fork_graph::EmptyForkGraph, metrics::BankMetrics,
-    subscription::Notifier,
+    subscription::Notifier, wal, SCHEDULER_WORKER_COUNT,
 };
-use infinisvm_types::jobs::ConsumedJob;
 
 pub fn get_feature_set() -> FeatureSet {
     let mut feature_set = FeatureSet::default();
     feature_set.activate(&agave_feature_set::move_precompile_verification_to_svm::id(), 1);
     feature_set
 }
+
+#[cfg(feature = "devnet")]
+macro_rules! init_v3_program {
+    ($self:ident, $program_id_str:expr, $program_buffer_str:expr, $program_upgrade_authority_str:expr) => {{
+        // create program account
+        let program_id = Pubkey::from_str_const($program_id_str);
+        let program_account_data =
+            include_bytes!(concat!("../../../bins/genesis-generator/elf/", $program_id_str, ".bin"));
+        static_assertions::const_assert!(!include_bytes!(concat!(
+            "../../../bins/genesis-generator/elf/",
+            $program_id_str,
+            ".bin"
+        ))
+        .is_empty());
+        let program_account = {
+            let mut account = AccountSharedData::default();
+            account.set_lamports(Rent::default().minimum_balance(program_account_data.len()));
+            account.set_owner(Pubkey::from_str_const("BPFLoaderUpgradeab1e11111111111111111111111"));
+            account.set_executable(true);
+            account.set_rent_epoch(u64::MAX);
+            account.set_data_from_slice(program_account_data);
+            account
+        };
+        $self.db.write().unwrap().write_account(program_id, program_account);
+
+        // create program buffer account
+        let program_buffer = Pubkey::from_str_const($program_buffer_str);
+
+        let program_buffer_data = include_bytes!(concat!(
+            "../../../bins/genesis-generator/elf/",
+            $program_buffer_str,
+            ".bin"
+        ));
+        static_assertions::const_assert!(!include_bytes!(concat!(
+            "../../../bins/genesis-generator/elf/",
+            $program_buffer_str,
+            ".bin"
+        ))
+        .is_empty());
+
+        let program_buffer_account = {
+            let mut account = AccountSharedData::default();
+            account.set_lamports(Rent::default().minimum_balance(program_buffer_data.len()));
+            account.set_owner(Pubkey::from_str_const("BPFLoaderUpgradeab1e11111111111111111111111"));
+            account.set_executable(false);
+            account.set_rent_epoch(u64::MAX);
+            account.set_data_from_slice(program_buffer_data);
+            account
+        };
+        $self
+            .db
+            .write()
+            .unwrap()
+            .write_account(program_buffer, program_buffer_account);
+
+        // create upgrade authority account (leave it empty)
+        let upgrade_authority = Pubkey::from_str_const($program_upgrade_authority_str);
+        let upgrade_authority_account = {
+            let mut account = AccountSharedData::default();
+            account.set_rent_epoch(u64::MAX);
+            account
+        };
+        $self
+            .db
+            .write()
+            .unwrap()
+            .write_account(upgrade_authority, upgrade_authority_account);
+    }};
+}
+
+// PDA of FeezfYUeAv85jB7uFEBcg8TVZDe11umr6FVgUqS9KC4F + worker_id(u8)
+pub static FEE_ACCOUNTS: [Pubkey; SCHEDULER_WORKER_COUNT] = [
+    Pubkey::from_str_const("FCvMVqjHcUdHybpc4Gw9epWoevw835UuhWvLv3MKtjr8"),
+    Pubkey::from_str_const("AXegJad62JQ4mEoZgGNAs54SeEce6bQ7iJ1HY72jqAEV"),
+    Pubkey::from_str_const("Gew43KABMFtRwX96iAThs8r9MAuEcdhCGQoQUQy641Xy"),
+    Pubkey::from_str_const("E2N1C4eDVrkR56yJVJYuZcGcDbJ1fy7i59NS6Yirc6DB"),
+    Pubkey::from_str_const("CMAazeiF2ssbFaPEcjhYhPQtkCLcGyaXkM9C18tBFP2N"),
+    Pubkey::from_str_const("EujQFYnwMuGvdeKm5fHztHJYg4TJrGB3Whjy7uy8Pttb"),
+    Pubkey::from_str_const("JDo2i8b11ETQiAvjHS1qChHczjaYN2SDJ7z8ZVKAow28"),
+    Pubkey::from_str_const("5HUvbRyDyQm6MK2bxKc9W6cA3griE2H2Pz34v959KEBe"),
+    Pubkey::from_str_const("Ce5dqkNN171ZfAHJQ7WpDK3zF9ha9sKSzjqXpnpmQB4S"),
+    Pubkey::from_str_const("CE7KJLAJ3soio7QsVNPHWWa7PqkwUViDfK2HCQZhE5ga"),
+    Pubkey::from_str_const("EmEzBFMnFXEBNRAaTdqXRxaVX8TLZg3eFTpKfEaaikm6"),
+    Pubkey::from_str_const("4G2dckVTkzVR5RBWRrpaNFbLqpcDs8zGEYCTsc9mdUvN"),
+];
 
 /*
 when executing we don't care about account version
@@ -98,7 +182,6 @@ pub struct RawSlot {
     pub parent_hash: Hash,
     pub timestamp: u64,
     pub job_ids: Vec<u64>,
-    // pub transactions: Vec<VersionedTransaction>,
 }
 
 const JOB_ID_RETENTION_SLOTS: u64 = 512;
@@ -111,7 +194,7 @@ struct SlotMeta {
 }
 
 pub struct Bank {
-    db: Arc<RwLock<dyn VersionedDB>>,
+    db: Arc<RwLock<dyn Database>>,
     status_cache: Arc<DashMap<Signature, TransactionStatus>>,
 
     blockhash_pruner_sender: Sender<(Hash, HashSet<Signature>)>,
@@ -143,12 +226,18 @@ unsafe impl Sync for Bank {}
 
 
 impl Bank {
-    pub fn set_db(&mut self, db: Arc<RwLock<dyn VersionedDB>>) {
+    pub fn set_db(&mut self, db: Arc<RwLock<dyn Database>>) {
         self.db = db;
     }
 
     pub fn add_subscriber(&mut self, subscriber: Arc<dyn Notifier>) {
         self.subscription_processor = Some(subscriber);
+    }
+
+    pub fn shutdown_streams(&mut self) {
+        // Drop outbound slot publishers so downstream listeners can exit cleanly.
+        self.new_block_sender.take();
+        self.raw_slot_sender.take();
     }
 
     pub fn new_slave(exit: Arc<AtomicBool>) -> Self {
@@ -258,7 +347,11 @@ impl Bank {
             transaction_processor,
             _feature_set: feature_set,
             _fork_graph: fork_graph,
-            fee_structure: FeeStructure::default(),
+            fee_structure: FeeStructure {
+                lamports_per_signature: 5000,
+                lamports_per_write_lock: 0,
+                compute_fee_bins: vec![FeeBin { limit: 1400000, fee: 0 }],
+            },
             subscription_processor: None,
             slot_job_ids: BTreeMap::new(),
             emitted_slot_meta: BTreeMap::new(),
@@ -494,6 +587,8 @@ impl Bank {
         );
 
         self.db.write().unwrap().commit(slot);
+
+        #[cfg(feature = "devnet")]
         self.init_accounts_for_test(
             &Pubkey::from_str_const("FUND4EFuH8XaPmFkFLvABVQzfBZ2GQ7grYHhWV6ZYTQm"),
             false,
@@ -505,11 +600,12 @@ impl Bank {
     pub fn tick_as_slave(&mut self, slot_data: &RawSlot) {
         // Advance to the provided slot/hash/timestamp from the sequencer
         self.slot_hash_timestamp = (slot_data.slot, slot_data.hash, slot_data.timestamp);
-        // Update blockhash window and Clock/sysvars for the current slot (not the previous)
+        // Update blockhash window and Clock/sysvars for the current slot (not the
+        // previous)
         self.post_tick(slot_data.slot, slot_data.timestamp, true);
     }
 
-    pub fn commit_changes(&mut self, db_changes: Vec<(Pubkey, AccountSharedData, AccountVersion)>) {
+    pub fn commit_changes(&mut self, db_changes: Vec<(Pubkey, AccountSharedData)>) {
         let mut db = self.db.write().unwrap();
         db.commit_changes_raw(db_changes);
     }
@@ -616,6 +712,31 @@ impl Bank {
         self.previous_hashes.clone()
     }
 
+    #[cfg(feature = "devnet")]
+    pub fn init_bench_shared_accounts(&self) {
+        let layer_id = Pubkey::from_str_const("LAYER4xPpTCb3QL8S9u41EAhAX7mhBn8Q6xMTwY2Yzc");
+        let layer_account = {
+            let mut account = AccountSharedData::default();
+            let account_data =
+                include_bytes!("../../../bins/genesis-generator/elf/LAYER4xPpTCb3QL8S9u41EAhAX7mhBn8Q6xMTwY2Yzc.bin");
+            account.set_lamports(Rent::default().minimum_balance(account_data.len()));
+            account.set_owner(Pubkey::from_str_const("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"));
+            account.set_executable(false);
+            account.set_rent_epoch(u64::MAX);
+            account.set_data_from_slice(account_data);
+            account
+        };
+        self.db.write().unwrap().write_account(layer_id, layer_account);
+
+        init_v3_program!(
+            self,
+            "rp7km3qAmYb8ciKKS23v5nmyYU9dFTc5RTAyx7zQSAz",
+            "4WzoXzrZBidLu1MTj26c1iyLBd7LN3Sj5HkugJ1AKVxw",
+            "SahScoe6eHCbC4a8M6BPp27bHqFVaQiDPqYpFeDCwFb"
+        );
+    }
+
+    #[cfg(feature = "devnet")]
     pub fn init_accounts_for_test(&self, pubkey: &Pubkey, with_token: bool) {
         let mut default_account = AccountSharedData::default();
         default_account.set_lamports(1_000_000_000_000_000); // 1000000 SOL
@@ -737,7 +858,8 @@ impl Bank {
         self.db.write().unwrap().write_account(*program_id, account);
     }
 
-    pub fn commit_transactions(&mut self, consumed_jobs: &[ConsumedJob]) {
+    pub fn commit_transactions(&mut self, consumed_jobs: &[ConsumedJob], worker_id: usize) {
+        let mut total_fees = 0;
         let mut accounts_changed = HashMap::with_capacity(consumed_jobs.len() * 64);
 
         for consumed_job in consumed_jobs {
@@ -754,6 +876,8 @@ impl Bank {
             }
 
             let processing_result = processing_result.as_ref().unwrap();
+
+            total_fees += processing_result.fee_details().total_fee();
 
             // two things to store/do:
             // 1. account data
@@ -827,10 +951,18 @@ impl Bank {
             self.status_cache.insert(*signature, status);
         }
 
-        let mut db: std::sync::RwLockWriteGuard<'_, dyn VersionedDB> = self.db.write().unwrap();
+        let mut db: std::sync::RwLockWriteGuard<'_, dyn Database> = self.db.write().unwrap();
         for (address, account) in accounts_changed.into_iter() {
             db.write_account(address, account.clone());
         }
+
+        let fee_account = FEE_ACCOUNTS[worker_id];
+        let mut fee_account_data = match db.get_account(fee_account) {
+            Ok(Some(account)) => account,
+            _ => AccountSharedData::default(),
+        };
+        fee_account_data.checked_add_lamports(total_fees).unwrap();
+        db.write_account(fee_account, fee_account_data);
 
         self.transactions.extend(
             consumed_jobs
@@ -839,7 +971,7 @@ impl Bank {
         );
     }
 
-    pub fn db_cloned(&self) -> Arc<RwLock<dyn VersionedDB>> {
+    pub fn db_cloned(&self) -> Arc<RwLock<dyn Database>> {
         self.db.clone()
     }
 
@@ -981,5 +1113,23 @@ impl TransactionProcessingCallback for Bank {
 
         let account = native_loader::create_loadable_account_with_fields(name, (1, 0));
         self.db.write().unwrap().write_account(*program_id, account);
+    }
+
+    fn calculate_fee(
+        &self,
+        message: &impl SVMMessage,
+        lamports_per_signature: u64,
+        prioritization_fee: u64,
+        _feature_set: &FeatureSet,
+    ) -> FeeDetails {
+        solana_fee::calculate_fee_details(
+            message,
+            false, /* zero_fees_for_test */
+            lamports_per_signature,
+            prioritization_fee,
+            FeeFeatures {
+                enable_secp256r1_precompile: false,
+            },
+        )
     }
 }

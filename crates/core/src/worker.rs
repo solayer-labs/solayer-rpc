@@ -5,8 +5,10 @@ use std::{
 
 use crossbeam_channel::{Receiver, Sender};
 use infinisvm_logger::{error, info};
-use infinisvm_types::jobs::{ConsumedJob, TransactionId};
-use infinisvm_types::tid::TransactionBatchId;
+use infinisvm_types::{
+    jobs::{ConsumedJob, TransactionId},
+    tid::TransactionBatchId,
+};
 use solana_sdk::transaction::SanitizedTransaction;
 use solana_svm::transaction_processor::{LoadAndExecuteSanitizedTransactionsOutput, TransactionProcessingConfig};
 
@@ -129,6 +131,7 @@ impl<'a> Worker<'a> {
                                 pre_accounts,
                                 sanitized_transaction: tx,
                                 transaction_id: tx_id,
+                                worker_id: self.id,
                             });
                         }
                         Err(load_err) => {
@@ -149,6 +152,7 @@ impl<'a> Worker<'a> {
                                 pre_accounts: Vec::new(),
                                 sanitized_transaction: tx,
                                 transaction_id: tx_id,
+                                worker_id: self.id,
                             });
                         }
                     }
@@ -157,7 +161,7 @@ impl<'a> Worker<'a> {
                 let prepare_commit_time = loop_start.elapsed() - execute_time - check_time - sysvar_time;
                 WORKER_METRICS.record_prepare_commit_time(prepare_commit_time);
                 {
-                    bank.write().unwrap().commit_transactions(&commit_batch);
+                    bank.write().unwrap().commit_transactions(&commit_batch, self.id);
                 }
 
                 let job_len = callback_sender.len();

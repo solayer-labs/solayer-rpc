@@ -1,8 +1,17 @@
+use std::{
+    collections::{HashSet, VecDeque},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, RwLock,
+    },
+    time::Instant,
+};
+
 use dashmap::{DashMap, DashSet};
 use eyre::Result;
 use hashbrown::HashMap;
 use infinisvm_core::{
-    bank::{Bank, RawSlot, TransactionStatus},
+    bank::{Bank, RawSlot, TransactionStatus, FEE_ACCOUNTS},
     committer::PerfSample,
     indexer::Indexer,
     subscription::SubscriptionProcessor,
@@ -19,16 +28,14 @@ use infinisvm_sync::{
 };
 use infinisvm_types::sync::grpc::{CommitBatchNotification, SlotDataResponse};
 use metrics::{counter, gauge, histogram};
-use solana_sdk::hash::Hash;
-use std::sync::atomic::AtomicU64;
-use std::{
-    collections::{HashSet, VecDeque},
-    sync::{atomic::Ordering, Arc, RwLock},
-    time::Instant,
+use solana_sdk::{
+    account::{AccountSharedData, WritableAccount},
+    hash::Hash,
 };
-use tokio::sync::Mutex;
-use tokio::sync::{mpsc, Semaphore};
-use tokio::task::JoinHandle;
+use tokio::{
+    sync::{mpsc, Mutex, Semaphore},
+    task::JoinHandle,
+};
 
 pub struct ColdStartResult {
     pub db_chain: Arc<RwLock<DBChain<MemoryDB<NoopDB>>>>,
@@ -44,7 +51,7 @@ pub struct ColdStartResult {
 // 6. Merge
 pub async fn cold_start(
     http_client: Arc<HttpClient>,
-    tx_receivers: Vec<mpsc::Receiver<CommitBatchNotification>>,
+    tx_receivers: Vec<mpsc::Receiver<Arc<CommitBatchNotification>>>,
     slot_receivers: Vec<mpsc::Receiver<SlotDataResponse>>,
     indexer: Arc<Mutex<dyn Indexer>>,
     bank: Arc<RwLock<Bank>>,
@@ -73,7 +80,8 @@ pub async fn cold_start(
     let t_bulk_download = Instant::now();
     let data = downloader
         .bulk_download(&http_client, all_ckpts, Arc::new(parse_data))
-        .await?;
+        .await
+        .expect("Bulk download failed");
     histogram!("cold_start_bulk_download_ms").record(t_bulk_download.elapsed().as_secs_f64() * 1000.0);
     gauge!("cold_start_last_slot").set(downloader.last_slot() as f64);
     info!("Completed bulk download of checkpoints");
@@ -125,10 +133,7 @@ pub async fn cold_start(
             counter!("file_poller_received_total", "type" => file_kind).increment(1);
             histogram!("file_poller_records_len", "type" => file_kind).record(data.len() as f64);
 
-            let new_db = MemoryDB::from_hashmap(HashMap::from_iter(
-                data.into_iter()
-                    .map(|(pubkey, account, version)| (pubkey, (account, version))),
-            ));
+            let new_db = MemoryDB::from_hashmap(HashMap::from_iter(data.into_iter()));
             let meta = DBMeta::from_db_file(slot);
             let mut chain = db_chain_ref_clone.write().unwrap();
             let before = chain.len();
@@ -154,11 +159,13 @@ pub async fn cold_start(
     let num_slots = Arc::new(AtomicU64::new(0));
     // Track the latest observed slot from the slot stream for accurate sampling
     let current_slot = Arc::new(AtomicU64::new(last_slot));
-    // Remote slot plan as advertised by the leader (updated by both tx and slot processors)
+    // Remote slot plan as advertised by the leader (updated by both tx and slot
+    // processors)
     let slot_plan = Arc::new(RwLock::new(HashMap::<u64, Vec<u64>>::new()));
     // Local slot plan built from tx_receivers after indexing
     let local_slot_plan = Arc::new(RwLock::new(HashMap::<u64, Vec<u64>>::new()));
-    // Global in-flight refetch tracker and applied-shreds tracker to reduce duplication
+    // Global in-flight refetch tracker and applied-shreds tracker to reduce
+    // duplication
     let inflight_refetch: Arc<DashSet<(u64, u64)>> = Arc::new(DashSet::new());
     let seen_shreds: Arc<DashSet<(u64, u64)>> = Arc::new(DashSet::new());
     let job_slot_overrides: Arc<DashMap<u64, u64>> = Arc::new(DashMap::new());
@@ -168,10 +175,8 @@ pub async fn cold_start(
         let bank_clone = bank.clone();
         let subscription_processor_clone = subscription_processor.clone();
         let num_transactions_clone = num_transactions.clone();
-        let num_slots_clone = num_slots.clone();
         let local_slot_plan_clone = local_slot_plan.clone();
         let slot_plan_clone = slot_plan.clone();
-        let http_client_clone = http_client.clone();
         let inflight_refetch_clone = inflight_refetch.clone();
         let seen_shreds_clone = seen_shreds.clone();
         let job_slot_overrides_clone = job_slot_overrides.clone();
@@ -191,7 +196,7 @@ pub async fn cold_start(
                     let info_job_id = tx_batch.job_id;
                     let info_batch_size = tx_batch.batch_size;
 
-                    let parsed = match process_commit_notification(tx_batch) {
+                    let parsed = match process_commit_notification(tx_batch.as_ref()) {
                         Ok(parsed) => parsed,
                         Err(e) => {
                             error!("Processor {}: Error parsing tx_batch: {}", i, e);
@@ -225,7 +230,8 @@ pub async fn cold_start(
                         }
                     }
 
-                    // Empty payloads carry (slot, job_id). Mark presence and add empty shard if new; cancel refetch.
+                    // Empty payloads carry (slot, job_id). Mark presence and add empty shard if
+                    // new; cancel refetch.
                     if parsed.transactions.is_empty() {
                         counter!("tx_batch_empty_total").increment(1);
                         info!(
@@ -334,7 +340,7 @@ pub async fn cold_start(
                             for diff in diffs {
                                 diff.apply_to_account(&mut account);
                             }
-                            shred_db.write_account(pubkey, &account);
+                            shred_db.write_account(pubkey, account);
                         }
                     }
                     histogram!("tx_batch_build_shard_ms").record(t_build.elapsed().as_secs_f64() * 1000.0);
@@ -384,8 +390,9 @@ pub async fn cold_start(
                     }
                     histogram!("tx_batch_index_ms").record(t_index.elapsed().as_secs_f64() * 1000.0);
 
-                    // Status cache was already written per-transaction above with the
-                    // correct success or error status. Do not overwrite here.
+                    // Status cache was already written per-transaction above
+                    // with the correct success or error
+                    // status. Do not overwrite here.
                 }
                 info!("Transaction batch processor {} terminated (channel closed)", i);
                 Ok(()) as Result<(), eyre::Report>
@@ -458,7 +465,8 @@ pub async fn cold_start(
                     let mut sp = slot_plan_clone.write().unwrap();
                     let ids_len = ids.len();
                     let sample: Vec<u64> = ids.iter().copied().take(6).collect();
-                    // Diagnostics: observe whether we overwrite a larger set with a smaller one (regression)
+                    // Diagnostics: observe whether we overwrite a larger set with a smaller one
+                    // (regression)
                     let prev_len = sp.get(&slot).map(|v| v.len()).unwrap_or(0);
                     let union_len = match sp.get(&slot) {
                         Some(prev) => {
@@ -598,7 +606,8 @@ pub async fn cold_start(
                         log_slot_plan_mismatch(slot, &local_vec, &remote_vec);
                         gauge!("grpc_refetch_missing_jobs").set(missing.len() as f64);
 
-                        // For missing jobs, schedule refetch; if definitively NotFound after retries, treat as empty
+                        // For missing jobs, schedule refetch; if definitively NotFound after retries,
+                        // treat as empty
                         for job_id in missing {
                             // Skip if a refetch for (slot, job_id) is already in-flight
                             if !inflight_clone.insert((slot, job_id)) {
@@ -675,7 +684,8 @@ pub async fn cold_start(
                                             break;
                                         }
                                         Err(RefetchErr::NotFound) => {
-                                            // Definitive NotFound after retries: treat as empty and add placeholder shard
+                                            // Definitive NotFound after retries: treat as empty and add placeholder
+                                            // shard
                                             info!(
                                                 "Refetch NotFound exhausted for slot {}, job {}: adding empty shard",
                                                 slot, job_id
@@ -693,7 +703,6 @@ pub async fn cold_start(
                                                 {
                                                     let meta = DBMeta::from_shred(slot, job_id);
                                                     let mut chain = db_chain_task.write().unwrap();
-                                                    let before = chain.len();
                                                     let t_add = Instant::now();
                                                     chain.add_db(
                                                         Arc::new(RwLock::new(MemoryDB::new_no_underlying())),
@@ -837,13 +846,6 @@ pub async fn cold_start(
     ))
 }
 
-fn slot_plans_match(local: &[u64], remote: &[u64]) -> bool {
-    use std::collections::HashSet;
-    let lset: HashSet<u64> = local.iter().copied().collect();
-    let rset: HashSet<u64> = remote.iter().copied().collect();
-    lset == rset
-}
-
 fn log_slot_plan_mismatch(slot: u64, local_vec: &[u64], remote_vec: &[u64]) {
     use std::collections::{HashMap as StdHashMap, HashSet};
 
@@ -908,7 +910,7 @@ fn reconcile_slot_plan_entry(slot_plan: &mut HashMap<u64, Vec<u64>>, job_id: u64
         slot_plan.remove(&slot);
     }
 
-    let entry = slot_plan.entry(target_slot).or_insert_with(Vec::new);
+    let entry = slot_plan.entry(target_slot).or_default();
     if !entry.contains(&job_id) {
         entry.push(job_id);
         entry.sort_unstable();
@@ -1009,7 +1011,8 @@ async fn refetch_and_apply_shred_from_pool(
         });
     };
 
-    // Handle empty batches (no payload) explicitly; mark presence and add empty shred
+    // Handle empty batches (no payload) explicitly; mark presence and add empty
+    // shred
     if notification.batch_size == 0 || notification.compressed_transactions.is_empty() {
         let existing_slot = {
             let chain = db_chain.read().unwrap();
@@ -1024,7 +1027,7 @@ async fn refetch_and_apply_shred_from_pool(
                     }
                 }
             }
-            let entry = lsp.entry(target_slot).or_insert_with(Vec::new);
+            let entry = lsp.entry(target_slot).or_default();
             if !entry.contains(&job_id) {
                 entry.push(job_id);
                 entry.sort_unstable();
@@ -1083,11 +1086,11 @@ async fn refetch_and_apply_shred_from_pool(
     let compressed = notification.compressed_transactions;
     let t_decompress = Instant::now();
     let decompressed =
-        zstd::decode_all(&compressed[..]).map_err(|e| RefetchErr::Other(format!("decompress error: {}", e)))?;
+        zstd::decode_all(&compressed[..]).map_err(|e| RefetchErr::Other(format!("decompress error: {e}")))?;
     histogram!("grpc_refetch_decompress_ms").record(t_decompress.elapsed().as_secs_f64() * 1000.0);
     let t_deser = Instant::now();
     let batch: infinisvm_sync::types::SerializableBatch =
-        bincode::deserialize(&decompressed).map_err(|e| RefetchErr::Other(format!("deserialize error: {}", e)))?;
+        bincode::deserialize(&decompressed).map_err(|e| RefetchErr::Other(format!("deserialize error: {e}")))?;
     histogram!("grpc_refetch_deserialize_ms").record(t_deser.elapsed().as_secs_f64() * 1000.0);
     let txs = batch.transactions;
     histogram!("grpc_refetch_txs_count").record(txs.len() as f64);
@@ -1098,17 +1101,21 @@ async fn refetch_and_apply_shred_from_pool(
             let _ = idx.index_serializable_tx(tx.clone()).await;
         }
     }
-    // Status will be written with accurate Ok/Err per-transaction during shard build below.
+    // Status will be written with accurate Ok/Err per-transaction during shard
+    // build below.
 
     // Build MemoryDB shard mirroring the transaction-batch path
     let mut shred_db = MemoryDB::new_no_underlying();
     let t_build = Instant::now();
+    let mut fees = 0;
     for tx in txs.iter() {
         let result = tx
             .get_result()
-            .map_err(|e| RefetchErr::Other(format!("get_result error: {}", e)))?;
+            .map_err(|e| RefetchErr::Other(format!("get_result error: {e}")))?;
+        fees += result.fee;
 
-        // Write the correct status (success or error) to the follower's status cache and notify subscribers
+        // Write the correct status (success or error) to the follower's status cache
+        // and notify subscribers
         let status = match result.status {
             Ok(()) => TransactionStatus::Executed(None, target_slot),
             Err(e) => TransactionStatus::Executed(Some(e), target_slot),
@@ -1117,15 +1124,22 @@ async fn refetch_and_apply_shred_from_pool(
         bank.write().unwrap().write_status_cache(&tx.get_signature(), status);
         let pre_accounts = tx
             .get_pre_accounts()
-            .map_err(|e| RefetchErr::Other(format!("get_pre_accounts error: {}", e)))?;
+            .map_err(|e| RefetchErr::Other(format!("get_pre_accounts error: {e}")))?;
         for ((pubkey, account_opt), diffs) in pre_accounts.into_iter().zip(result.diffs.into_iter()) {
             let mut account = account_opt.unwrap_or_default();
             for diff in diffs {
                 diff.apply_to_account(&mut account);
             }
-            shred_db.write_account(pubkey, &account);
+            shred_db.write_account(pubkey, account);
         }
     }
+    let fee_account = FEE_ACCOUNTS[batch.worker_id];
+    let mut fee_account_data = match shred_db.get_account(fee_account) {
+        Ok(Some(account)) => account,
+        _ => AccountSharedData::default(),
+    };
+    fee_account_data.checked_add_lamports(fees).unwrap();
+    shred_db.write_account(fee_account, fee_account_data);
     histogram!("grpc_refetch_build_shard_ms").record(t_build.elapsed().as_secs_f64() * 1000.0);
 
     // Update local plan to reflect presence of this job
@@ -1143,7 +1157,7 @@ async fn refetch_and_apply_shred_from_pool(
                 }
             }
         }
-        let entry = lsp.entry(target_slot).or_insert_with(Vec::new);
+        let entry = lsp.entry(target_slot).or_default();
         if !entry.contains(&job_id) {
             entry.push(job_id);
             entry.sort_unstable();

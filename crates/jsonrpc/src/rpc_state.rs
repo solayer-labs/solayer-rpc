@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use crossbeam_channel::Sender;
 use eyre::Context;
 use infinisvm_core::{bank::Bank, committer::PerfSample, indexer::Indexer, subscription::SubscriptionProcessor};
-use infinisvm_db::VersionedDB;
+use infinisvm_db::Database;
 use infinisvm_logger::{error, tracing};
 use infinisvm_types::{BlockWithTransactions, SignatureFilters, TransactionWithMetadata};
 use jsonrpsee::{core::RpcResult, types::ErrorCode};
@@ -27,7 +27,6 @@ use solana_sdk::{
     transaction::{MessageHash, SanitizedTransaction, Transaction, TransactionError, VersionedTransaction},
 };
 use solana_svm::transaction_processing_result::ProcessedTransaction;
-use tracing::info;
 
 use crate::{
     rpc_impl::{RpcFilterType, RpcKeyedAccount, RpcResponse, RpcResponseContext, RpcTokenAccountsFilter},
@@ -77,7 +76,7 @@ impl RpcBank for Bank {
 }
 
 pub struct RpcServerState {
-    pub db: Arc<RwLock<dyn VersionedDB>>,
+    pub db: Arc<RwLock<dyn Database>>,
     pub bank: Arc<RwLock<dyn RpcBank>>,
     pub indexer: Arc<dyn RpcIndexer>,
     pub samples: Arc<RwLock<(Instant, VecDeque<PerfSample>)>>,
@@ -104,7 +103,7 @@ pub const IDENTITY_KEYPAIR_BYTES: [u8; 64] = [
 
 impl TxService {
     pub fn new(sender: Sender<(SanitizedTransaction, u64)>) -> Self {
-        let keypair = Keypair::from_bytes(&IDENTITY_KEYPAIR_BYTES).unwrap();
+        let keypair = Keypair::try_from(&IDENTITY_KEYPAIR_BYTES[..]).unwrap();
         Self { keypair, sender }
     }
 
@@ -182,7 +181,7 @@ pub trait RpcIndexer: Indexer + Send + Sync {
 impl RpcServerState {
     pub fn new(
         bank: Arc<RwLock<dyn RpcBank>>,
-        db: Arc<RwLock<dyn VersionedDB>>,
+        db: Arc<RwLock<dyn Database>>,
         indexer: Arc<dyn RpcIndexer>,
         samples: Arc<RwLock<(Instant, VecDeque<PerfSample>)>>,
         total_transaction_count: Arc<AtomicU64>,

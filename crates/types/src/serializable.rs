@@ -1,11 +1,9 @@
-use serde::{Deserialize, Serialize};
 use std::pin::Pin;
-use tokio_postgres::binary_copy::BinaryCopyInWriter;
 
 use async_trait::async_trait;
 use cdrs_tokio::types::ByIndex;
 use klickhouse::Row;
-
+use serde::{Deserialize, Serialize};
 use solana_pubkey::Pubkey;
 use solana_sdk::{
     account::{AccountSharedData, ReadableAccount, WritableAccount},
@@ -16,6 +14,7 @@ use solana_sdk::{
 };
 use solana_svm::transaction_execution_result::ExecutedTransaction;
 use solana_transaction_context::TransactionReturnData;
+use tokio_postgres::binary_copy::BinaryCopyInWriter;
 
 use crate::convert::calculate_diff_successful_tx_for_processed_tx;
 

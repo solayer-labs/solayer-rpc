@@ -37,15 +37,16 @@ pub async fn start_server(
     info!("InfiniSVM gRPC Server listening on {}", grpc_addr);
 
     // Enable gRPC server with bincode message types
-    // Note: This uses tonic's default protobuf transport but with bincode message structs
-    // For full bincode transport, additional codec implementation would be needed
+    // Note: This uses tonic's default protobuf transport but with bincode message
+    // structs For full bincode transport, additional codec implementation would
+    // be needed
     let grpc_service = InfiniSvmServiceServer::new(service);
     tokio::spawn(async move {
         // Tune gRPC server for lower latency and better h2 performance
         let mut server = Server::builder().tcp_nodelay(true);
 
-        // If TLS is enabled, generate a self-signed Ed25519 certificate from the provided key
-        // and configure tonic's server with it.
+        // If TLS is enabled, generate a self-signed Ed25519 certificate from the
+        // provided key and configure tonic's server with it.
         if let Some(key_or_path) = grpc_tls_ed25519_key {
             // Install ring provider for rustls 0.23 if not already installed
             let _ = rustls::crypto::ring::default_provider().install_default();
@@ -85,10 +86,11 @@ pub async fn start_server(
     Ok(sync_state)
 }
 
-/// Load an Identity from an Ed25519 key (PEM or path) by generating a self-signed
-/// end-entity certificate (CA=false) suitable for TLS server authentication. If the input
-/// contains both a certificate and a private key, we will prefer using the private key
-/// to generate a fresh leaf certificate to avoid CA-as-leaf issues.
+/// Load an Identity from an Ed25519 key (PEM or path) by generating a
+/// self-signed end-entity certificate (CA=false) suitable for TLS server
+/// authentication. If the input contains both a certificate and a private key,
+/// we will prefer using the private key to generate a fresh leaf certificate to
+/// avoid CA-as-leaf issues.
 fn load_identity_from_key_or_bundle(key_or_path: &str, grpc_addr: SocketAddr) -> eyre::Result<Identity> {
     // Load PEM contents either directly or from file path
     let pem = if Path::new(key_or_path).exists() {
@@ -132,12 +134,14 @@ fn load_identity_from_key_or_bundle(key_or_path: &str, grpc_addr: SocketAddr) ->
         .find(key_begin)
         .ok_or_else(|| eyre::eyre!("missing key PEM in input"))?;
     let (cert_pem, key_pem) = if cert_start < key_start {
-        let cert_pem = pem[cert_start..].to_string();
-        let key_pem = pem[key_start..].to_string();
+        // Certificate comes first, then key
+        let cert_pem = pem[cert_start..key_start].trim().to_string();
+        let key_pem = pem[key_start..].trim().to_string();
         (cert_pem, key_pem)
     } else {
-        let cert_pem = pem[cert_start..].to_string();
-        let key_pem = pem[key_start..].to_string();
+        // Key comes first, then certificate
+        let key_pem = pem[key_start..cert_start].trim().to_string();
+        let cert_pem = pem[cert_start..].trim().to_string();
         (cert_pem, key_pem)
     };
     Ok(Identity::from_pem(cert_pem, key_pem))

@@ -1,10 +1,11 @@
 use std::collections::HashMap;
 
-use crate::bank::TransactionStatus;
 use infinisvm_types::BlockWithTransactions;
 use jsonrpsee::types::ErrorObjectOwned;
 use solana_sdk::{account::AccountSharedData, clock::Slot, pubkey::Pubkey, signature::Signature};
 use tokio::sync::broadcast;
+
+use crate::bank::TransactionStatus;
 
 pub const SUBSCRIPTION_CHANNEL_SIZE: usize = 1000;
 
@@ -136,6 +137,12 @@ impl SubscriptionProcessor {
 
         self.notify_all_blocks_update(block);
         self.notify_all_slots_update(&block.slot);
+    }
+}
+
+impl Default for SubscriptionProcessor {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

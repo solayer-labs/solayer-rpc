@@ -83,8 +83,7 @@ async fn handle_connection(
                     payload_length, MAX_PAYLOAD_SIZE
                 );
                 return Err(Box::from(format!(
-                    "Payload too large: {} bytes, max allowed: {}",
-                    payload_length, MAX_PAYLOAD_SIZE
+                    "Payload too large: {payload_length} bytes, max allowed: {MAX_PAYLOAD_SIZE}"
                 )));
             }
 

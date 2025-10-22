@@ -1,11 +1,11 @@
+use std::hash::{Hash, Hasher};
+
 use solana_sdk::{
     account::AccountSharedData,
     clock::Slot,
     transaction::{SanitizedTransaction, TransactionError},
 };
 use solana_svm::transaction_processing_result::ProcessedTransaction;
-
-use std::hash::{Hash, Hasher};
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct TransactionId(u64);
@@ -48,6 +48,7 @@ impl Hash for TransactionPriorityId {
 
 pub struct ConsumedJob {
     pub job_id: usize,
+    pub worker_id: usize,
     pub processed_transaction: Result<ProcessedTransaction, TransactionError>,
     pub sanitized_transaction: SanitizedTransaction,
     pub transaction_id: TransactionId, // used for pruning
@@ -60,6 +61,7 @@ impl Clone for ConsumedJob {
     fn clone(&self) -> Self {
         Self {
             job_id: self.job_id,
+            worker_id: self.worker_id,
             sanitized_transaction: self.sanitized_transaction.clone(),
             transaction_id: self.transaction_id,
             slot: self.slot,

@@ -93,7 +93,7 @@ impl InfiniSVMServiceImpl {
                             }
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                            counter!("grpc_cache_builder_lagged_total").increment(n as u64);
+                            counter!("grpc_cache_builder_lagged_total").increment(n);
                             continue;
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => {
@@ -197,7 +197,7 @@ impl InfiniSvmService for InfiniSVMServiceImpl {
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        metrics::counter!("grpc_batch_stream_lagged_total").increment(n as u64);
+                        metrics::counter!("grpc_batch_stream_lagged_total").increment(n);
                         continue;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,

@@ -131,6 +131,7 @@ impl DatabaseIndexerMetrics {
         self.gauge_last_slot_timestamp_seconds.set(timestamp_secs as f64);
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn report_cache_sizes(
         &self,
         tx_cache_len: usize,

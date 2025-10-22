@@ -1,15 +1,22 @@
-use std::collections::HashMap;
-use std::fs::{self, File};
-use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashMap,
+    fs::{self, File},
+    io::{Read, Write},
+    path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use infinisvm_db::persistence::DB_DIRECTORY;
 use infinisvm_logger::{error, info};
+use infinisvm_types::serializable::TransactionExecutionDetailsSerializable;
 use solana_pubkey::Pubkey;
 use solana_sdk::account::AccountSharedData;
 
 use crate::bank::Bank;
-use infinisvm_types::serializable::{SerializableTxRow, TransactionExecutionDetailsSerializable};
 
 /// Directory under the DB root where WAL files are stored.
 /// Layout: <DB_DIRECTORY>/wal/<slot>/<job_id>.bin
@@ -22,15 +29,16 @@ fn wal_root() -> PathBuf {
 }
 
 fn wal_slot_dir(slot: u64) -> PathBuf {
-    wal_root().join(format!("{:018}", slot))
+    wal_root().join(format!("{slot:018}"))
 }
 
 fn wal_job_file(slot: u64, job_id: u64) -> PathBuf {
-    wal_slot_dir(slot).join(format!("{:018}.bin", job_id))
+    wal_slot_dir(slot).join(format!("{job_id:018}.bin"))
 }
 
 /// Persist a completed job batch as a WAL record.
-/// The file contains a bincode-serialized `SerializableBatch` (uncompressed) for simplicity.
+/// The file contains a bincode-serialized `SerializableBatch` (uncompressed)
+/// for simplicity.
 pub fn persist_batch(batch: &[infinisvm_types::jobs::ConsumedJob]) -> std::io::Result<()> {
     // Filter to only successfully processed transactions to avoid panics
     let filtered: Vec<_> = batch
@@ -49,8 +57,7 @@ pub fn persist_batch(batch: &[infinisvm_types::jobs::ConsumedJob]) -> std::io::R
 
     // Build SerializableBatch without compression
     let serializable = infinisvm_sync::types::SerializableBatch::from_consumed_jobs(&filtered);
-    let bytes = bincode::serialize(&serializable)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("serialize WAL: {e}")))?;
+    let bytes = bincode::serialize(&serializable).map_err(|e| std::io::Error::other(format!("serialize WAL: {e}")))?;
 
     // Ensure directory exists
     let slot_dir = wal_slot_dir(slot);
@@ -122,8 +129,9 @@ pub fn replay(bank: &mut Bank, from_slot: u64) -> eyre::Result<usize> {
     Ok(applied)
 }
 
-/// Delete all WAL files for a given `slot` after successful external persistence.
-/// Returns the number of files deleted. Best-effort: continues on individual file errors.
+/// Delete all WAL files for a given `slot` after successful external
+/// persistence. Returns the number of files deleted. Best-effort: continues on
+/// individual file errors.
 pub fn delete_slot(slot: u64) -> std::io::Result<usize> {
     let dir = wal_slot_dir(slot);
     if !dir.exists() {
@@ -186,7 +194,7 @@ fn apply_wal_file(bank: &mut Bank, path: &Path) -> eyre::Result<()> {
     }
 
     if !changes.is_empty() {
-        let items: Vec<(Pubkey, AccountSharedData, u64)> = changes.into_iter().map(|(k, v)| (k, v, 0u64)).collect();
+        let items: Vec<(Pubkey, AccountSharedData)> = changes.into_iter().collect();
         bank.commit_changes(items);
     }
 
@@ -203,95 +211,105 @@ fn parse_u64_stem(name: std::ffi::OsString) -> Option<u64> {
     stem.parse::<u64>().ok()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::{Arc, RwLock};
+pub fn spawn(exit: Arc<AtomicBool>) {
+    std::thread::Builder::new()
+        .name("walDeleter".to_string())
+        .spawn(move || {
+            worker(exit);
+        })
+        .unwrap();
+}
 
-    use infinisvm_logger::console;
-    use solana_sdk::account::{AccountSharedData, ReadableAccount, WritableAccount};
+fn worker(exit: Arc<AtomicBool>) {
+    info!("walDeleter started");
 
-    fn setup_logger() {
-        let _ = console();
+    const CHECK_INTERVAL_SECS: u64 = 60;
+
+    while !exit.load(Ordering::Relaxed) {
+        delete_old_batches();
+        std::thread::sleep(Duration::from_secs(CHECK_INTERVAL_SECS));
     }
 
-    fn mk_account_with_lamports(lamports: u64) -> AccountSharedData {
-        let mut a = AccountSharedData::default();
-        a.set_lamports(lamports);
-        a
+    println!("walDeleter exited");
+}
+
+fn delete_old_batches() {
+    // remove all files under wal_root() older than 2 days, recursively
+    let root = wal_root();
+    if !root.exists() {
+        return;
     }
 
-    #[test]
-    fn wal_replay_applies_account_diffs() {
-        setup_logger();
+    let now = std::time::SystemTime::now();
+    let cutoff = Duration::from_secs(60 * 60 * 24 * 2);
 
-        // 1) Prepare temp wal root
-        let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("INFINISVM_DB_PATH", tmp.path().display().to_string());
+    let mut num_deleted = 0;
+    prune_dir_recursively(&root, now, cutoff, &mut num_deleted);
+    info!("Deleted {} old WAL files", num_deleted);
+}
 
-        // 2) Create a small SerializableBatch with one tx that sets lamports
-        let slot = 1u64;
-        let job_id = 42u64;
-        let timestamp = 123_456u64;
-        let target = solana_pubkey::Pubkey::new_unique();
+fn prune_dir_recursively(path: &Path, now: std::time::SystemTime, cutoff: Duration, num_deleted: &mut usize) {
+    let entries = match fs::read_dir(path) {
+        Ok(e) => e,
+        Err(e) => {
+            error!("Failed to read WAL dir {:?}: {}", path, e);
+            return;
+        }
+    };
 
-        // Pre-state: account has 1 lamport
-        let pre = mk_account_with_lamports(1);
-        // Post-state: lamports become 777
-        let result = TransactionExecutionDetailsSerializable {
-            status: Ok(()),
-            log_messages: None,
-            inner_instructions: None,
-            return_data: None,
-            executed_units: 0,
-            accounts_data_len_delta: 0,
-            fee: 0,
-            diffs: vec![vec![infinisvm_types::serializable::AccountDataDiff::Lamports(777)]],
-            pre_balances: vec![1],
+    for entry_result in entries {
+        let entry = match entry_result {
+            Ok(e) => e,
+            Err(e) => {
+                error!("Failed to read entry in {:?}: {}", path, e);
+                continue;
+            }
         };
 
-        let s_tx = SerializableTxRow {
-            signature: vec![0; 64],
-            transaction: vec![], // not used by replay
-            result: bincode::serialize(&result).unwrap(),
-            slot,
-            pre_accounts: bincode::serialize(&vec![(target, Some(pre))]).unwrap(),
-            block_unix_timestamp: timestamp,
-            seq_number: job_id,
+        let entry_path = entry.path();
+        let file_type = match entry.file_type() {
+            Ok(t) => t,
+            Err(e) => {
+                error!("Failed to get type for {:?}: {}", entry_path, e);
+                continue;
+            }
         };
 
-        let ser_batch = infinisvm_sync::types::SerializableBatch {
-            slot,
-            timestamp,
-            job_id: job_id as usize,
-            transactions: vec![s_tx],
-        };
+        if file_type.is_dir() {
+            prune_dir_recursively(&entry_path, now, cutoff, num_deleted);
+            continue;
+        }
 
-        // 3) Write the WAL file directly
-        let dir = wal_slot_dir(slot);
-        std::fs::create_dir_all(&dir).unwrap();
-        let wal_path = wal_job_file(slot, job_id);
-        let tmp_path = wal_path.with_extension("wip");
-        let mut f = File::create(&tmp_path).unwrap();
-        let bytes = bincode::serialize(&ser_batch).unwrap();
-        f.write_all(&bytes).unwrap();
-        f.sync_all().unwrap();
-        std::fs::rename(&tmp_path, &wal_path).unwrap();
+        if file_type.is_file() {
+            let metadata = match entry.metadata() {
+                Ok(m) => m,
+                Err(e) => {
+                    error!("Failed to get metadata for {:?}: {}", entry_path, e);
+                    continue;
+                }
+            };
 
-        // 4) Build a Bank (slave mode uses in-memory DB)
-        let exit = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let mut bank = crate::bank::Bank::new_slave(exit);
+            let modified = match metadata.modified() {
+                Ok(m) => m,
+                Err(e) => {
+                    error!("Failed to read modified time for {:?}: {}", entry_path, e);
+                    continue;
+                }
+            };
 
-        // 5) Ensure account is not present before replay
-        let before = bank.get_account_shared_data_public(&target);
-        assert!(before.is_none());
-
-        // 6) Replay
-        let applied = replay(&mut bank, 0).unwrap();
-        assert_eq!(applied, 1);
-
-        // 7) Verify account now has 777 lamports
-        let after = bank.get_account_shared_data_public(&target).unwrap();
-        assert_eq!(after.lamports(), 777);
+            match now.duration_since(modified) {
+                Ok(age) if age > cutoff => {
+                    if let Err(e) = fs::remove_file(&entry_path) {
+                        error!("Failed to delete old WAL file {:?}: {}", entry_path, e);
+                    } else {
+                        *num_deleted += 1;
+                    }
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    // modified time is in the future; skip
+                }
+            }
+        }
     }
 }

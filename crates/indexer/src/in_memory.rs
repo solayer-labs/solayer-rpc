@@ -1,12 +1,13 @@
 use std::collections::VecDeque;
 
-use crate::to_transaction_with_metadata;
 use async_trait::async_trait;
 use infinisvm_core::indexer::Indexer;
 use infinisvm_jsonrpc::rpc_state::RpcIndexer;
 use infinisvm_types::{jobs::ConsumedJob, BlockWithTransactions, TransactionWithMetadata};
 use solana_hash::Hash;
 use solana_sdk::{clock::Slot, pubkey::Pubkey, signature::Signature};
+
+use crate::to_transaction_with_metadata;
 
 #[derive(Default)]
 struct BlockMetadata {

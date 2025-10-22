@@ -61,3 +61,43 @@ impl SyncState {
         self.latest_slot_sender.send(arc_slot).unwrap();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn notify_new_slot_caches_and_emits() {
+        let initial = (0, vec![], vec![], 0, vec![]);
+        let (mut state, receiver) = SyncState::new(initial);
+
+        let slot_tuple = (5u64, b"hash".to_vec(), b"parent".to_vec(), 123, vec![1, 2, 3]);
+        state.notify_new_slot(slot_tuple.clone());
+
+        let received = receiver.recv().expect("slot message");
+        assert_eq!(received.slot, slot_tuple.0);
+        assert_eq!(received.blockhash, slot_tuple.1);
+        assert_eq!(received.parent_blockhash, slot_tuple.2);
+        assert_eq!(received.timestamp, slot_tuple.3);
+        assert_eq!(received.job_ids, slot_tuple.4);
+
+        let cached = state.get_slot(slot_tuple.0).expect("cached slot");
+        assert!(Arc::ptr_eq(&cached, &received));
+    }
+
+    #[test]
+    fn notify_new_slot_prunes_when_capacity_exceeded() {
+        let initial = (0, vec![], vec![], 0, vec![]);
+        let (mut state, receiver) = SyncState::new(initial);
+
+        for slot in 0..=super::MAX_RETAINED_SLOTS as u64 + 1 {
+            let tuple = (slot, vec![slot as u8], vec![], slot, vec![]);
+            state.notify_new_slot(tuple);
+            receiver.recv().expect("drain receiver");
+        }
+
+        assert!(state.get_slot(0).is_none());
+        let last_slot = super::MAX_RETAINED_SLOTS as u64 + 1;
+        assert!(state.get_slot(last_slot).is_some());
+    }
+}

@@ -6,10 +6,8 @@ use std::{
 
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use infinisvm_logger::{debug, info};
-use infinisvm_types::sync::CommitBatchNotification;
+use infinisvm_types::{jobs::ConsumedJob, sync::CommitBatchNotification};
 use tokio::sync::broadcast;
-
-use infinisvm_types::jobs::ConsumedJob;
 
 use crate::types::SerializableBatch;
 
@@ -25,9 +23,6 @@ pub struct TransactionBatchBroadcaster {
 
     // Thread handles for broadcasting
     _broadcaster_handles: Vec<thread::JoinHandle<()>>,
-
-    // Round-robin counter for broadcast threads
-    broadcast_counter: Arc<AtomicUsize>,
 }
 
 impl TransactionBatchBroadcaster {
@@ -48,7 +43,7 @@ impl TransactionBatchBroadcaster {
             let broadcast_counter = broadcast_counter.clone();
 
             let handle = thread::Builder::new()
-                .name(format!("batch-broadcaster-{}", broadcaster_id))
+                .name(format!("batch-broadcaster-{broadcaster_id}"))
                 .spawn(move || {
                     Self::broadcaster_loop(
                         broadcaster_id,
@@ -66,11 +61,11 @@ impl TransactionBatchBroadcaster {
             notification_sender,
             notification_broadcast,
             _broadcaster_handles: broadcaster_handles,
-            broadcast_counter,
         }
     }
 
-    // This method does serialization inline but sends to broadcast threads non-blocking
+    // This method does serialization inline but sends to broadcast threads
+    // non-blocking
     pub fn broadcast_batch(&self, batch: Vec<ConsumedJob>) -> Result<(), String> {
         // Serialize and compress in the calling thread (committer thread)
         let start_time = Instant::now();
@@ -111,6 +106,7 @@ impl TransactionBatchBroadcaster {
                     compressed_transactions: Vec::new(),
                     compression_ratio: 0,
                     job_id: job_id as u64,
+                    worker_id: 0,
                 };
 
                 let processing_time = start_time.elapsed();
@@ -124,7 +120,7 @@ impl TransactionBatchBroadcaster {
                 return self
                     .notification_sender
                     .send(notification)
-                    .map_err(|e| format!("Failed to send notification to broadcaster: {}", e));
+                    .map_err(|e| format!("Failed to send notification to broadcaster: {e}"));
             } else if original_len > success_len {
                 infinisvm_logger::debug!(
                     "Broadcaster: dropping {} failed txs for slot={} job_id={} (successes={})",
@@ -149,7 +145,13 @@ impl TransactionBatchBroadcaster {
         let notification = Arc::new(notification);
         self.notification_sender
             .send(notification)
-            .map_err(|e| format!("Failed to send notification to broadcaster: {}", e))
+            .map_err(|e| format!("Failed to send notification to broadcaster: {e}"))
+    }
+
+    pub fn publish_notification(&self, notification: Arc<CommitBatchNotification>) -> Result<(), String> {
+        self.notification_sender
+            .send(notification)
+            .map_err(|e| format!("Failed to send notification to broadcaster: {e}"))
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<Arc<CommitBatchNotification>> {
@@ -193,13 +195,13 @@ impl TransactionBatchBroadcaster {
             return Err("serialize_and_compress_batch called with empty batch".to_string());
         }
         let serialized = bincode::serialize(&SerializableBatch::from_consumed_jobs(&batch))
-            .map_err(|e| format!("Failed to serialize batch: {}", e))?;
+            .map_err(|e| format!("Failed to serialize batch: {e}"))?;
 
         let original_size = serialized.len();
 
         // Compress with zstd
         let compressed = zstd::encode_all(&serialized[..], COMPRESSION_LEVEL)
-            .map_err(|e| format!("Failed to compress batch: {}", e))?;
+            .map_err(|e| format!("Failed to compress batch: {e}"))?;
 
         let compressed_size = compressed.len();
         let compression_ratio = if compressed_size > 0 {
@@ -222,7 +224,14 @@ impl TransactionBatchBroadcaster {
             compressed_transactions: compressed,
             compression_ratio: compression_ratio as u64,
             job_id: batch[0].job_id as u64,
+            worker_id: batch[0].worker_id,
         })
+    }
+}
+
+impl Default for TransactionBatchBroadcaster {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

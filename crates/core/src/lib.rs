@@ -7,6 +7,12 @@ pub mod ticker;
 pub mod wal;
 pub mod worker;
 
+#[cfg(feature = "devnet")]
+pub mod bench_initializer;
+
+pub const SCHEDULER_WORKER_COUNT: usize = 12;
+
+
 pub mod fork_graph;
 
 pub mod indexer;

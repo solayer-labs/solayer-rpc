@@ -40,7 +40,6 @@ impl BankMetrics {
 }
 
 
-
 #[derive(Debug, Default)]
 pub struct QuicTxReceiverMetrics {
     active_connections: AtomicU64,
