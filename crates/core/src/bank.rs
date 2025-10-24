@@ -597,6 +597,15 @@ impl Bank {
         self.post_tick(slot, unix_timestamp, true);
     }
 
+    pub fn commit_blockhash_to_signatures(&mut self, blockhash_to_signatures: HashMap<Hash, Vec<Signature>>) {
+        for (bh, signatures) in blockhash_to_signatures.into_iter() {
+            self.blockhash_signature_map
+                .entry(bh)
+                .or_insert_with(|| HashSet::with_capacity(200_000))
+                .extend(signatures.into_iter());
+        }
+    }
+
     pub fn tick_as_slave(&mut self, slot_data: &RawSlot) {
         // Advance to the provided slot/hash/timestamp from the sequencer
         self.slot_hash_timestamp = (slot_data.slot, slot_data.hash, slot_data.timestamp);
@@ -688,7 +697,8 @@ impl Bank {
             }
 
             // Process all currently available messages from the receiver without blocking
-            while let Ok((_blockhash, signatures)) = receiver.try_recv() {
+            while let Ok((blockhash, signatures)) = receiver.try_recv() {
+                info!("Pruning {} signatures for blockhash {:?}", signatures.len(), blockhash);
                 signatures.into_par_iter().for_each(|signature| {
                     status_cache.remove(&signature);
                 });

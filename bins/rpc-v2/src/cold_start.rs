@@ -169,6 +169,8 @@ pub async fn cold_start(
     let inflight_refetch: Arc<DashSet<(u64, u64)>> = Arc::new(DashSet::new());
     let seen_shreds: Arc<DashSet<(u64, u64)>> = Arc::new(DashSet::new());
     let job_slot_overrides: Arc<DashMap<u64, u64>> = Arc::new(DashMap::new());
+
+    let blockhash_to_signatures = Arc::new(RwLock::new(HashMap::new()));
     for (i, mut tx_receiver) in tx_receivers.into_iter().enumerate() {
         let db_chain_ref_clone = db_chain_ref.clone();
         let indexer_clone = indexer.clone();
@@ -180,6 +182,7 @@ pub async fn cold_start(
         let inflight_refetch_clone = inflight_refetch.clone();
         let seen_shreds_clone = seen_shreds.clone();
         let job_slot_overrides_clone = job_slot_overrides.clone();
+        let blockhash_to_signatures_clone = blockhash_to_signatures.clone();
         let handle = tokio::spawn({
             let indexer = indexer_clone;
             async move {
@@ -319,6 +322,7 @@ pub async fn cold_start(
                     num_transactions_clone.fetch_add(parsed.transactions.len() as u64, Ordering::SeqCst);
 
                     let t_build = Instant::now();
+                    let mut signatures = HashMap::new();
                     for tx in parsed.transactions.iter() {
                         let result = tx.get_result().unwrap();
 
@@ -326,13 +330,18 @@ pub async fn cold_start(
                             Ok(()) => TransactionStatus::Executed(None, target_slot),
                             Err(e) => TransactionStatus::Executed(Some(e), target_slot),
                         };
-                        trace!("Processor {}: Processing transaction {}", i, tx.get_signature());
-                        subscription_processor_clone.notify_signature_update(&tx.get_signature(), &status);
-                        bank_clone
-                            .write()
-                            .unwrap()
-                            .write_status_cache(&tx.get_signature(), status);
 
+                        let blockhash = if let Ok(transaction) = tx.get_transaction() {
+                            transaction.message.recent_blockhash().clone()
+                        } else {
+                            error!("Processor {}: Error getting transaction, bincode error", i);
+                            continue;
+                        };
+                        let signature = tx.get_signature();
+                        trace!("Processor {}: Processing transaction {}", i, signature);
+                        signatures.entry(blockhash).or_insert_with(Vec::new).push(signature);
+                        subscription_processor_clone.notify_signature_update(&signature, &status);
+                        bank_clone.write().unwrap().write_status_cache(&signature, status);
                         let pre_accounts = tx.get_pre_accounts().unwrap();
 
                         for ((pubkey, account), diffs) in pre_accounts.into_iter().zip(result.diffs.into_iter()) {
@@ -344,6 +353,13 @@ pub async fn cold_start(
                         }
                     }
                     histogram!("tx_batch_build_shard_ms").record(t_build.elapsed().as_secs_f64() * 1000.0);
+
+                    {
+                        let mut g = blockhash_to_signatures_clone.write().unwrap();
+                        for (bh, sigs) in signatures.into_iter() {
+                            g.entry(bh).or_insert_with(Vec::new).extend(sigs);
+                        }
+                    }
 
                     let meta = DBMeta::from_shred(target_slot, job_id_u64);
                     if seen_shreds_clone.insert((target_slot, job_id_u64)) {
@@ -422,6 +438,7 @@ pub async fn cold_start(
         let num_slots_counter = num_slots.clone();
         let current_slot_tracker = current_slot.clone();
         let job_slot_overrides_clone = job_slot_overrides.clone();
+        let blockhash_to_signatures_clone = blockhash_to_signatures.clone();
         let handle = tokio::spawn(async move {
             info!("Slot processor {} started", i);
             while let Some(slot) = slot_receiver.recv().await {
@@ -449,13 +466,20 @@ pub async fn cold_start(
                     job_ids.len()
                 );
                 histogram!("slot_job_ids_count").record(job_ids.len() as f64);
-                bank_clone.write().unwrap().tick_as_slave(&RawSlot {
-                    slot,
-                    hash: Hash::new(blockhash.as_ref()),
-                    parent_hash: Hash::new(parent_blockhash.as_ref()),
-                    timestamp,
-                    job_ids: vec![], // we don't need job_ids for posting tick
-                });
+
+                let blockhash_to_signatures = std::mem::take(&mut *blockhash_to_signatures_clone.write().unwrap());
+
+                {
+                    let mut bank_writer = bank_clone.write().unwrap();
+                    bank_writer.tick_as_slave(&RawSlot {
+                        slot,
+                        hash: Hash::new(blockhash.as_ref()),
+                        parent_hash: Hash::new(parent_blockhash.as_ref()),
+                        timestamp,
+                        job_ids: vec![], // we don't need job_ids for posting tick
+                    });
+                    bank_writer.commit_blockhash_to_signatures(blockhash_to_signatures);
+                }
                 let remote_ids: Vec<u64> = {
                     // Deduplicate remote job_ids to avoid over-counting in DBChain merge
                     let mut ids = job_ids;
