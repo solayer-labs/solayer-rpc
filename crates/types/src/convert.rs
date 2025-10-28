@@ -1,3 +1,5 @@
+#![allow(clippy::type_complexity)]
+
 use solana_pubkey::Pubkey;
 use solana_sdk::{
     account::{AccountSharedData, ReadableAccount},

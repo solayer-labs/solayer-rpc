@@ -201,6 +201,7 @@ pub struct Bank {
     blockhash_signature_map: DashMap<Hash, HashSet<Signature>>,
 
     previous_hashes: Arc<RwLock<VecDeque<Hash>>>, // 150 valid hashes
+    slot_blockhashes: BTreeMap<u64, Hash>,
 
     slot_hash_timestamp: SlotHashTimestamp,
     hash_generator: DummyRpcBlockhashGenerator,
@@ -330,12 +331,21 @@ impl Bank {
             .sysvar_cache_mut()
             .fill_missing_entries(sysvar_setter);
 
-        let bank = Self {
+        let mut slot_blockhashes = BTreeMap::new();
+        slot_blockhashes.insert(slot, hash);
+        let previous_hashes = Arc::new(RwLock::new(VecDeque::with_capacity(150)));
+        {
+            let mut prev = previous_hashes.write().unwrap();
+            prev.push_back(hash);
+        }
+
+        let mut bank = Self {
             db: Arc::new(RwLock::new(pdb)),
             // 350000 tps, expire every 150 slots
             // we need to store 21000000 txs
             blockhash_signature_map: DashMap::with_capacity(150),
-            previous_hashes: Arc::new(RwLock::new(VecDeque::with_capacity(150))),
+            previous_hashes,
+            slot_blockhashes,
             slot_hash_timestamp: (slot, hash, timestamp),
             hash_generator,
             new_block_sender: None,
@@ -357,6 +367,9 @@ impl Bank {
             emitted_slot_meta: BTreeMap::new(),
             metrics: BankMetrics::default(),
         };
+
+        bank.blockhash_signature_map
+            .insert(hash, HashSet::with_capacity(200_000));
 
         for builtin in BUILTINS {
             bank.transaction_processor.add_builtin(
@@ -453,6 +466,86 @@ impl Bank {
 
     pub fn get_tx_status(&self, signature: &Signature) -> Option<TransactionStatus> {
         self.status_cache.get(signature).map(|r| r.clone())
+    }
+
+    fn stage_blockhash(&mut self, slot: u64, hash: Hash) {
+        let existing = self.slot_blockhashes.get(&slot).copied();
+        if existing == Some(hash) {
+            return;
+        }
+
+        if let Some(old_hash) = existing {
+            if old_hash != hash {
+                self.blockhash_signature_map.remove(&old_hash);
+            }
+        }
+
+        self.slot_blockhashes.insert(slot, hash);
+        self.blockhash_signature_map
+            .entry(hash)
+            .or_insert_with(|| HashSet::with_capacity(200_000));
+
+        self.trim_blockhash_history();
+        self.rebuild_previous_hashes();
+    }
+
+    fn trim_blockhash_history(&mut self) {
+        const MAX_HASH_SLOTS: usize = 150;
+        while self.slot_blockhashes.len() > MAX_HASH_SLOTS {
+            let oldest_slot = match self.slot_blockhashes.keys().next().copied() {
+                Some(slot) => slot,
+                None => break,
+            };
+
+            if let Some(old_hash) = self.slot_blockhashes.remove(&oldest_slot) {
+                if let Some((_, signatures)) = self.blockhash_signature_map.remove(&old_hash) {
+                    let _ = self.blockhash_pruner_sender.send((old_hash, signatures));
+                }
+            }
+        }
+
+        self.blockhash_signature_map.shrink_to_fit();
+    }
+
+    fn rebuild_previous_hashes(&mut self) {
+        let mut previous = self.previous_hashes.write().unwrap();
+        previous.clear();
+        for hash in self.slot_blockhashes.values() {
+            previous.push_back(*hash);
+        }
+    }
+
+    pub fn finalize_blockhash(&mut self, slot: u64, hash: Hash) {
+        let existing = self.slot_blockhashes.get(&slot).copied();
+        if existing == Some(hash) {
+            return;
+        }
+
+        let signatures = if let Some(old_hash) = existing {
+            self.blockhash_signature_map
+                .remove(&old_hash)
+                .map(|(_, set)| set)
+                .unwrap_or_else(|| HashSet::with_capacity(200_000))
+        } else {
+            HashSet::with_capacity(200_000)
+        };
+
+        self.slot_blockhashes.insert(slot, hash);
+        self.blockhash_signature_map.insert(hash, signatures);
+
+        self.trim_blockhash_history();
+        self.rebuild_previous_hashes();
+
+        if self.slot_hash_timestamp.0 == slot {
+            self.slot_hash_timestamp.1 = hash;
+        }
+
+        if let Some(meta) = self.emitted_slot_meta.get_mut(&slot) {
+            if meta.hash != hash {
+                meta.hash = hash;
+                self.resend_slot(slot);
+            }
+        }
     }
 
     pub fn register_job_id(&mut self, slot: u64, job_id: u64) {
@@ -578,13 +671,10 @@ impl Bank {
         }
 
         let unix_timestamp = std::time::UNIX_EPOCH.elapsed().unwrap().as_secs();
-        self.slot_hash_timestamp = (
-            self.slot_hash_timestamp.0 + 1,
-            self.hash_generator.next(),
-            // todo: hash relates to tx
-            // may 20: do this when adding consensus
-            unix_timestamp,
-        );
+        let next_slot = self.slot_hash_timestamp.0 + 1;
+        let next_hash = self.hash_generator.next();
+        self.stage_blockhash(next_slot, next_hash);
+        self.slot_hash_timestamp = (next_slot, next_hash, unix_timestamp);
 
         self.db.write().unwrap().commit(slot);
 
@@ -600,6 +690,7 @@ impl Bank {
     pub fn tick_as_slave(&mut self, slot_data: &RawSlot) {
         // Advance to the provided slot/hash/timestamp from the sequencer
         self.slot_hash_timestamp = (slot_data.slot, slot_data.hash, slot_data.timestamp);
+        self.finalize_blockhash(slot_data.slot, slot_data.hash);
         // Update blockhash window and Clock/sysvars for the current slot (not the
         // previous)
         self.post_tick(slot_data.slot, slot_data.timestamp, true);
@@ -613,27 +704,6 @@ impl Bank {
     /// Set the status of the bank after tick moved forward, pass in previous
     /// slot and timestamp
     fn post_tick(&mut self, slot: u64, unix_timestamp: u64, update_sysvar: bool) {
-        self.previous_hashes
-            .write()
-            .unwrap()
-            .push_back(self.slot_hash_timestamp.1);
-        self.blockhash_signature_map
-            .insert(self.slot_hash_timestamp.1, HashSet::with_capacity(200_000));
-
-        if self.previous_hashes.read().unwrap().len() > 150 {
-            if let Some(blockhash) = self.previous_hashes.write().unwrap().pop_front() {
-                match self.blockhash_signature_map.remove(&blockhash) {
-                    Some((bh, signatures)) => {
-                        let _ = self.blockhash_pruner_sender.send((bh, signatures));
-                    }
-                    None => {
-                        warn!("blockhash missing in signature map during prune: {:?}", blockhash);
-                    }
-                }
-                self.blockhash_signature_map.shrink_to_fit();
-            }
-        }
-
         let clock = Clock {
             slot,
             epoch: 0,
