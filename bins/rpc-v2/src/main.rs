@@ -152,8 +152,8 @@ struct Args {
     #[arg(long, default_value = "http://127.0.0.1:8899")]
     sequencer_host: String,
 
-    /// Cassandra host addresses (optional, comma-delimited). If omitted, uses in-memory indexer.
-    /// default_value = "127.0.0.1:9042"
+    /// Cassandra host addresses (optional, comma-delimited). If omitted, uses
+    /// in-memory indexer. default_value = "127.0.0.1:9042"
     #[arg(long, value_delimiter = ',')]
     pub cassandra_hosts: Option<Vec<String>>,
 
@@ -318,6 +318,7 @@ async fn do_main() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_pyroscope("rpc-v2");
 
     let args = Args::parse();
+
     // Start Prometheus metrics exporter
     let builder = PrometheusBuilder::new().with_http_listener(args.metric_addr);
     builder.install().expect("Failed to install recorder/exporter");

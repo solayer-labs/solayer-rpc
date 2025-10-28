@@ -685,10 +685,10 @@ impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB>
     }
 
     pub async fn flush_account_ops_cache_async(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if self.account_ops_create_cache.is_empty()
-            && self.account_ops_delete_cache.is_empty()
-            && self.account_ops_mint_create_cache.is_empty()
-            && self.account_ops_mint_delete_cache.is_empty()
+        if self.account_ops_create_cache.is_empty() &&
+            self.account_ops_delete_cache.is_empty() &&
+            self.account_ops_mint_create_cache.is_empty() &&
+            self.account_ops_mint_delete_cache.is_empty()
         {
             debug!("account_ops_cache is empty, nothing to flush");
             return Ok(());
@@ -893,8 +893,8 @@ impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB>
             }
         }
 
-        if self.account_ops_create_cache.len() >= self.max_cache_size
-            || self.account_ops_delete_cache.len() >= self.max_cache_size
+        if self.account_ops_create_cache.len() >= self.max_cache_size ||
+            self.account_ops_delete_cache.len() >= self.max_cache_size
         {
             if let Err(e) = self.flush_account_ops_cache_async().await {
                 error!("Error flushing account ops cache: {}", e);

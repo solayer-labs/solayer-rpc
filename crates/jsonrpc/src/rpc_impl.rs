@@ -2496,9 +2496,8 @@ impl RpcServer for RpcServerState {
             return Err(RpcCustomError::TransactionBlockhashNotFound.into());
         }
 
-        if !config.replace_recent_blockhash
-            && bank
-                .get_tx_status(sanitized_tx.signature())
+        if !config.replace_recent_blockhash &&
+            bank.get_tx_status(sanitized_tx.signature())
                 .is_some_and(|status| matches!(status, infinisvm_core::bank::TransactionStatus::Executed(_, _)))
         {
             return Err(RpcCustomError::TransactionAlreadyProcessed.into());
