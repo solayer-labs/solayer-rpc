@@ -25,7 +25,6 @@ solana-compute-budget.workspace = true
 solana-bpf-loader-program.workspace = true
 solana-builtins.workspace = true
 agave-feature-set.workspace = true
-solana-sha256-hasher = { workspace = true, features = ["sha2"] }
 
 
 serde.workspace = true

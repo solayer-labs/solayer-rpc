@@ -2599,7 +2599,6 @@ dependencies = [
  "solana-program-runtime",
  "solana-pubkey",
  "solana-sdk",
- "solana-sha256-hasher",
  "solana-svm",
  "solana-svm-transaction",
  "solana-transaction-status-client-types",

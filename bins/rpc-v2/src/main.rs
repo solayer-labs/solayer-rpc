@@ -318,7 +318,6 @@ async fn do_main() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_pyroscope("rpc-v2");
 
     let args = Args::parse();
-
     // Start Prometheus metrics exporter
     let builder = PrometheusBuilder::new().with_http_listener(args.metric_addr);
     builder.install().expect("Failed to install recorder/exporter");

@@ -8,8 +8,6 @@ pub struct SerializableBatch {
     pub job_id: usize,
     pub transactions: Vec<SerializableTxRow>,
     pub worker_id: usize,
-    #[serde(default)]
-    pub is_final: bool,
 }
 
 impl SerializableBatch {
@@ -21,7 +19,6 @@ impl SerializableBatch {
                 job_id: 0,
                 transactions: Vec::new(),
                 worker_id: 0,
-                is_final: false,
             };
         }
 
@@ -42,7 +39,6 @@ impl SerializableBatch {
             job_id: first_job.job_id,
             transactions,
             worker_id: first_job.worker_id,
-            is_final: false,
         }
     }
 }

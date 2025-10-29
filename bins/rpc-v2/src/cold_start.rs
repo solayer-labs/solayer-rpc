@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashSet, VecDeque},
+    collections::{HashSet, VecDeque},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, RwLock,
@@ -25,7 +25,6 @@ use infinisvm_logger::{debug, error, info, trace, warn};
 use infinisvm_sync::{
     grpc::{batch_subscriber::process_commit_notification, client::SyncClient},
     http_client::{parse_data, reduce_data, Downloader, HttpClient},
-    types::SerializableBatch,
 };
 use infinisvm_types::sync::grpc::{CommitBatchNotification, SlotDataResponse};
 use metrics::{counter, gauge, histogram};
@@ -170,7 +169,8 @@ pub async fn cold_start(
     let inflight_refetch: Arc<DashSet<(u64, u64)>> = Arc::new(DashSet::new());
     let seen_shreds: Arc<DashSet<(u64, u64)>> = Arc::new(DashSet::new());
     let job_slot_overrides: Arc<DashMap<u64, u64>> = Arc::new(DashMap::new());
-    let staged_batches: Arc<DashMap<u64, BTreeMap<u64, SerializableBatch>>> = Arc::new(DashMap::new());
+
+    let blockhash_to_signatures = Arc::new(RwLock::new(HashMap::new()));
     for (i, mut tx_receiver) in tx_receivers.into_iter().enumerate() {
         let db_chain_ref_clone = db_chain_ref.clone();
         let indexer_clone = indexer.clone();
@@ -182,7 +182,7 @@ pub async fn cold_start(
         let inflight_refetch_clone = inflight_refetch.clone();
         let seen_shreds_clone = seen_shreds.clone();
         let job_slot_overrides_clone = job_slot_overrides.clone();
-        let staged_batches_clone = staged_batches.clone();
+        let blockhash_to_signatures_clone = blockhash_to_signatures.clone();
         let handle = tokio::spawn({
             let indexer = indexer_clone;
             async move {
@@ -199,33 +199,13 @@ pub async fn cold_start(
                     let info_job_id = tx_batch.job_id;
                     let info_batch_size = tx_batch.batch_size;
 
-                    let mut parsed = match process_commit_notification(tx_batch.as_ref()) {
+                    let parsed = match process_commit_notification(tx_batch.as_ref()) {
                         Ok(parsed) => parsed,
                         Err(e) => {
                             error!("Processor {}: Error parsing tx_batch: {}", i, e);
                             continue;
                         }
                     };
-                    if parsed.is_final {
-                        info!("Processor {}: Received finalization marker for slot {}", i, parsed.slot);
-                        if let Err(e) = finalize_staged_slot(
-                            parsed.slot,
-                            parsed.timestamp,
-                            &staged_batches_clone,
-                            &db_chain_ref_clone,
-                            &bank_clone,
-                            &subscription_processor_clone,
-                            &indexer,
-                            &num_transactions_clone,
-                            &seen_shreds_clone,
-                            i,
-                        )
-                        .await
-                        {
-                            error!("Processor {}: Failed to finalize slot {}: {}", i, parsed.slot, e);
-                        }
-                        continue;
-                    }
                     let job_id_u64 = parsed.job_id as u64;
                     let mut target_slot = parsed.slot;
                     if let Some(override_slot) = job_slot_overrides_clone.get(&job_id_u64) {
@@ -252,8 +232,6 @@ pub async fn cold_start(
                             target_slot = existing_slot;
                         }
                     }
-
-                    parsed.slot = target_slot;
 
                     // Empty payloads carry (slot, job_id). Mark presence and add empty shard if
                     // new; cancel refetch.
@@ -286,15 +264,34 @@ pub async fn cold_start(
                             seen_shreds_clone.remove(&(parsed.slot, job_id_u64));
                         }
                         seen_shreds_clone.remove(&(target_slot, job_id_u64));
+                        if seen_shreds_clone.insert((target_slot, job_id_u64)) {
+                            let meta = DBMeta::from_shred(target_slot, job_id_u64);
+                            let mut chain = db_chain_ref_clone.write().unwrap();
+                            let before = chain.len();
+                            let t_add = Instant::now();
+                            debug!(
+                                "Processor {}: adding empty shred from stream {:?}; chain size {} -> {}?",
+                                i,
+                                meta,
+                                before,
+                                before + 1
+                            );
+                            chain.add_db(Arc::new(RwLock::new(MemoryDB::new_no_underlying())), meta);
+                            histogram!("db_chain_add_shred_ms", "source" => "tx_stream_empty")
+                                .record(t_add.elapsed().as_secs_f64() * 1000.0);
+                            counter!("db_chain_shreds_added_total", "source" => "tx_stream_empty").increment(1);
+                            debug!("Processor {}: post-add summary: {}", i, chain.summary());
+                        } else {
+                            info!(
+                                "Processor {}: empty shard already applied for slot={} job_id={}, skipping",
+                                i, target_slot, job_id_u64
+                            );
+                        }
                         job_slot_overrides_clone.remove(&job_id_u64);
                         {
                             let mut sp = slot_plan_clone.write().unwrap();
                             reconcile_slot_plan_entry(&mut sp, job_id_u64, target_slot, "processor_empty");
                         }
-                        staged_batches_clone
-                            .entry(target_slot)
-                            .or_insert_with(BTreeMap::new)
-                            .insert(job_id_u64, parsed);
                         continue;
                     }
                     // Non-empty: record presence in local plan immediately
@@ -319,6 +316,77 @@ pub async fn cold_start(
                         seen_shreds_clone.remove(&(parsed.slot, job_id_u64));
                     }
                     seen_shreds_clone.remove(&(target_slot, job_id_u64));
+                    let mut shred_db = MemoryDB::new_no_underlying();
+                    histogram!("tx_batch_transactions_count").record(parsed.transactions.len() as f64);
+
+                    num_transactions_clone.fetch_add(parsed.transactions.len() as u64, Ordering::SeqCst);
+
+                    let t_build = Instant::now();
+                    let mut signatures = HashMap::new();
+                    for tx in parsed.transactions.iter() {
+                        let result = tx.get_result().unwrap();
+
+                        let status = match result.status {
+                            Ok(()) => TransactionStatus::Executed(None, target_slot),
+                            Err(e) => TransactionStatus::Executed(Some(e), target_slot),
+                        };
+
+                        let blockhash = if let Ok(transaction) = tx.get_transaction() {
+                            transaction.message.recent_blockhash().clone()
+                        } else {
+                            error!("Processor {}: Error getting transaction, bincode error", i);
+                            continue;
+                        };
+                        let signature = tx.get_signature();
+                        trace!("Processor {}: Processing transaction {}", i, signature);
+                        signatures.entry(blockhash).or_insert_with(Vec::new).push(signature);
+                        subscription_processor_clone.notify_signature_update(&signature, &status);
+                        bank_clone.write().unwrap().write_status_cache(&signature, status);
+                        let pre_accounts = tx.get_pre_accounts().unwrap();
+
+                        for ((pubkey, account), diffs) in pre_accounts.into_iter().zip(result.diffs.into_iter()) {
+                            let mut account = account.unwrap_or_default();
+                            for diff in diffs {
+                                diff.apply_to_account(&mut account);
+                            }
+                            shred_db.write_account(pubkey, account);
+                        }
+                    }
+                    histogram!("tx_batch_build_shard_ms").record(t_build.elapsed().as_secs_f64() * 1000.0);
+
+                    {
+                        let mut g = blockhash_to_signatures_clone.write().unwrap();
+                        for (bh, sigs) in signatures.into_iter() {
+                            g.entry(bh).or_insert_with(Vec::new).extend(sigs);
+                        }
+                    }
+
+                    let meta = DBMeta::from_shred(target_slot, job_id_u64);
+                    if seen_shreds_clone.insert((target_slot, job_id_u64)) {
+                        {
+                            let mut chain = db_chain_ref_clone.write().unwrap();
+                            let before = chain.len();
+                            let t_add = Instant::now();
+                            info!(
+                                "Processor {}: adding shred {:?}; chain size {} -> {}?",
+                                i,
+                                meta,
+                                before,
+                                before + 1
+                            );
+                            chain.add_db(Arc::new(RwLock::new(shred_db)), meta);
+                            histogram!("db_chain_add_shred_ms", "source" => "tx_batch")
+                                .record(t_add.elapsed().as_secs_f64() * 1000.0);
+                            counter!("db_chain_shreds_added_total", "source" => "tx_batch").increment(1);
+                            debug!("Processor {}: post-add summary: {}", i, chain.summary());
+                        }
+                    } else {
+                        info!(
+                            "Processor {}: shard already applied for slot={} job_id={}, skipping add",
+                            i, target_slot, job_id_u64
+                        );
+                    }
+
                     job_slot_overrides_clone.remove(&job_id_u64);
 
                     {
@@ -326,11 +394,21 @@ pub async fn cold_start(
                         reconcile_slot_plan_entry(&mut sp, job_id_u64, target_slot, "processor");
                     }
 
-                    staged_batches_clone
-                        .entry(target_slot)
-                        .or_insert_with(BTreeMap::new)
-                        .insert(job_id_u64, parsed);
-                    continue;
+                    // Process transactions in chunks to reduce mutex thrash
+                    const INDEXER_CHUNK: usize = 512;
+                    let t_index = Instant::now();
+                    for chunk in parsed.transactions.chunks(INDEXER_CHUNK) {
+                        let mut guard = indexer.lock().await;
+                        for tx in chunk.iter() {
+                            let _ = guard.index_serializable_tx(tx.clone()).await;
+                        }
+                        drop(guard);
+                    }
+                    histogram!("tx_batch_index_ms").record(t_index.elapsed().as_secs_f64() * 1000.0);
+
+                    // Status cache was already written per-transaction above
+                    // with the correct success or error
+                    // status. Do not overwrite here.
                 }
                 info!("Transaction batch processor {} terminated (channel closed)", i);
                 Ok(()) as Result<(), eyre::Report>
@@ -360,6 +438,7 @@ pub async fn cold_start(
         let num_slots_counter = num_slots.clone();
         let current_slot_tracker = current_slot.clone();
         let job_slot_overrides_clone = job_slot_overrides.clone();
+        let blockhash_to_signatures_clone = blockhash_to_signatures.clone();
         let handle = tokio::spawn(async move {
             info!("Slot processor {} started", i);
             while let Some(slot) = slot_receiver.recv().await {
@@ -387,13 +466,20 @@ pub async fn cold_start(
                     job_ids.len()
                 );
                 histogram!("slot_job_ids_count").record(job_ids.len() as f64);
-                bank_clone.write().unwrap().tick_as_slave(&RawSlot {
-                    slot,
-                    hash: Hash::new(blockhash.as_ref()),
-                    parent_hash: Hash::new(parent_blockhash.as_ref()),
-                    timestamp,
-                    job_ids: vec![], // we don't need job_ids for posting tick
-                });
+
+                let blockhash_to_signatures = std::mem::take(&mut *blockhash_to_signatures_clone.write().unwrap());
+
+                {
+                    let mut bank_writer = bank_clone.write().unwrap();
+                    bank_writer.tick_as_slave(&RawSlot {
+                        slot,
+                        hash: Hash::new(blockhash.as_ref()),
+                        parent_hash: Hash::new(parent_blockhash.as_ref()),
+                        timestamp,
+                        job_ids: vec![], // we don't need job_ids for posting tick
+                    });
+                    bank_writer.commit_blockhash_to_signatures(blockhash_to_signatures);
+                }
                 let remote_ids: Vec<u64> = {
                     // Deduplicate remote job_ids to avoid over-counting in DBChain merge
                     let mut ids = job_ids;
@@ -824,150 +910,6 @@ fn log_slot_plan_mismatch(slot: u64, local_vec: &[u64], remote_vec: &[u64]) {
         remote_vec,
         local_vec
     );
-}
-
-async fn finalize_staged_slot(
-    slot: u64,
-    slot_timestamp: u64,
-    staged_batches: &DashMap<u64, BTreeMap<u64, SerializableBatch>>,
-    db_chain: &Arc<RwLock<DBChain<MemoryDB<NoopDB>>>>,
-    bank: &Arc<RwLock<Bank>>,
-    subscription_processor: &Arc<SubscriptionProcessor>,
-    indexer: &Arc<Mutex<dyn Indexer>>,
-    num_transactions: &Arc<AtomicU64>,
-    seen_shreds: &Arc<DashSet<(u64, u64)>>,
-    processor_id: usize,
-) -> eyre::Result<()> {
-    let staged_entry = staged_batches.remove(&slot);
-    let batches = match staged_entry {
-        Some((_, batches)) => batches,
-        None => {
-            warn!(
-                "Processor {}: Finalization received for slot {} with no staged batches",
-                processor_id, slot
-            );
-            return Ok(());
-        }
-    };
-
-    let batch_count = batches.len();
-    if batch_count == 0 {
-        info!(
-            "Processor {}: Finalization for slot {} (timestamp={}) with no queued batches",
-            processor_id, slot, slot_timestamp
-        );
-        return Ok(());
-    }
-
-    info!(
-        "Processor {}: Finalizing slot {} (timestamp={}) with {} buffered batches",
-        processor_id, slot, slot_timestamp, batch_count
-    );
-
-    const INDEXER_CHUNK: usize = 512;
-
-    for (job_id, batch) in batches.into_iter() {
-        seen_shreds.remove(&(batch.slot, job_id));
-
-        if batch.transactions.is_empty() {
-            if seen_shreds.insert((batch.slot, job_id)) {
-                let meta = DBMeta::from_shred(batch.slot, job_id);
-                let mut chain = db_chain.write().unwrap();
-                let before = chain.len();
-                let t_add = Instant::now();
-                debug!(
-                    "Processor {}: applying empty shard {:?}; chain size {} -> {}?",
-                    processor_id,
-                    meta,
-                    before,
-                    before + 1
-                );
-                chain.add_db(Arc::new(RwLock::new(MemoryDB::new_no_underlying())), meta);
-                histogram!("db_chain_add_shred_ms", "source" => "tx_stream_empty")
-                    .record(t_add.elapsed().as_secs_f64() * 1000.0);
-                counter!("db_chain_shreds_added_total", "source" => "tx_stream_empty").increment(1);
-                debug!("Processor {}: post-add summary: {}", processor_id, chain.summary());
-            } else {
-                info!(
-                    "Processor {}: empty shard already applied for slot={} job_id={}, skipping",
-                    processor_id, batch.slot, job_id
-                );
-            }
-            continue;
-        }
-
-        histogram!("tx_batch_transactions_count").record(batch.transactions.len() as f64);
-        num_transactions.fetch_add(batch.transactions.len() as u64, Ordering::SeqCst);
-
-        let mut shred_db = MemoryDB::new_no_underlying();
-        let t_build = Instant::now();
-        for tx in batch.transactions.iter() {
-            let result = tx.get_result().expect("serialized batch result");
-
-            let status = match result.status {
-                Ok(()) => TransactionStatus::Executed(None, batch.slot),
-                Err(e) => TransactionStatus::Executed(Some(e), batch.slot),
-            };
-            trace!(
-                "Processor {}: Processing finalized transaction {}",
-                processor_id,
-                tx.get_signature()
-            );
-            subscription_processor.notify_signature_update(&tx.get_signature(), &status);
-            bank.write().unwrap().write_status_cache(&tx.get_signature(), status);
-
-            let pre_accounts = tx.get_pre_accounts().expect("serialized batch pre-accounts");
-
-            for ((pubkey, account), diffs) in pre_accounts.into_iter().zip(result.diffs.into_iter()) {
-                let mut account = account.unwrap_or_default();
-                for diff in diffs {
-                    diff.apply_to_account(&mut account);
-                }
-                shred_db.write_account(pubkey, account);
-            }
-        }
-        histogram!("tx_batch_build_shard_ms").record(t_build.elapsed().as_secs_f64() * 1000.0);
-
-        let meta = DBMeta::from_shred(batch.slot, job_id);
-        if seen_shreds.insert((batch.slot, job_id)) {
-            let mut chain = db_chain.write().unwrap();
-            let before = chain.len();
-            let t_add = Instant::now();
-            info!(
-                "Processor {}: adding shard {:?}; chain size {} -> {}?",
-                processor_id,
-                meta,
-                before,
-                before + 1
-            );
-            chain.add_db(Arc::new(RwLock::new(shred_db)), meta);
-            histogram!("db_chain_add_shred_ms", "source" => "tx_batch").record(t_add.elapsed().as_secs_f64() * 1000.0);
-            counter!("db_chain_shreds_added_total", "source" => "tx_batch").increment(1);
-            debug!("Processor {}: post-add summary: {}", processor_id, chain.summary());
-        } else {
-            info!(
-                "Processor {}: shard already applied for slot={} job_id={}, skipping add",
-                processor_id, batch.slot, job_id
-            );
-        }
-
-        let t_index = Instant::now();
-        for chunk in batch.transactions.chunks(INDEXER_CHUNK) {
-            let mut guard = indexer.lock().await;
-            for tx in chunk.iter() {
-                let _ = guard.index_serializable_tx(tx.clone()).await;
-            }
-            drop(guard);
-        }
-        histogram!("tx_batch_index_ms").record(t_index.elapsed().as_secs_f64() * 1000.0);
-    }
-
-    info!(
-        "Processor {}: Completed finalization for slot {} (timestamp={})",
-        processor_id, slot, slot_timestamp
-    );
-
-    Ok(())
 }
 
 fn reconcile_slot_plan_entry(slot_plan: &mut HashMap<u64, Vec<u64>>, job_id: u64, target_slot: u64, reason: &str) {

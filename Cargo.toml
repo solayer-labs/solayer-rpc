@@ -51,7 +51,6 @@ solana-transaction-context = { git = "ssh://git@github.com/solayer-labs/agave.gi
 solana-streamer = { git = "ssh://git@github.com/solayer-labs/agave.git", rev = "6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a" }
 solana-perf = { git = "ssh://git@github.com/solayer-labs/agave.git", rev = "6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a" }
 solana-fee = { git = "ssh://git@github.com/solayer-labs/agave.git", rev = "6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a" }
-solana-sha256-hasher = { version = "=2.2.1" }
 
 axum = "0.8.3"
 

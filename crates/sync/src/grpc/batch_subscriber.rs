@@ -27,17 +27,6 @@ pub fn process_commit_notification(
         notification.slot, notification.batch_size, notification.compression_ratio
     );
 
-    if notification.is_final {
-        return Ok(SerializableBatch {
-            slot: notification.slot,
-            timestamp: notification.timestamp,
-            job_id: notification.job_id as usize,
-            transactions: Vec::new(),
-            worker_id: notification.worker_id,
-            is_final: true,
-        });
-    }
-
     // Handle empty batches gracefully to avoid zstd "incomplete frame" errors
     if notification.batch_size == 0 || notification.compressed_transactions.is_empty() {
         // Preserve real metadata so receivers can mark presence for (slot, job_id)
@@ -47,7 +36,6 @@ pub fn process_commit_notification(
             job_id: notification.job_id as usize,
             transactions: Vec::new(),
             worker_id: notification.worker_id,
-            is_final: false,
         });
     }
 
@@ -55,8 +43,7 @@ pub fn process_commit_notification(
     let decompressed = zstd::decode_all(&notification.compressed_transactions[..])?;
 
     // Deserialize the batch
-    let mut batch: SerializableBatch = bincode::deserialize(&decompressed)?;
-    batch.is_final = notification.is_final;
+    let batch: SerializableBatch = bincode::deserialize(&decompressed)?;
 
     Ok(batch)
 }
