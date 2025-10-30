@@ -1,4 +1,4 @@
-use std::{borrow::Cow, collections::HashMap, io::Write, str::FromStr, sync::atomic::Ordering};
+use std::{borrow::Cow, collections::{BTreeMap, HashMap}, io::Write, str::FromStr, sync::atomic::Ordering};
 
 use base64::{engine::general_purpose::STANDARD as b64, Engine};
 use infinisvm_core::bank::{get_feature_set, TransactionStatus};
@@ -45,6 +45,8 @@ use thiserror::Error;
 use tracing::error;
 
 use crate::rpc_state::{RpcBank, RpcServerState};
+
+pub const MAX_TOKEN_ACCOUNTS_QUERY_LIMIT: usize = 1 << 32;
 
 pub fn deserialize_checked(input: &[u8]) -> Option<VersionedTransaction> {
     match limited_deserialize::<VersionedTransaction>(input) {
@@ -483,6 +485,14 @@ pub struct RpcSignatureStatusConfig {
 pub enum RpcTokenAccountsFilter {
     Mint(String),
     ProgramId(String),
+}
+
+
+#[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct DelegateSearch {
+    pub mint: String,
+    pub program_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
@@ -1195,6 +1205,16 @@ pub struct RpcKeyedAccount {
     pub account: UiAccount,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcTokenAccountValueOnly {
+    pub address: String,
+    pub amount: String,
+    pub decimals: u8,
+    pub ui_amount: Option<f64>,
+    pub ui_amount_string: String,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct RpcVote {
@@ -1324,6 +1344,21 @@ pub trait Rpc {
         pubkey_str: String,
         config: Option<serde_json::Value>,
     ) -> RpcResult<RpcResponse<UiTokenAmount>>;
+
+    #[method(name = "getTokenAccountsByDelegate")]
+    async fn get_token_accounts_by_delegate(
+        &self,
+        pubkey: String,
+        needle: DelegateSearch,
+        config: Option<RpcAccountInfoConfig>,
+    ) -> RpcResult<RpcResponse<Vec<RpcKeyedAccount>>>;
+
+    #[method(name = "getTokenLargestAccounts")]
+    async fn get_token_largest_accounts(
+        &self,
+        mint: String,
+        config: Option<RpcAccountInfoConfig>,
+    ) -> RpcResult<RpcResponse<Vec<RpcTokenAccountValueOnly>>>;
 
     #[method(name = "getTokenSupply")]
     fn get_token_supply(
@@ -2239,8 +2274,6 @@ impl RpcServer for RpcServerState {
                 invalid_params_error(format!("Failed to find mint account in accounts_db {mint_account_key}"))
             })?;
 
-        // spl_token and spl_token_22 seem to struggle with deserializing the mint
-        // account so we just grab the info we need
         let mint_decimals = get_mint_decimals(mint_account.data())
             .map_err(|_| invalid_params_error("Token mint could not be unpacked"))?;
 
@@ -2250,6 +2283,124 @@ impl RpcServer for RpcServerState {
         };
 
         Ok(rpc_response)
+    }
+
+
+    async fn get_token_accounts_by_delegate(
+        &self,
+        pubkey: String,
+        needle: DelegateSearch,
+        config: Option<RpcAccountInfoConfig>,
+    ) -> RpcResult<RpcResponse<Vec<RpcKeyedAccount>>> {
+        counter!("rpc", "method" => "getTokenAccountsByDelegate").increment(1);
+        let pubkey = verify_pubkey(&pubkey)?;
+        let mint_pubkey = verify_pubkey(&needle.mint)?;
+        let program_id_pubkey = needle.program_id.map(|program_id| verify_pubkey(&program_id)).transpose()?;
+        let token_accounts = self.indexer
+            .find_token_accounts_by_mint(program_id_pubkey, mint_pubkey, MAX_TOKEN_ACCOUNTS_QUERY_LIMIT, 0)
+            .await;
+        let filter = |token_account: &StateWithExtensions<spl_token_2022::state::Account>| -> bool {
+            token_account.base.delegate.is_some() && token_account.base.delegate.unwrap() == pubkey
+        };
+        let db_reader = self.db.read().map_err(|e| {
+            error!("get_token_accounts_by_delegate error: {:?}", e);
+            ErrorCode::InternalError
+        })?;
+        let mut filtered_accounts = Vec::new();
+        for pubkey in token_accounts {
+            let token_account = db_reader.get_account(pubkey).unwrap().unwrap_or_default();
+            let token_account_data = StateWithExtensions::<spl_token_2022::state::Account>::unpack(token_account.data())
+                .map_err(|e| {
+                    error!("Failed to unpack token account data: {:?}", e);
+                    ErrorCode::InternalError
+                })?;
+            if filter(&token_account_data) {
+                let (encoded_sliced_data, encoding) = get_account_data_encoding_and_slice(&config, &token_account)?;
+                filtered_accounts.push(RpcKeyedAccount {
+                    pubkey: pubkey.to_string(),
+                    account: UiAccount {
+                        lamports: token_account.lamports(),
+                        data: UiAccountData::Binary(encoded_sliced_data, encoding),
+                        owner: token_account.owner().to_string(),
+                        executable: token_account.executable(),
+                        rent_epoch: token_account.rent_epoch(),
+                        space: Some(token_account.data().len() as u64),
+                    },
+                });
+            }
+        }
+        drop(db_reader);
+
+        let slot = self.get_current_slot()?;
+
+        Ok(RpcResponse::<Vec<RpcKeyedAccount>> {
+            context: RpcResponseContext { slot },
+            value: filtered_accounts,
+        })
+    }
+
+    async fn get_token_largest_accounts(
+        &self,
+        mint: String,
+        _config: Option<RpcAccountInfoConfig>,
+    ) -> RpcResult<RpcResponse<Vec<RpcTokenAccountValueOnly>>> {
+        counter!("rpc", "method" => "getTokenLargestAccounts").increment(1);
+        let mint_pubkey = verify_pubkey(&mint)?;
+        let slot = self.get_current_slot()?;
+        let token_accounts = self.indexer
+            .find_token_accounts_by_mint(None, mint_pubkey, MAX_TOKEN_ACCOUNTS_QUERY_LIMIT, 0)
+            .await;
+        let db_reader = self.db.read().map_err(|e| {
+            error!("get_token_largest_accounts error: {:?}", e);
+            ErrorCode::InternalError
+        })?;
+
+        let mint_account = db_reader
+            .get_account(mint_pubkey)
+            .expect("Failed to find mint account in accounts_db")
+            .ok_or_else(|| invalid_params_error(format!("Failed to find mint account in accounts_db {mint_pubkey}")))?;
+
+        let mint_account = StateWithExtensions::<Mint>::unpack(mint_account.data()).map_err(|e| {
+            error!("Failed to unpack mint account data: {:?}", e);
+            ErrorCode::InternalError
+        })?;
+        let mut token_accounts_with_amounts = Vec::new();
+
+        for pubkey in token_accounts {
+            let token_account = db_reader.get_account(pubkey).unwrap().unwrap_or_default();
+
+            let token_account_data = StateWithExtensions::<spl_token_2022::state::Account>::unpack(token_account.data())
+                .map_err(|e| {
+                    error!("Failed to unpack token account data: {:?}", e);
+                    ErrorCode::InternalError
+                })?;
+
+            token_accounts_with_amounts.push((token_account_data.base.amount, pubkey));
+        }
+
+        drop(db_reader);
+
+        // sort descending by amount
+        token_accounts_with_amounts.sort_by_key(|(amount, _)| std::cmp::Reverse(*amount));
+
+        // take top 20
+        let top_20: Vec<_> = token_accounts_with_amounts.into_iter().take(20).collect();
+
+        let mut parsed_token_accounts = vec![];
+        for (amount, pubkey) in top_20 {
+            let amount = token_amount_to_ui_amount(amount, mint_account.base.decimals);
+            parsed_token_accounts.push(RpcTokenAccountValueOnly {
+                address: pubkey.to_string(),
+                amount: amount.amount,
+                decimals: mint_account.base.decimals,
+                ui_amount: amount.ui_amount,
+                ui_amount_string: amount.ui_amount_string,
+            });
+        }
+        Ok(RpcResponse::<Vec<RpcTokenAccountValueOnly>> {
+            context: RpcResponseContext { slot },
+            value: parsed_token_accounts,
+        })
     }
 
     fn get_token_supply(
@@ -2316,7 +2467,7 @@ impl RpcServer for RpcServerState {
         let mut parsed_token_accounts = vec![];
 
         for pubkey in token_accounts {
-            let account = db_reader.get_account(pubkey).unwrap().unwrap_or_default();
+            let account = db_reader.get_account(pubkey).expect("Failed to get account").unwrap_or_default();
             let (encoded_sliced_data, encoding) = get_account_data_encoding_and_slice(&config, &account)?;
             parsed_token_accounts.push(RpcKeyedAccount {
                 pubkey: pubkey.to_string(),
@@ -2496,8 +2647,9 @@ impl RpcServer for RpcServerState {
             return Err(RpcCustomError::TransactionBlockhashNotFound.into());
         }
 
-        if !config.replace_recent_blockhash &&
-            bank.get_tx_status(sanitized_tx.signature())
+        if !config.replace_recent_blockhash
+            && bank
+                .get_tx_status(sanitized_tx.signature())
                 .is_some_and(|status| matches!(status, infinisvm_core::bank::TransactionStatus::Executed(_, _)))
         {
             return Err(RpcCustomError::TransactionAlreadyProcessed.into());

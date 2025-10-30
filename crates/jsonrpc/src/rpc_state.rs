@@ -160,6 +160,13 @@ pub trait RpcIndexer: Indexer + Send + Sync {
         limit: usize,
         offset: usize,
     ) -> Vec<Pubkey>;
+    async fn find_token_accounts_by_mint(
+        &self,
+        program_id: Option<Pubkey>,
+        mint: Pubkey,
+        limit: usize,
+        offset: usize,
+    ) -> Vec<Pubkey>;
     async fn get_block_with_transactions(
         &self,
         slot: u64,

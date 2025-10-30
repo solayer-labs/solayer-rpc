@@ -1623,35 +1623,36 @@ impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB>
 
     pub async fn get_token_account_owned_by_account_async(
         &self,
-        account: &Pubkey,
+        account: Option<Pubkey>,
         program_id: Option<Pubkey>,
         mint: Option<Pubkey>,
         limit: usize,
         offset: usize,
     ) -> Vec<Pubkey> {
         let _timer = ScopedTimer::new(&self.metrics.histogram_get_token_accounts_owned_by_account);
-        let account_hex = ACCOUNT::to_array_string(&account.to_bytes());
 
         let mut query = format!(
-            "SELECT account FROM {} WHERE owner = {}",
+            "SELECT account FROM {} WHERE 1=1",
             if ACCOUNT::require_distributed() {
                 format!("{ACCOUNT_MINT_TABLE_NAME}_dist")
             } else {
                 ACCOUNT_MINT_TABLE_NAME.to_string()
-            },
-            account_hex
+            }
         );
+
+        if let Some(account) = account {
+            query = format!("{query} AND account = {}", ACCOUNT::to_array_string(&account.to_bytes()));
+        }
 
         if let Some(program_id) = program_id {
             query = format!(
-                "{} AND account_type = {}",
-                query,
+                "{query} AND account_type = {}",
                 if program_id == spl_token::id() { 1 } else { 2 }
             );
         }
 
         if let Some(mint) = mint {
-            query = format!("{} AND mint = {}", query, ACCOUNT::to_array_string(&mint.to_bytes()));
+            query = format!("{query} AND mint = {}", ACCOUNT::to_array_string(&mint.to_bytes()));
         }
 
         query = format!("{query} LIMIT {limit} OFFSET {offset}");
@@ -1799,8 +1800,18 @@ impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB> R
         limit: usize,
         offset: usize,
     ) -> Vec<Pubkey> {
-        self.get_token_account_owned_by_account_async(owner, program_id, mint, limit, offset)
+        self.get_token_account_owned_by_account_async(Some(*owner), program_id, mint, limit, offset)
             .await
+    }
+
+    async fn find_token_accounts_by_mint(
+        &self,
+        program_id: Option<Pubkey>,
+        mint: Pubkey,
+        limit: usize,
+        offset: usize,
+    ) -> Vec<Pubkey> {
+        self.get_token_account_owned_by_account_async(None, program_id, Some(mint), limit, offset).await
     }
 
     async fn get_block_with_transactions(
@@ -2236,6 +2247,17 @@ impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB> R
         self.clients[0].find_accounts_owned_by(pubkey, limit, offset).await
     }
 
+    async fn find_token_accounts_by_mint(
+        &self,
+        program_id: Option<Pubkey>,
+        mint: Pubkey,
+        limit: usize,
+        offset: usize,
+    ) -> Vec<Pubkey> {
+        // Use round-robin client selection for read operations
+        self.clients[0].find_token_accounts_by_mint(program_id, mint, limit, offset).await
+    }
+
     async fn find_token_accounts_owned_by(
         &self,
         owner: &Pubkey,
@@ -2301,6 +2323,17 @@ impl RpcIndexer for NoopIndexer {
         _offset: usize,
     ) -> Vec<Pubkey> {
         error!("NoopIndexer: find_token_accounts_owned_by");
+        vec![]
+    }
+
+    async fn find_token_accounts_by_mint(
+        &self,
+        _program_id: Option<Pubkey>,
+        _mint: Pubkey,
+        _limit: usize,
+        _offset: usize,
+    ) -> Vec<Pubkey> {
+        error!("NoopIndexer: find_token_accounts_by_mint");
         vec![]
     }
 

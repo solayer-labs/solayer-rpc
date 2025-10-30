@@ -133,6 +133,17 @@ impl RpcIndexer for InMemoryIndexer {
         vec![]
     }
 
+
+    async fn find_token_accounts_by_mint(
+        &self,
+        _program_id: Option<Pubkey>,
+        _mint: Pubkey,
+        _limit: usize,
+        _offset: usize,
+    ) -> Vec<Pubkey> {
+        vec![]
+    }
+    
     async fn get_block_with_transactions(
         &self,
         slot: u64,
