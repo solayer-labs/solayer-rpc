@@ -40,7 +40,6 @@ bs58 = { workspace = true }
 pyroscope = { workspace = true, optional = true }
 pyroscope_pprofrs = { workspace = true, optional = true }
 
-
 tikv-jemallocator = { workspace = true }
 cap = { version = "0.1.2", optional = true }
 axum = { workspace = true, optional = true }
@@ -48,6 +47,7 @@ jemalloc_pprof = { version = "0.7", features = [
     "flamegraph",
     "symbolize",
 ], optional = true }
+url = "2.5.7"
 
 
 

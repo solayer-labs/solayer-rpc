@@ -116,25 +116,25 @@ fn parse_socket_addr(s: &str) -> Result<SocketAddr, String> {
 #[derive(Parser, Debug)]
 #[command()]
 struct Args {
-    /// gRPC server address (e.g., "http://localhost:5005")
-    #[arg(short = 'o', long, default_value = "localhost")]
-    host: String,
+    /// Sequencer server address
+    #[arg(long, short = 's', default_value = "127.0.0.1")]
+    sequencer_host: String,
 
-    /// gRPC server port
-    #[arg(short, long, default_value = "5005")]
-    port: u16,
+    /// Sequencer gRPC server address, overrides sequencer_host
+    #[arg(long, default_value = "")]
+    sequencer_grpc_server_addr: String,
 
     /// Local gRPC listen address for downstream subscribers
     #[arg(long, value_parser = parse_socket_addr, default_value = "0.0.0.0:15005")]
     grpc_listen_addr: SocketAddr,
 
-    /// HTTP sync server (host:port)
-    #[arg(long, default_value = "localhost:6005")]
-    http_addr: String,
+    /// Sequencer HTTP server address, overrides sequencer_host
+    #[arg(long, default_value = "")]
+    sequencer_http_server_addr: String,
 
     /// JSON-RPC listen addr (host:port)
     #[arg(long, default_value = "127.0.0.1:18899")]
-    rpc_addr: String,
+    listen_addr: String,
 
     /// Prometheus metrics listen address
     #[arg(long, default_value = "127.0.0.1:3002")]
@@ -148,10 +148,6 @@ struct Args {
     #[arg(long, default_value = "127.0.0.1:5005", value_parser = parse_socket_addr)]
     tpu_host: SocketAddr,
 
-    /// Sequencer server address
-    #[arg(long, default_value = "http://127.0.0.1:8899")]
-    sequencer_host: String,
-
     /// Cassandra host addresses (optional, comma-delimited). If omitted, uses
     /// in-memory indexer. default_value = "127.0.0.1:9042"
     #[arg(long, value_delimiter = ',')]
@@ -160,6 +156,10 @@ struct Args {
     /// Cassandra instance replication factor (optional, defaults to 1)
     #[arg(long)]
     pub cassandra_replication_factor: Option<u8>,
+
+    /// Sequencer RPC server address, overrides sequencer_host
+    #[arg(long, default_value = "")]
+    sequencer_rpc_server_addr: String,
 
     #[arg(long, default_value = "s3://infinisvm-dev/")]
     pub s3_path: String,
@@ -341,12 +341,12 @@ async fn do_main() -> Result<(), Box<dyn Error + Send + Sync>> {
         }
     });
 
-    info!(
-        "Connecting to gRPC server at: {}:({}-{})",
-        args.host,
-        args.port,
-        args.port + args.num_threads as u16 - 1
-    );
+    let grpc_server_addr = if args.sequencer_grpc_server_addr.is_empty() {
+        format!("http://{}:5005", args.sequencer_host)
+    } else {
+        args.sequencer_grpc_server_addr.clone()
+    };
+
 
     // Parse allowed server pubkeys if provided
     fn parse_pubkey(s: &str) -> Option<[u8; 32]> {
@@ -396,9 +396,24 @@ async fn do_main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     // Create gRPC client
     let mut clients = Vec::new();
+
+    let url = grpc_server_addr
+        .parse::<url::Url>()
+        .unwrap_or_else(|e| panic!("Invalid gRPC server address '{}': {}", grpc_server_addr, e));
+    let grpc_server_host = url.host_str().unwrap_or_default();
+    let grpc_server_port = url.port_or_known_default().unwrap_or_else(|| {
+        panic!(
+            "No port found for gRPC server address '{}'; must specify port (e.g., https://host:port)",
+            grpc_server_addr
+        )
+    });
+
+    info!("Connecting to gRPC server at: {}:{} - {} threads", grpc_server_host, grpc_server_port, args.num_threads);
+
+
     for i in 0..args.num_threads {
         let scheme = if use_tls { "https" } else { "http" };
-        let client_addr = format!("{}://{}:{}", scheme, args.host, args.port + i as u16);
+        let client_addr = format!("{}://{}:{}", scheme, grpc_server_host, grpc_server_port + i as u16);
         info!("Connecting gRPC client {} to {} (tls={})", i, client_addr, use_tls);
         let client = if use_tls {
             SyncClient::connect_with_tls(
@@ -487,7 +502,12 @@ async fn do_main() -> Result<(), Box<dyn Error + Send + Sync>> {
         })
         .collect::<Vec<_>>();
 
-    let http_client = Arc::new(HttpClient::new(format!("http://{}", args.http_addr)));
+    let http_server_addr = if args.sequencer_http_server_addr.is_empty() {
+        format!("http://{}:6005", args.sequencer_host)
+    } else {
+        args.sequencer_http_server_addr.clone()
+    };
+    let http_client = Arc::new(HttpClient::new(http_server_addr));
 
     let snapshots = http_client.get_snapshots().await?;
     info!("Successfully got snapshots: {:?}", snapshots.get_ckpts_to_download());
@@ -505,7 +525,7 @@ async fn do_main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut refetch_clients = Vec::new();
     for i in 0..args.num_threads {
         let scheme = if use_tls { "https" } else { "http" };
-        let client_addr = format!("{}://{}:{}", scheme, args.host, args.port + i as u16);
+        let client_addr = format!("{}://{}:{}", scheme, grpc_server_host, grpc_server_port + i as u16);
         let client = if use_tls {
             SyncClient::connect_with_tls(
                 &client_addr,
@@ -557,6 +577,12 @@ async fn do_main() -> Result<(), Box<dyn Error + Send + Sync>> {
         }
     });
 
+    let sequencer_rpc_addr = if args.sequencer_rpc_server_addr.is_empty() {
+        format!("http://{}:8899", args.sequencer_host)
+    } else {
+        args.sequencer_rpc_server_addr.clone()
+    };
+
     let jsonrpc_state = infinisvm_jsonrpc::rpc_state::RpcServerState::new(
         bank,
         cold_start_result.db_chain,
@@ -564,7 +590,7 @@ async fn do_main() -> Result<(), Box<dyn Error + Send + Sync>> {
         samples,
         total_transaction_count,
         tx_sender,
-        Some(args.sequencer_host.to_string()),
+        Some(sequencer_rpc_addr),
         args.tpu_host,
         subscription_processor,
     );
@@ -592,10 +618,10 @@ async fn do_main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .max_connections(10000)
         .max_subscriptions_per_connection(5000)
         .set_http_middleware(middleware)
-        .build(args.rpc_addr.clone())
+        .build(args.listen_addr.clone())
         .await
         .unwrap();
-    info!("Starting RPC server on {}", args.rpc_addr);
+    info!("Starting RPC server on {}", args.listen_addr);
     let handle = server.start(module);
     info!("Background task count: {}", handles.len());
     // Wait for any handle to exit, then crash
