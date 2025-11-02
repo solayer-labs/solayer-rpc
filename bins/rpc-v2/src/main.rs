@@ -347,7 +347,6 @@ async fn do_main() -> Result<(), Box<dyn Error + Send + Sync>> {
         args.sequencer_grpc_server_addr.clone()
     };
 
-
     // Parse allowed server pubkeys if provided
     fn parse_pubkey(s: &str) -> Option<[u8; 32]> {
         // hex
@@ -408,8 +407,10 @@ async fn do_main() -> Result<(), Box<dyn Error + Send + Sync>> {
         )
     });
 
-    info!("Connecting to gRPC server at: {}:{} - {} threads", grpc_server_host, grpc_server_port, args.num_threads);
-
+    info!(
+        "Connecting to gRPC server at: {}:{} - {} threads",
+        grpc_server_host, grpc_server_port, args.num_threads
+    );
 
     for i in 0..args.num_threads {
         let scheme = if use_tls { "https" } else { "http" };

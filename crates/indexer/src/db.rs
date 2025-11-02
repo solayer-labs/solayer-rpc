@@ -685,10 +685,10 @@ impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB>
     }
 
     pub async fn flush_account_ops_cache_async(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if self.account_ops_create_cache.is_empty() &&
-            self.account_ops_delete_cache.is_empty() &&
-            self.account_ops_mint_create_cache.is_empty() &&
-            self.account_ops_mint_delete_cache.is_empty()
+        if self.account_ops_create_cache.is_empty()
+            && self.account_ops_delete_cache.is_empty()
+            && self.account_ops_mint_create_cache.is_empty()
+            && self.account_ops_mint_delete_cache.is_empty()
         {
             debug!("account_ops_cache is empty, nothing to flush");
             return Ok(());
@@ -893,8 +893,8 @@ impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB>
             }
         }
 
-        if self.account_ops_create_cache.len() >= self.max_cache_size ||
-            self.account_ops_delete_cache.len() >= self.max_cache_size
+        if self.account_ops_create_cache.len() >= self.max_cache_size
+            || self.account_ops_delete_cache.len() >= self.max_cache_size
         {
             if let Err(e) = self.flush_account_ops_cache_async().await {
                 error!("Error flushing account ops cache: {}", e);
@@ -1641,7 +1641,10 @@ impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB>
         );
 
         if let Some(account) = account {
-            query = format!("{query} AND account = {}", ACCOUNT::to_array_string(&account.to_bytes()));
+            query = format!(
+                "{query} AND account = {}",
+                ACCOUNT::to_array_string(&account.to_bytes())
+            );
         }
 
         if let Some(program_id) = program_id {
@@ -1811,7 +1814,8 @@ impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB> R
         limit: usize,
         offset: usize,
     ) -> Vec<Pubkey> {
-        self.get_token_account_owned_by_account_async(None, program_id, Some(mint), limit, offset).await
+        self.get_token_account_owned_by_account_async(None, program_id, Some(mint), limit, offset)
+            .await
     }
 
     async fn get_block_with_transactions(
@@ -2255,7 +2259,9 @@ impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB> R
         offset: usize,
     ) -> Vec<Pubkey> {
         // Use round-robin client selection for read operations
-        self.clients[0].find_token_accounts_by_mint(program_id, mint, limit, offset).await
+        self.clients[0]
+            .find_token_accounts_by_mint(program_id, mint, limit, offset)
+            .await
     }
 
     async fn find_token_accounts_owned_by(

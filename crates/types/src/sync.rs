@@ -55,6 +55,7 @@ pub struct CommitBatchNotification {
     pub compression_ratio: u64,
     pub job_id: u64,
     pub worker_id: usize,
+    pub is_final: bool,
 }
 
 // Simple gRPC service definitions for bincode
@@ -772,6 +773,7 @@ pub mod grpc {
                                                     compression_ratio: legacy.compression_ratio,
                                                     job_id: 0,
                                                     worker_id: legacy.worker_id,
+                                                    is_final: false,
                                                 },
                                             )
                                         });
@@ -914,6 +916,7 @@ pub mod grpc {
                             compression_ratio: legacy.compression_ratio,
                             job_id: 0,
                             worker_id: legacy.worker_id,
+                            is_final: false,
                         }
                     })
                 })

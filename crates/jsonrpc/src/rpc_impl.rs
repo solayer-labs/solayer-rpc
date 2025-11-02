@@ -1,4 +1,10 @@
-use std::{borrow::Cow, collections::{BTreeMap, HashMap}, io::Write, str::FromStr, sync::atomic::Ordering};
+use std::{
+    borrow::Cow,
+    collections::{BTreeMap, HashMap},
+    io::Write,
+    str::FromStr,
+    sync::atomic::Ordering,
+};
 
 use base64::{engine::general_purpose::STANDARD as b64, Engine};
 use infinisvm_core::bank::{get_feature_set, TransactionStatus};
@@ -486,7 +492,6 @@ pub enum RpcTokenAccountsFilter {
     Mint(String),
     ProgramId(String),
 }
-
 
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -2285,7 +2290,6 @@ impl RpcServer for RpcServerState {
         Ok(rpc_response)
     }
 
-
     async fn get_token_accounts_by_delegate(
         &self,
         pubkey: String,
@@ -2295,8 +2299,12 @@ impl RpcServer for RpcServerState {
         counter!("rpc", "method" => "getTokenAccountsByDelegate").increment(1);
         let pubkey = verify_pubkey(&pubkey)?;
         let mint_pubkey = verify_pubkey(&needle.mint)?;
-        let program_id_pubkey = needle.program_id.map(|program_id| verify_pubkey(&program_id)).transpose()?;
-        let token_accounts = self.indexer
+        let program_id_pubkey = needle
+            .program_id
+            .map(|program_id| verify_pubkey(&program_id))
+            .transpose()?;
+        let token_accounts = self
+            .indexer
             .find_token_accounts_by_mint(program_id_pubkey, mint_pubkey, MAX_TOKEN_ACCOUNTS_QUERY_LIMIT, 0)
             .await;
         let filter = |token_account: &StateWithExtensions<spl_token_2022::state::Account>| -> bool {
@@ -2309,8 +2317,8 @@ impl RpcServer for RpcServerState {
         let mut filtered_accounts = Vec::new();
         for pubkey in token_accounts {
             let token_account = db_reader.get_account(pubkey).unwrap().unwrap_or_default();
-            let token_account_data = StateWithExtensions::<spl_token_2022::state::Account>::unpack(token_account.data())
-                .map_err(|e| {
+            let token_account_data =
+                StateWithExtensions::<spl_token_2022::state::Account>::unpack(token_account.data()).map_err(|e| {
                     error!("Failed to unpack token account data: {:?}", e);
                     ErrorCode::InternalError
                 })?;
@@ -2347,7 +2355,8 @@ impl RpcServer for RpcServerState {
         counter!("rpc", "method" => "getTokenLargestAccounts").increment(1);
         let mint_pubkey = verify_pubkey(&mint)?;
         let slot = self.get_current_slot()?;
-        let token_accounts = self.indexer
+        let token_accounts = self
+            .indexer
             .find_token_accounts_by_mint(None, mint_pubkey, MAX_TOKEN_ACCOUNTS_QUERY_LIMIT, 0)
             .await;
         let db_reader = self.db.read().map_err(|e| {
@@ -2369,8 +2378,8 @@ impl RpcServer for RpcServerState {
         for pubkey in token_accounts {
             let token_account = db_reader.get_account(pubkey).unwrap().unwrap_or_default();
 
-            let token_account_data = StateWithExtensions::<spl_token_2022::state::Account>::unpack(token_account.data())
-                .map_err(|e| {
+            let token_account_data =
+                StateWithExtensions::<spl_token_2022::state::Account>::unpack(token_account.data()).map_err(|e| {
                     error!("Failed to unpack token account data: {:?}", e);
                     ErrorCode::InternalError
                 })?;
@@ -2467,7 +2476,10 @@ impl RpcServer for RpcServerState {
         let mut parsed_token_accounts = vec![];
 
         for pubkey in token_accounts {
-            let account = db_reader.get_account(pubkey).expect("Failed to get account").unwrap_or_default();
+            let account = db_reader
+                .get_account(pubkey)
+                .expect("Failed to get account")
+                .unwrap_or_default();
             let (encoded_sliced_data, encoding) = get_account_data_encoding_and_slice(&config, &account)?;
             parsed_token_accounts.push(RpcKeyedAccount {
                 pubkey: pubkey.to_string(),
