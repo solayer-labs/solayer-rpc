@@ -110,8 +110,8 @@ impl Pusher {
 
                         debug!("Connection from {}", connection.remote_address());
 
-                        if !connection.remote_address().ip().to_string().starts_with("10.")
-                            && !connection.remote_address().ip().to_string().starts_with("127.")
+                        if !connection.remote_address().ip().to_string().starts_with("10.") &&
+                            !connection.remote_address().ip().to_string().starts_with("127.")
                         {
                             connection.close(quinn::VarInt::from_u32(0x1337), b"fuxk off");
                             continue;

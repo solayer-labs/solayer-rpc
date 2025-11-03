@@ -171,6 +171,7 @@ pub async fn cold_start(
     let finalized_slots: Arc<DashSet<u64>> = Arc::new(DashSet::new());
     let finalized_timestamps: Arc<DashMap<u64, u64>> = Arc::new(DashMap::new());
     let blockhash_to_signatures = Arc::new(RwLock::new(HashMap::new()));
+    let pending_signature_count = Arc::new(AtomicU64::new(0));
     for (i, mut tx_receiver) in tx_receivers.into_iter().enumerate() {
         let db_chain_ref_clone = db_chain_ref.clone();
         let indexer_clone = indexer.clone();
@@ -188,6 +189,7 @@ pub async fn cold_start(
         let refetch_pool_clone = refetch_pool.clone();
         let refetch_semaphore = Arc::new(Semaphore::new(16));
         let blockhash_to_signatures_clone = blockhash_to_signatures.clone();
+        let pending_signature_count_clone = pending_signature_count.clone();
         let handle = tokio::spawn({
             let indexer = indexer_clone;
             async move {
@@ -292,19 +294,25 @@ pub async fn cold_start(
                         }
                         inflight_refetch_clone.remove(&(parsed.slot, job_id_u64));
                         inflight_refetch_clone.remove(&(target_slot, job_id_u64));
+                        record_dashset_len(inflight_refetch_clone.as_ref(), "grpc_refetch_inflight");
                         if parsed.slot != target_slot {
                             seen_shreds_clone.remove(&(parsed.slot, job_id_u64));
                         }
                         seen_shreds_clone.remove(&(target_slot, job_id_u64));
+                        record_dashset_len(seen_shreds_clone.as_ref(), "seen_shreds_len");
                         job_slot_overrides_clone.remove(&job_id_u64);
+                        record_dashmap_len(job_slot_overrides_clone.as_ref(), "job_slot_overrides_len");
                         {
                             let mut sp = slot_plan_clone.write().unwrap();
                             reconcile_slot_plan_entry(&mut sp, job_id_u64, target_slot, "processor_empty");
                         }
-                        staged_batches_clone
-                            .entry(target_slot)
-                            .or_insert_with(BTreeMap::new)
-                            .insert(job_id_u64, parsed);
+                        let slot_len = {
+                            let mut entry = staged_batches_clone.entry(target_slot).or_insert_with(BTreeMap::new);
+                            entry.insert(job_id_u64, parsed);
+                            entry.len()
+                        };
+                        histogram!("staged_batches_slot_jobs").record(slot_len as f64);
+                        record_staged_batches_metrics(staged_batches_clone.as_ref());
                         continue;
                     }
                     // Non-empty: record presence in local plan immediately
@@ -325,10 +333,12 @@ pub async fn cold_start(
                     // Cancel in-flight refetch for this shard if present
                     inflight_refetch_clone.remove(&(parsed.slot, job_id_u64));
                     inflight_refetch_clone.remove(&(target_slot, job_id_u64));
+                    record_dashset_len(inflight_refetch_clone.as_ref(), "grpc_refetch_inflight");
                     if parsed.slot != target_slot {
                         seen_shreds_clone.remove(&(parsed.slot, job_id_u64));
                     }
                     seen_shreds_clone.remove(&(target_slot, job_id_u64));
+                    record_dashset_len(seen_shreds_clone.as_ref(), "seen_shreds_len");
                     if !parsed.transactions.is_empty() {
                         let mut signatures = HashMap::new();
                         for tx in parsed.transactions.iter() {
@@ -346,23 +356,46 @@ pub async fn cold_start(
                         }
                         if !signatures.is_empty() {
                             let mut guard = blockhash_to_signatures_clone.write().unwrap();
+                            let mut added_signatures = 0usize;
                             for (bh, sigs) in signatures.into_iter() {
-                                guard.entry(bh).or_insert_with(Vec::new).extend(sigs);
+                                let entry = guard.entry(bh).or_insert_with(Vec::new);
+                                let before = entry.len();
+                                entry.extend(sigs);
+                                added_signatures += entry.len() - before;
                             }
+                            let pending_blockhashes = guard.len();
+                            gauge!("blockhash_signature_pending_blockhashes").set(pending_blockhashes as f64);
+                            if added_signatures > 0 {
+                                histogram!("blockhash_signature_batch_inserted").record(added_signatures as f64);
+                                let prev_total =
+                                    pending_signature_count_clone.fetch_add(added_signatures as u64, Ordering::SeqCst);
+                                let new_total = prev_total.saturating_add(added_signatures as u64);
+                                gauge!("blockhash_signature_pending_signatures").set(new_total as f64);
+                            } else {
+                                let current_total = pending_signature_count_clone.load(Ordering::SeqCst);
+                                gauge!("blockhash_signature_pending_signatures").set(current_total as f64);
+                            }
+                        } else {
+                            let current_total = pending_signature_count_clone.load(Ordering::SeqCst);
+                            gauge!("blockhash_signature_pending_signatures").set(current_total as f64);
                         }
                     }
 
                     job_slot_overrides_clone.remove(&job_id_u64);
+                    record_dashmap_len(job_slot_overrides_clone.as_ref(), "job_slot_overrides_len");
 
                     {
                         let mut sp = slot_plan_clone.write().unwrap();
                         reconcile_slot_plan_entry(&mut sp, job_id_u64, target_slot, "processor");
                     }
 
-                    staged_batches_clone
-                        .entry(target_slot)
-                        .or_insert_with(BTreeMap::new)
-                        .insert(job_id_u64, parsed);
+                    let slot_len = {
+                        let mut entry = staged_batches_clone.entry(target_slot).or_insert_with(BTreeMap::new);
+                        entry.insert(job_id_u64, parsed);
+                        entry.len()
+                    };
+                    histogram!("staged_batches_slot_jobs").record(slot_len as f64);
+                    record_staged_batches_metrics(staged_batches_clone.as_ref());
                     continue;
                 }
                 info!("Transaction batch processor {} terminated (channel closed)", i);
@@ -398,6 +431,7 @@ pub async fn cold_start(
         let finalized_timestamps_clone = finalized_timestamps.clone();
         let num_transactions_clone = num_transactions.clone();
         let blockhash_to_signatures_clone = blockhash_to_signatures.clone();
+        let pending_signature_count_clone = pending_signature_count.clone();
         let handle = tokio::spawn(async move {
             info!("Slot processor {} started", i);
             while let Some(slot) = slot_receiver.recv().await {
@@ -425,10 +459,30 @@ pub async fn cold_start(
                     job_ids.len()
                 );
                 histogram!("slot_job_ids_count").record(job_ids.len() as f64);
-                let blockhash_to_signatures = {
+                let (blockhash_to_signatures, flush_blockhashes, flush_signatures) = {
                     let mut guard = blockhash_to_signatures_clone.write().unwrap();
-                    std::mem::take(&mut *guard)
+                    let taken = std::mem::take(&mut *guard);
+                    let flush_blockhashes = taken.len();
+                    let flush_signatures = taken.values().map(Vec::len).sum::<usize>();
+                    (taken, flush_blockhashes, flush_signatures)
                 };
+                if flush_blockhashes > 0 {
+                    histogram!("blockhash_signature_flush_blockhashes").record(flush_blockhashes as f64);
+                    histogram!("blockhash_signature_flush_signatures").record(flush_signatures as f64);
+                }
+                let remaining_signatures = if flush_signatures == 0 {
+                    pending_signature_count_clone.load(Ordering::SeqCst)
+                } else {
+                    let prev = pending_signature_count_clone.fetch_sub(flush_signatures as u64, Ordering::SeqCst);
+                    if flush_signatures as u64 > prev {
+                        pending_signature_count_clone.store(0, Ordering::SeqCst);
+                        0
+                    } else {
+                        prev - flush_signatures as u64
+                    }
+                };
+                gauge!("blockhash_signature_pending_blockhashes").set(0.0);
+                gauge!("blockhash_signature_pending_signatures").set(remaining_signatures as f64);
 
                 {
                     let mut bank_writer = bank_clone.write().unwrap();
@@ -516,6 +570,7 @@ pub async fn cold_start(
                         }
                     }
                 }
+                record_dashmap_len(job_slot_overrides_clone.as_ref(), "job_slot_overrides_len");
 
                 if !relocated.is_empty() {
                     info!(
@@ -570,6 +625,7 @@ pub async fn cold_start(
                         seen_shreds_clone2.remove(&(*old_slot, *job_id));
                         seen_shreds_clone2.insert((slot, *job_id));
                     }
+                    record_dashset_len(seen_shreds_clone2.as_ref(), "seen_shreds_len");
                 }
                 // Compare and refetch (sequentially) using this task's dedicated client
                 let remote_opt = slot_plan_clone.read().unwrap().get(&slot).cloned();
@@ -603,7 +659,6 @@ pub async fn cold_start(
                         for job_id in missing {
                             // Skip if a refetch for (slot, job_id) is already in-flight
                             if !inflight_clone.insert((slot, job_id)) {
-                                info!("Refetch already in flight for slot={}, job_id={}", slot, job_id);
                                 continue;
                             }
                             counter!("grpc_refetch_scheduled_total").increment(1);
@@ -701,6 +756,7 @@ pub async fn cold_start(
                                             }
                                             // Add empty shard if not already applied elsewhere
                                             if seen_shreds_task.insert((slot, job_id)) {
+                                                record_dashset_len(seen_shreds_task.as_ref(), "seen_shreds_len");
                                                 {
                                                     let meta = DBMeta::from_shred(slot, job_id);
                                                     let mut chain = db_chain_task.write().unwrap();
@@ -729,6 +785,7 @@ pub async fn cold_start(
                                 }
                                 // Remove from in-flight set regardless of success/failure
                                 inflight_task.remove(&(slot, job_id));
+                                record_dashset_len(inflight_task.as_ref(), "grpc_refetch_inflight");
                                 gauge!("grpc_refetch_inflight").set(inflight_task.len() as f64);
                                 info!("Refetch task ended for slot={}, job_id={}", slot, job_id);
                             });
@@ -743,8 +800,15 @@ pub async fn cold_start(
                     let merge_result = {
                         let mut db_chain = db_chain_ref_clone.write().unwrap();
                         info!("Acquired lock. Pre-merge: {}", db_chain.summary());
-                        let res = db_chain.merge(slot_plan_clone.read().unwrap().clone());
-                        info!("Merge finished at slot {}; Post-merge: {}", slot, db_chain.summary());
+                        // Augment the plan with finalized slots: map them to an empty Vec so
+                        // last_confirmed_slot treats them as satisfied even if someone
+                        // prematurely pruned their plan entries.
+                        let mut plan = slot_plan_clone.read().unwrap().clone();
+                        for s in finalized_slots_clone.iter() {
+                            plan.entry(*s).or_default();
+                        }
+                        let res = db_chain.merge(plan);
+                        info!("Merge finished at slot {}; Post-merge: {}", i, db_chain.summary());
                         res
                     };
                     let latest_slot = match merge_result {
@@ -795,6 +859,138 @@ pub async fn cold_start(
             Ok(()) as Result<(), eyre::Report>
         });
 
+        handles.push(handle);
+    }
+
+    // Periodic pruning task for long-lived containers
+    {
+        let seen_shreds_prune = seen_shreds.clone();
+        let finalized_slots_prune = finalized_slots.clone();
+        let finalized_timestamps_prune = finalized_timestamps.clone();
+        let job_slot_overrides_prune = job_slot_overrides.clone();
+        let staged_batches_prune = staged_batches.clone();
+        let inflight_refetch_prune = inflight_refetch.clone();
+        let current_slot_tracker = current_slot.clone();
+
+        let handle = tokio::spawn(async move {
+            let prune_interval_secs = std::env::var("PRUNE_INTERVAL_SECS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(120);
+            let seen_window = std::env::var("SEEN_SHREDS_WINDOW_SLOTS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(300);
+            let finalized_window = std::env::var("FINALIZED_SLOTS_WINDOW_SLOTS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(1000);
+            let overrides_ttl = std::env::var("JOB_SLOT_OVERRIDES_TTL_SLOTS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(300);
+            let staged_ttl = std::env::var("STAGED_BATCHES_TTL_SLOTS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(50);
+            let inflight_ttl = std::env::var("REFETCH_INFLIGHT_TTL_SLOTS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(100);
+
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(prune_interval_secs));
+            loop {
+                ticker.tick().await;
+
+                let cur = current_slot_tracker.load(Ordering::SeqCst);
+                if cur == 0 {
+                    continue;
+                }
+                let seen_cutoff = cur.saturating_sub(seen_window);
+                let finalized_cutoff = cur.saturating_sub(finalized_window);
+                let overrides_cutoff = cur.saturating_sub(overrides_ttl);
+                let staged_cutoff = cur.saturating_sub(staged_ttl);
+                let inflight_cutoff = cur.saturating_sub(inflight_ttl);
+
+                // seen_shreds: retain only entries with slot >= cutoff
+                let mut removed_seen = 0usize;
+                seen_shreds_prune.retain(|entry| {
+                    let keep = entry.0 >= seen_cutoff;
+                    if !keep {
+                        removed_seen += 1;
+                    }
+                    keep
+                });
+                seen_shreds_prune.shrink_to_fit();
+                gauge!("seen_shreds_len").set(seen_shreds_prune.len() as f64);
+                histogram!("prune_seen_shreds_removed").record(removed_seen as f64);
+
+                // finalized_slots: prune by slot window
+                let mut removed_finalized = 0usize;
+                finalized_slots_prune.retain(|slot| {
+                    let keep = *slot >= finalized_cutoff;
+                    if !keep {
+                        removed_finalized += 1;
+                    }
+                    keep
+                });
+                finalized_slots_prune.shrink_to_fit();
+                gauge!("finalized_slots_len").set(finalized_slots_prune.len() as f64);
+                histogram!("prune_finalized_slots_removed").record(removed_finalized as f64);
+
+                // finalized_timestamps: prune by slot window on keys
+                let mut removed_ts = 0usize;
+                finalized_timestamps_prune.retain(|slot, _| {
+                    let keep = *slot >= finalized_cutoff;
+                    if !keep {
+                        removed_ts += 1;
+                    }
+                    keep
+                });
+                finalized_timestamps_prune.shrink_to_fit();
+                gauge!("finalized_timestamps_len").set(finalized_timestamps_prune.len() as f64);
+                histogram!("prune_finalized_timestamps_removed").record(removed_ts as f64);
+
+                // job_slot_overrides: prune entries mapping to too-old slots
+                let mut removed_overrides = 0usize;
+                job_slot_overrides_prune.retain(|_, target_slot| {
+                    let keep = *target_slot >= overrides_cutoff;
+                    if !keep {
+                        removed_overrides += 1;
+                    }
+                    keep
+                });
+                job_slot_overrides_prune.shrink_to_fit();
+                gauge!("job_slot_overrides_len").set(job_slot_overrides_prune.len() as f64);
+                histogram!("prune_job_slot_overrides_removed").record(removed_overrides as f64);
+
+                // staged_batches: safety-net prune for very old slots (not finalized)
+                let mut removed_staged_slots = 0usize;
+                staged_batches_prune.retain(|slot, _| {
+                    let keep = *slot >= staged_cutoff;
+                    if !keep {
+                        removed_staged_slots += 1;
+                    }
+                    keep
+                });
+                staged_batches_prune.shrink_to_fit();
+                record_staged_batches_metrics(&staged_batches_prune);
+                histogram!("prune_staged_batches_slots_removed").record(removed_staged_slots as f64);
+
+                // inflight_refetch: prune by slot window
+                let mut removed_inflight = 0usize;
+                inflight_refetch_prune.retain(|entry| {
+                    let keep = entry.0 >= inflight_cutoff;
+                    if !keep {
+                        removed_inflight += 1;
+                    }
+                    keep
+                });
+                inflight_refetch_prune.shrink_to_fit();
+                gauge!("grpc_refetch_inflight").set(inflight_refetch_prune.len() as f64);
+                histogram!("prune_inflight_refetch_removed").record(removed_inflight as f64);
+            }
+        });
         handles.push(handle);
     }
 
@@ -917,8 +1113,11 @@ async fn finalize_staged_slot(
     refetch_sem: &Arc<Semaphore>,
     processor_id: usize,
 ) -> eyre::Result<()> {
-    finalized_slots.insert(slot);
+    if finalized_slots.insert(slot) {
+        record_dashset_len(finalized_slots.as_ref(), "finalized_slots_len");
+    }
     finalized_timestamps.insert(slot, slot_timestamp);
+    record_dashmap_len(finalized_timestamps.as_ref(), "finalized_timestamps_len");
 
     finalize_staged_slot_once(
         slot,
@@ -956,7 +1155,13 @@ async fn finalize_staged_slot_once(
 ) -> eyre::Result<()> {
     // 1) Drain currently staged
     let staged_entry = staged_batches.remove(&slot);
-    let mut batches = staged_entry.map(|(_, b)| b).unwrap_or_default();
+    record_staged_batches_metrics(staged_batches);
+    let mut batches = staged_entry
+        .map(|(_, b)| {
+            histogram!("staged_batches_slot_jobs").record(b.len() as f64);
+            b
+        })
+        .unwrap_or_default();
 
     // 2) Fill in missing according to remote slot_plan (if present)
     let missing_job_ids = {
@@ -983,7 +1188,8 @@ async fn finalize_staged_slot_once(
             let permit = refetch_sem.acquire().await.expect("semaphore not closed");
             match get_and_decode_batch(refetch_pool, slot, job_id).await {
                 Ok(maybe_batch) => {
-                    // Stage it into `batches`, even if empty; duplicates guarded by seen_shreds below
+                    // Stage it into `batches`, even if empty; duplicates guarded by seen_shreds
+                    // below
                     batches.insert(job_id, maybe_batch);
                 }
                 Err(RefetchErr::NotFound) => {
@@ -1042,6 +1248,7 @@ async fn finalize_staged_slot_once(
 
         if batch.transactions.is_empty() {
             if seen_shreds.insert((batch.slot, job_id)) {
+                record_dashset_len(seen_shreds.as_ref(), "seen_shreds_len");
                 let meta = DBMeta::from_shred(batch.slot, job_id);
                 let mut chain = db_chain.write().unwrap();
                 let before = chain.len();
@@ -1101,6 +1308,7 @@ async fn finalize_staged_slot_once(
 
         let meta = DBMeta::from_shred(batch.slot, job_id);
         if seen_shreds.insert((batch.slot, job_id)) {
+            record_dashset_len(seen_shreds.as_ref(), "seen_shreds_len");
             let mut chain = db_chain.write().unwrap();
             let before = chain.len();
             let t_add = Instant::now();
@@ -1138,8 +1346,16 @@ async fn finalize_staged_slot_once(
         processor_id, slot, slot_timestamp
     );
 
-    // Prune plans
-    slot_plan.write().unwrap().remove(&slot);
+    // IMPORTANT: Do NOT prune the remote slot plan here.
+    // DBChain::merge() needs the expected job_ids per slot to compute the
+    // confirmed frontier. We keep entries in `slot_plan` until a merge
+    // successfully advances past them; the slot processor prunes ≤latest_slot
+    // right after a successful merge.
+    {
+        // still publish the size for observability
+        let sp_len = slot_plan.read().unwrap().len();
+        gauge!("slot_plan_len").set(sp_len as f64);
+    }
 
     Ok(())
 }
@@ -1178,6 +1394,24 @@ fn reconcile_slot_plan_entry(slot_plan: &mut HashMap<u64, Vec<u64>>, job_id: u64
             reason, job_id, target_slot, removed_from
         );
     }
+}
+
+fn record_dashmap_len<K, V>(map: &DashMap<K, V>, metric: &'static str)
+where
+    K: Eq + std::hash::Hash,
+{
+    gauge!(metric).set(map.len() as f64);
+}
+
+fn record_dashset_len<T>(set: &DashSet<T>, metric: &'static str)
+where
+    T: Eq + std::hash::Hash,
+{
+    gauge!(metric).set(set.len() as f64);
+}
+
+fn record_staged_batches_metrics(staged_batches: &DashMap<u64, BTreeMap<u64, SerializableBatch>>) {
+    record_dashmap_len(staged_batches, "staged_batches_slots");
 }
 
 async fn get_and_decode_batch(
@@ -1259,6 +1493,7 @@ async fn refetch_and_apply_shred_from_pool(
     }
     if seen_shreds.contains(&(target_slot, job_id)) {
         job_slot_overrides.remove(&job_id);
+        record_dashmap_len(job_slot_overrides.as_ref(), "job_slot_overrides_len");
         return Ok(());
     }
 
@@ -1276,7 +1511,13 @@ async fn refetch_and_apply_shred_from_pool(
     }
 
     // Stage the batch
-    staged_batches.entry(target_slot).or_default().insert(job_id, batch);
+    let slot_len = {
+        let mut entry = staged_batches.entry(target_slot).or_default();
+        entry.insert(job_id, batch);
+        entry.len()
+    };
+    histogram!("staged_batches_slot_jobs").record(slot_len as f64);
+    record_staged_batches_metrics(staged_batches.as_ref());
 
     // If the slot was already finalized (finalizer arrived before this refetch),
     // immediately finalize again to drain late arrivals.

@@ -569,11 +569,7 @@ impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB>
         let block = std::mem::take(&mut self.tx_cache);
         let block_len = block.len();
         let slot = block[0].slot;
-        let start_tx_sig = block[0].signature;
-        let end_tx_sig = block[block_len - 1].signature;
         debug!("Flushing {} transactions to ClickHouse for slot {}", block_len, slot);
-
-        let start_time = SystemTime::now();
 
         // Execute the query
         let result = match self
@@ -593,19 +589,7 @@ impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB>
             )
             .await
         {
-            Ok(_) => {
-                let end_time = SystemTime::now();
-                let duration = end_time.duration_since(start_time).unwrap();
-                info!(
-                    "Successfully flushed {} transactions[{} - {}] to database for slot {} in {:?}ms",
-                    block_len,
-                    Signature::from(start_tx_sig),
-                    Signature::from(end_tx_sig),
-                    slot,
-                    duration.as_millis()
-                );
-                Ok(block_len)
-            }
+            Ok(_) => Ok(block_len),
             Err(e) => {
                 error!("Failed to flush tx_cache: {}", e);
                 self.metrics.report_db_error("flush_tx_cache");
@@ -639,7 +623,6 @@ impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB>
             return Ok(());
         }
 
-        info!("Flushing {} signatures to database", self.signature_cache.len());
         self.metrics.report_signature_cache_flush();
 
         let block = std::mem::take(&mut self.signature_cache);
@@ -685,10 +668,10 @@ impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB>
     }
 
     pub async fn flush_account_ops_cache_async(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if self.account_ops_create_cache.is_empty()
-            && self.account_ops_delete_cache.is_empty()
-            && self.account_ops_mint_create_cache.is_empty()
-            && self.account_ops_mint_delete_cache.is_empty()
+        if self.account_ops_create_cache.is_empty() &&
+            self.account_ops_delete_cache.is_empty() &&
+            self.account_ops_mint_create_cache.is_empty() &&
+            self.account_ops_mint_delete_cache.is_empty()
         {
             debug!("account_ops_cache is empty, nothing to flush");
             return Ok(());
@@ -893,8 +876,8 @@ impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB>
             }
         }
 
-        if self.account_ops_create_cache.len() >= self.max_cache_size
-            || self.account_ops_delete_cache.len() >= self.max_cache_size
+        if self.account_ops_create_cache.len() >= self.max_cache_size ||
+            self.account_ops_delete_cache.len() >= self.max_cache_size
         {
             if let Err(e) = self.flush_account_ops_cache_async().await {
                 error!("Error flushing account ops cache: {}", e);

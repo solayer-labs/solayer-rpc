@@ -72,6 +72,10 @@ impl<T: MergeableDB> DBChain<T> {
         let initial_size = self.dbs.len();
 
         let split_at = self.dbs.partition_point(|(m, _)| m.slot.slot() <= last_confirmed_slot);
+        if split_at <= 1 {
+            counter!("db_chain_merge_total", "event" => "noop").increment(1);
+            return Ok(Some(last_confirmed_slot));
+        }
         let mut dbs_to_merge = self.dbs[..split_at].to_vec();
         info!(
             "Merging {} segments into new checkpoint at slot {}; tail remains: {}; pre-merge summary: {}",
