@@ -12,7 +12,6 @@ use infinisvm_logger::{info, warn};
 use infinisvm_sync::{grpc::TransactionBatchBroadcaster, types::SerializableBatch};
 use infinisvm_types::jobs::ConsumedJob;
 use metrics::gauge;
-use rand::Rng;
 use solana_hash::Hash;
 use solana_sha256_hasher::{hashv, Hasher};
 

@@ -339,7 +339,7 @@ impl Bank {
             prev.push_back(hash);
         }
 
-        let mut bank = Self {
+        let bank = Self {
             db: Arc::new(RwLock::new(pdb)),
             // 350000 tps, expire every 150 slots
             // we need to store 21000000 txs

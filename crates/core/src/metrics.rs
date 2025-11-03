@@ -69,46 +69,6 @@ impl QuicTxReceiverMetrics {
     }
 }
 
-/// PusherMetrics tracks metrics related to the QUIC pusher component.
-pub struct PusherMetrics {
-    /// Number of active QUIC connections
-    pub active_connections: Gauge,
-
-    /// Bytes queued for sending to each connection
-    pub bytes_queued: Counter,
-
-    /// Total bytes sent over QUIC connections
-    pub bytes_sent: Counter,
-}
-
-impl Default for PusherMetrics {
-    fn default() -> Self {
-        Self {
-            active_connections: gauge!("pusher_active_connections"),
-            bytes_queued: counter!("pusher_queued_bytes"),
-            bytes_sent: counter!("pusher_sent_bytes"),
-        }
-    }
-}
-
-impl PusherMetrics {
-    pub fn increase_active_connections(&self) {
-        self.active_connections.increment(1);
-    }
-
-    pub fn decrease_active_connections(&self) {
-        self.active_connections.decrement(1);
-    }
-
-    pub fn increase_bytes_queued(&self, bytes: u64) {
-        self.bytes_queued.increment(bytes);
-    }
-
-    pub fn increase_bytes_sent(&self, bytes: u64) {
-        self.bytes_sent.increment(bytes);
-    }
-}
-
 /// WorkerMetrics tracks metrics related to the worker component.
 pub struct WorkerMetrics {
     /// Histogram for sysvar update time

@@ -16,7 +16,6 @@ pub mod fork_graph;
 
 pub mod indexer;
 pub mod metrics;
-pub mod pusher;
 
 pub mod subscription;
 

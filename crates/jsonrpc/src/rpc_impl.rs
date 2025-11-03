@@ -1,6 +1,6 @@
 use std::{
     borrow::Cow,
-    collections::{BTreeMap, HashMap},
+    collections::HashMap,
     io::Write,
     str::FromStr,
     sync::atomic::Ordering,

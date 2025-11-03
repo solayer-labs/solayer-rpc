@@ -17,7 +17,6 @@ use cdrs_tokio::{
     load_balancing::RoundRobinLoadBalancingStrategy,
     transport::TransportTcp,
 };
-use crossbeam_channel::Sender;
 use futures_util::pin_mut;
 use infinisvm_core::indexer::Indexer;
 use infinisvm_jsonrpc::rpc_state::RpcIndexer;
@@ -82,8 +81,6 @@ pub struct DatabaseIndexer<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB,
     slot_time: u64,
     // Cache size configuration
     max_cache_size: usize,
-
-    pusher_sender: Option<Sender<(Vec<u8>, Vec<u8>)>>,
 
     s3: Option<S3FsClient>,
 
@@ -468,20 +465,13 @@ impl IndexerDB for PostgresIndexerDB {
 impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB>
     DatabaseIndexer<TX, SLOT, SIGNATURE, ACCOUNT>
 {
-    pub fn new(
-        tx_client: TX,
-        slot_client: SLOT,
-        signature_client: SIGNATURE,
-        account_client: ACCOUNT,
-        pusher_sender: Option<Sender<(Vec<u8>, Vec<u8>)>>,
-    ) -> Self {
+    pub fn new(tx_client: TX, slot_client: SLOT, signature_client: SIGNATURE, account_client: ACCOUNT) -> Self {
         Self::with_config(
             tx_client,
             slot_client,
             signature_client,
             account_client,
             DEFAULT_CACHE_SIZE,
-            pusher_sender,
         )
     }
 
@@ -491,7 +481,6 @@ impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB>
         signature_client: SIGNATURE,
         account_client: ACCOUNT,
         cache_size: usize,
-        pusher_sender: Option<Sender<(Vec<u8>, Vec<u8>)>>,
     ) -> Self {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(5)
@@ -517,7 +506,6 @@ impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB>
                 .unwrap_or_default()
                 .as_secs(),
             max_cache_size: cache_size,
-            pusher_sender,
             s3: None,
             metrics: DatabaseIndexerMetrics::default(),
         }
@@ -529,7 +517,6 @@ impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB>
         signature_client: SIGNATURE,
         account_client: ACCOUNT,
         runtime: Arc<tokio::runtime::Runtime>,
-        pusher_sender: Option<Sender<(Vec<u8>, Vec<u8>)>>,
     ) -> Self {
         Self {
             tx_client,
@@ -548,7 +535,6 @@ impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB>
                 .unwrap_or_default()
                 .as_secs(),
             max_cache_size: DEFAULT_CACHE_SIZE,
-            pusher_sender,
             s3: None,
             metrics: DatabaseIndexerMetrics::default(),
         }
@@ -605,7 +591,6 @@ impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB>
             self.account_ops_delete_cache.len(),
             self.account_ops_mint_create_cache.len(),
             self.account_ops_mint_delete_cache.len(),
-            self.pusher_sender.as_ref().map_or(0, |s| s.len()),
             self.tx_cache.capacity(),
             self.signature_cache.capacity(),
             self.account_ops_create_cache.capacity(),
@@ -655,7 +640,6 @@ impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB>
             self.account_ops_delete_cache.len(),
             self.account_ops_mint_create_cache.len(),
             self.account_ops_mint_delete_cache.len(),
-            self.pusher_sender.as_ref().map_or(0, |s| s.len()),
             self.tx_cache.capacity(),
             self.signature_cache.capacity(),
             self.account_ops_create_cache.capacity(),
@@ -802,7 +786,6 @@ impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB>
             self.account_ops_delete_cache.len(),
             self.account_ops_mint_create_cache.len(),
             self.account_ops_mint_delete_cache.len(),
-            self.pusher_sender.as_ref().map_or(0, |s| s.len()),
             self.tx_cache.capacity(),
             self.signature_cache.capacity(),
             self.account_ops_create_cache.capacity(),
@@ -818,10 +801,6 @@ impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB>
         debug!("Processing transaction: {}", job.sanitized_transaction.signature());
         let signature_rows = to_signature_rows(&job);
         let (tx_row, account_delta) = to_tx_row(&job);
-
-        self.pusher_sender
-            .as_ref()
-            .map(|sender| sender.send((tx_row.transaction.clone().0, tx_row.result.clone().0)));
 
         // Report metrics for indexed signatures
         self.metrics.report_signatures_indexed(signature_rows.len() as u64);
@@ -850,7 +829,6 @@ impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB>
             self.account_ops_delete_cache.len(),
             self.account_ops_mint_create_cache.len(),
             self.account_ops_mint_delete_cache.len(),
-            self.pusher_sender.as_ref().map_or(0, |s| s.len()),
             self.tx_cache.capacity(),
             self.signature_cache.capacity(),
             self.account_ops_create_cache.capacity(),
@@ -1698,7 +1676,6 @@ impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB>
             self.account_ops_delete_cache.len(),
             self.account_ops_mint_create_cache.len(),
             self.account_ops_mint_delete_cache.len(),
-            self.pusher_sender.as_ref().map_or(0, |s| s.len()),
             self.tx_cache.capacity(),
             self.signature_cache.capacity(),
             self.account_ops_create_cache.capacity(),
@@ -1890,11 +1867,7 @@ unsafe impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: Index
 impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB>
     MultiDatabaseIndexer<TX, SLOT, SIGNATURE, ACCOUNT>
 {
-    pub fn new(
-        clients: Vec<(TX, SLOT, SIGNATURE, ACCOUNT)>,
-        pusher_sender: Option<Sender<(Vec<u8>, Vec<u8>)>>,
-        s3: Option<S3FsClient>,
-    ) -> Self {
+    pub fn new(clients: Vec<(TX, SLOT, SIGNATURE, ACCOUNT)>, s3: Option<S3FsClient>) -> Self {
         let client_cnt = clients.len();
         if client_cnt == 0 {
             panic!("No clients provided");
@@ -1927,7 +1900,6 @@ impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB>
                 signature_client.clone(),
                 account_client.clone(),
                 runtime_clone.clone(),
-                pusher_sender.clone(),
             );
             if let Some(s3_client) = s3.clone() {
                 indexer.add_s3(s3_client);
@@ -1935,14 +1907,8 @@ impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB>
             indexers.push(indexer);
 
             // Create worker indexer with its own pool
-            let mut worker_indexer = DatabaseIndexer::with_runtime(
-                tx_client,
-                slot_client,
-                signature_client,
-                account_client,
-                runtime_clone,
-                pusher_sender.clone(),
-            );
+            let mut worker_indexer =
+                DatabaseIndexer::with_runtime(tx_client, slot_client, signature_client, account_client, runtime_clone);
             if let Some(s3_client) = s3.clone() {
                 worker_indexer.add_s3(s3_client);
             }

@@ -307,7 +307,7 @@ pub async fn cold_start(
                             reconcile_slot_plan_entry(&mut sp, job_id_u64, target_slot, "processor_empty");
                         }
                         let slot_len = {
-                            let mut entry = staged_batches_clone.entry(target_slot).or_insert_with(BTreeMap::new);
+                            let mut entry = staged_batches_clone.entry(target_slot).or_default();
                             entry.insert(job_id_u64, parsed);
                             entry.len()
                         };
@@ -349,7 +349,7 @@ pub async fn cold_start(
                                     continue;
                                 }
                             };
-                            let blockhash = transaction.message.recent_blockhash().clone();
+                            let blockhash = *transaction.message.recent_blockhash();
                             let signature = tx.get_signature();
                             trace!("Processor {}: Processing transaction {}", i, signature);
                             signatures.entry(blockhash).or_insert_with(Vec::new).push(signature);
@@ -390,7 +390,7 @@ pub async fn cold_start(
                     }
 
                     let slot_len = {
-                        let mut entry = staged_batches_clone.entry(target_slot).or_insert_with(BTreeMap::new);
+                        let mut entry = staged_batches_clone.entry(target_slot).or_default();
                         entry.insert(job_id_u64, parsed);
                         entry.len()
                     };

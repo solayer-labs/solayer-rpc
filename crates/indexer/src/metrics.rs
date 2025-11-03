@@ -24,7 +24,6 @@ pub struct DatabaseIndexerMetrics {
     pub gauge_cache_size_account_ops_delete: Gauge,
     pub gauge_cache_size_account_ops_mint_create: Gauge,
     pub gauge_cache_size_account_ops_mint_delete: Gauge,
-    pub gauge_pusher_sender_channel_len: Gauge,
 
     // Latency metrics
     pub histogram_get_slot: Histogram,
@@ -67,7 +66,6 @@ impl Default for DatabaseIndexerMetrics {
             gauge_cache_size_account_ops_delete: gauge!("indexer_cache_size", "type" => "account_ops_delete"),
             gauge_cache_size_account_ops_mint_create: gauge!("indexer_cache_size", "type" => "account_ops_mint_create"),
             gauge_cache_size_account_ops_mint_delete: gauge!("indexer_cache_size", "type" => "account_ops_mint_delete"),
-            gauge_pusher_sender_channel_len: gauge!("indexer_channel_len", "type" => "pusher_sender"),
 
             // Initialize histograms
             histogram_get_slot: histogram!(latency_metric_name, "op" => "get_slot"),
@@ -140,7 +138,6 @@ impl DatabaseIndexerMetrics {
         account_ops_delete_len: usize,
         account_ops_mint_create_len: usize,
         account_ops_mint_delete_len: usize,
-        pusher_sender_len: usize,
         tx_cache_capacity: usize,
         signature_cache_capacity: usize,
         account_ops_create_capacity: usize,
@@ -158,7 +155,6 @@ impl DatabaseIndexerMetrics {
             .set(account_ops_mint_create_len as f64);
         self.gauge_cache_size_account_ops_mint_delete
             .set(account_ops_mint_delete_len as f64);
-        self.gauge_pusher_sender_channel_len.set(pusher_sender_len as f64);
         self.gauge_capacity_transactions.set(tx_cache_capacity as f64);
         self.gauge_capacity_signatures.set(signature_cache_capacity as f64);
         self.gauge_capacity_account_ops_create

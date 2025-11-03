@@ -185,7 +185,7 @@ struct Args {
 
 async fn create_indexer(args: &Args) -> (Arc<Mutex<dyn Indexer>>, Arc<dyn RpcIndexer>) {
     // Fallback to in-memory indexer if Cassandra hosts are not provided
-    let hosts = args.cassandra_hosts.as_ref().map(|v| v.as_slice()).unwrap_or(&[]);
+    let hosts = args.cassandra_hosts.as_deref().unwrap_or(&[]);
     if hosts.is_empty() {
         info!("No Cassandra hosts provided; using in-memory indexer");
         let indexer = Arc::new(Mutex::new(NoopIndexer));
@@ -229,8 +229,8 @@ async fn create_indexer(args: &Args) -> (Arc<Mutex<dyn Indexer>>, Arc<dyn RpcInd
         }
     }
 
-    let cassandra_indexer = Arc::new(Mutex::new(MultiDatabaseIndexer::new(pools, None, Some(s3.clone()))));
-    let cassandra_indexer_rpc = Arc::new(MultiDatabaseIndexer::new(readonly_pools, None, Some(s3.clone())));
+    let cassandra_indexer = Arc::new(Mutex::new(MultiDatabaseIndexer::new(pools, Some(s3.clone()))));
+    let cassandra_indexer_rpc = Arc::new(MultiDatabaseIndexer::new(readonly_pools, Some(s3.clone())));
 
     (cassandra_indexer, cassandra_indexer_rpc)
 }
@@ -398,12 +398,11 @@ async fn do_main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     let url = grpc_server_addr
         .parse::<url::Url>()
-        .unwrap_or_else(|e| panic!("Invalid gRPC server address '{}': {}", grpc_server_addr, e));
+        .unwrap_or_else(|e| panic!("Invalid gRPC server address '{grpc_server_addr}': {e}"));
     let grpc_server_host = url.host_str().unwrap_or_default();
     let grpc_server_port = url.port_or_known_default().unwrap_or_else(|| {
         panic!(
-            "No port found for gRPC server address '{}'; must specify port (e.g., https://host:port)",
-            grpc_server_addr
+            "No port found for gRPC server address '{grpc_server_addr}'; must specify port (e.g., https://host:port)"
         )
     });
 
