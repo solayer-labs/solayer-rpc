@@ -583,8 +583,13 @@ pub async fn cold_start(
                     {
                         let mut lsp = local_slot_plan_clone.write().unwrap();
                         for (old_slot, job_id) in &relocated {
+                            let mut drop_empty = false;
                             if let Some(old_vec) = lsp.get_mut(old_slot) {
                                 old_vec.retain(|jid| *jid != *job_id);
+                                drop_empty = old_vec.is_empty();
+                            }
+                            if drop_empty {
+                                lsp.remove(old_slot);
                             }
                             let entry = lsp.entry(slot).or_default();
                             if !entry.contains(job_id) {
@@ -834,6 +839,16 @@ pub async fn cold_start(
                             i,
                             removed_count - slot_plan.len()
                         );
+
+                        // NEW: prune local_slot_plan to avoid unbounded growth
+                        {
+                            let mut lsp = local_slot_plan_clone.write().unwrap();
+                            let before = lsp.len();
+                            lsp.retain(|&s, ids| s > latest_slot && !ids.is_empty());
+                            let pruned_lsp = before.saturating_sub(lsp.len());
+                            counter!("local_slot_plan_entries_pruned_total").increment(pruned_lsp as u64);
+                            gauge!("local_slot_plan_len").set(lsp.len() as f64);
+                        }
                     } else {
                         info!(
                             "Processor {}: Merge returned None at slot {} (no confirmed slot yet)",
@@ -869,6 +884,7 @@ pub async fn cold_start(
         let finalized_timestamps_prune = finalized_timestamps.clone();
         let job_slot_overrides_prune = job_slot_overrides.clone();
         let staged_batches_prune = staged_batches.clone();
+        let local_slot_plan_prune = local_slot_plan.clone();
         let inflight_refetch_prune = inflight_refetch.clone();
         let current_slot_tracker = current_slot.clone();
 
@@ -893,6 +909,10 @@ pub async fn cold_start(
                 .ok()
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(50);
+            let lsp_window = std::env::var("LOCAL_SLOT_PLAN_WINDOW_SLOTS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(1000);
             let inflight_ttl = std::env::var("REFETCH_INFLIGHT_TTL_SLOTS")
                 .ok()
                 .and_then(|s| s.parse::<u64>().ok())
@@ -910,6 +930,21 @@ pub async fn cold_start(
                 let finalized_cutoff = cur.saturating_sub(finalized_window);
                 let overrides_cutoff = cur.saturating_sub(overrides_ttl);
                 let staged_cutoff = cur.saturating_sub(staged_ttl);
+                let lsp_cutoff = cur.saturating_sub(lsp_window);
+                // local_slot_plan: prune by slot window and drop empty vectors
+                let mut removed_lsp = 0usize;
+                {
+                    let mut lsp = local_slot_plan_prune.write().unwrap();
+                    lsp.retain(|&slot, ids| {
+                        let keep = slot >= lsp_cutoff && !ids.is_empty();
+                        if !keep {
+                            removed_lsp += 1;
+                        }
+                        keep
+                    });
+                    gauge!("local_slot_plan_len").set(lsp.len() as f64);
+                }
+                histogram!("prune_local_slot_plan_removed").record(removed_lsp as f64);
                 let inflight_cutoff = cur.saturating_sub(inflight_ttl);
 
                 // seen_shreds: retain only entries with slot >= cutoff

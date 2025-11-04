@@ -1,10 +1,4 @@
-use std::{
-    borrow::Cow,
-    collections::HashMap,
-    io::Write,
-    str::FromStr,
-    sync::atomic::Ordering,
-};
+use std::{borrow::Cow, collections::HashMap, io::Write, str::FromStr, sync::atomic::Ordering};
 
 use base64::{engine::general_purpose::STANDARD as b64, Engine};
 use infinisvm_core::bank::{get_feature_set, TransactionStatus};
