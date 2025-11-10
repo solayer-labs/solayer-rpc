@@ -107,6 +107,7 @@ impl TransactionBatchBroadcaster {
                     compression_ratio: 0,
                     job_id: job_id as u64,
                     worker_id: 0,
+                    job_ids: Vec::new(),
                     is_final: false,
                 };
 
@@ -149,15 +150,16 @@ impl TransactionBatchBroadcaster {
             .map_err(|e| format!("Failed to send notification to broadcaster: {e}"))
     }
 
-    pub fn broadcast_finalization(&self, slot: u64, timestamp: u64) -> Result<(), String> {
+    pub fn broadcast_finalization(&self, slot: u64, job_ids: Vec<u64>) -> Result<(), String> {
         let notification = Arc::new(CommitBatchNotification {
             slot,
-            timestamp,
+            timestamp: 0,
             batch_size: 0,
             compressed_transactions: Vec::new(),
             compression_ratio: 0,
             job_id: u64::MAX,
             worker_id: usize::MAX,
+            job_ids,
             is_final: true,
         });
 
@@ -243,6 +245,7 @@ impl TransactionBatchBroadcaster {
             compression_ratio: compression_ratio as u64,
             job_id: batch[0].job_id as u64,
             worker_id: batch[0].worker_id,
+            job_ids: Vec::new(),
             is_final: false,
         })
     }

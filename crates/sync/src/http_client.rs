@@ -1,6 +1,5 @@
 use std::{
     path::PathBuf,
-    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -190,11 +189,6 @@ pub struct Downloader {
     last_slot: u64,
 }
 
-pub fn parse_data(bytes: Vec<u8>) -> Result<Vec<(Pubkey, AccountSharedData)>> {
-    let checkpoint = bincode::deserialize(&bytes)?;
-    Ok(checkpoint)
-}
-
 pub fn reduce_data(
     data: HashMap<DBFile, Vec<(Pubkey, AccountSharedData)>>,
 ) -> Result<HashMap<Pubkey, AccountSharedData>> {
@@ -252,7 +246,6 @@ async fn ensure_aria2c_ready() -> Result<()> {
     let stdout = String::from_utf8_lossy(&output.stdout);
     if let Some(version) = parse_aria2c_version(&stdout) {
         if version_is_supported(version) {
-            info!("aria2c version {:?} detected", version);
             return Ok(());
         }
         return Err(eyre::eyre!(
@@ -277,14 +270,13 @@ impl Downloader {
         &mut self,
         http_client: &HttpClient,
         files: Vec<DBFile>,
-        parser: Arc<impl Fn(Vec<u8>) -> Result<T> + Send + Sync + 'static>,
+        parser: fn(Vec<u8>) -> Result<T>,
     ) -> Result<HashMap<DBFile, T>> {
         let base_url = http_client.base_url.clone();
         if let Err(e) = ensure_aria2c_ready().await {
             error!("aria2c is not ready: {}", e);
             return Err(e);
         }
-        info!("Aria2c is ready to download files");
 
         let multi_progress = MultiProgress::new();
         let progress_style = ProgressStyle::default_bar()
@@ -312,7 +304,6 @@ impl Downloader {
             let pb = multi_progress.add(ProgressBar::new(100));
             pb.set_style(progress_style.clone());
             pb.set_message(file.to_string());
-            let parser = parser.clone();
             let temp_dir_path = temp_dir_path.clone();
             let connection_arg = connection_arg.clone();
 
@@ -454,8 +445,8 @@ impl Downloader {
         &mut self,
         http_client: &HttpClient,
         sender: mpsc::Sender<(DBFile, T)>,
-        parser: Arc<impl Fn(Vec<u8>) -> Result<T> + Send + Sync + 'static>,
-    ) -> Result<()> {
+        parser: fn(Vec<u8>) -> Result<T>,
+    ) -> ! {
         info!(
             "Downloader.poll_for_new_files started (initial last_slot={})",
             self.last_slot
@@ -464,19 +455,21 @@ impl Downloader {
         loop {
             interval.tick().await;
             info!("Polling for new files since slot {}", self.last_slot);
-            let snapshots = http_client.get_snapshots().await?;
+            let snapshots = http_client.get_snapshots().await.expect("Failed to get snapshots");
             let files = snapshots.since_slot(self.last_slot);
             if files.is_empty() {
                 info!("No new files found in this tick");
             } else {
                 info!("Found {} new files since slot {}", files.len(), self.last_slot);
             }
-            let results = self.bulk_download(http_client, files, parser.clone()).await?;
+            let results = self
+                .bulk_download(http_client, files, parser)
+                .await
+                .expect("Failed to bulk download files");
             info!("Download complete: {} files", results.len());
             for (file, result) in results {
                 if let Err(e) = sender.send((file, result)).await {
-                    error!("Failed to enqueue downloaded file to DB-chain updater: {}", e);
-                    return Err(e.into());
+                    panic!("Failed to enqueue downloaded file to DB-chain updater: {e}");
                 }
             }
         }

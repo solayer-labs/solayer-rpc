@@ -11,8 +11,7 @@ use base64::Engine;
 use infinisvm_logger::{debug, error, info, warn};
 use infinisvm_types::sync::{
     grpc::infini_svm_service_client::InfiniSvmServiceClient, CommitBatchNotification, GetLatestSlotRequest,
-    GetLatestSlotResponse, GetTransactionBatchRequest, SlotDataResponse, StartReceivingSlotsRequest,
-    TransactionBatchRequest,
+    GetTransactionBatchRequest, RawSlot, StartReceivingSlotsRequest, TransactionBatchRequest,
 };
 use metrics::counter;
 use tokio::{
@@ -690,7 +689,7 @@ impl SyncClient {
         Err(error_msg.into())
     }
 
-    pub async fn get_latest_slot(&mut self) -> Result<GetLatestSlotResponse, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn get_latest_slot(&mut self) -> Result<RawSlot, Box<dyn std::error::Error + Send + Sync>> {
         let result = self
             .execute_with_retry("get_latest_slot", |client| {
                 Box::pin(async move {
@@ -733,7 +732,7 @@ impl SyncClient {
 
     pub async fn subscribe_slots(
         &mut self,
-    ) -> Result<mpsc::Receiver<SlotDataResponse>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<mpsc::Receiver<RawSlot>, Box<dyn std::error::Error + Send + Sync>> {
         let stream = self
             .execute_with_retry("subscribe_slots", |client| {
                 Box::pin(async move {

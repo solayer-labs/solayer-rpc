@@ -22,7 +22,7 @@ pub type PerfSample = (u64, u64, u64, u64); // slot(sampled at), num_transaction
 pub enum CommitEvent {
     Batch(Vec<ConsumedJob>),
     Flush,
-    Finalize { slot: u64, timestamp: u64 },
+    Finalize { slot: u64 },
 }
 
 struct SlotHashAccumulator {
@@ -74,7 +74,7 @@ pub struct Committer {
     // gRPC batch broadcaster
     batch_broadcaster: Option<Vec<Arc<TransactionBatchBroadcaster>>>,
     batch_buffer: Vec<ConsumedJob>,
-    pending_finalizations: VecDeque<(u64, u64)>,
+    pending_finalizations: VecDeque<u64>,
     slot_hash_accumulators: HashMap<u64, SlotHashAccumulator>,
     bank: Arc<RwLock<Bank>>,
 
@@ -219,8 +219,8 @@ impl Committer {
                         self.process_pending_finalizations();
                     }
                 }
-                Ok(CommitEvent::Finalize { slot, timestamp }) => {
-                    self.pending_finalizations.push_back((slot, timestamp));
+                Ok(CommitEvent::Finalize { slot }) => {
+                    self.pending_finalizations.push_back(slot);
                     self.process_pending_finalizations();
                 }
                 Err(_) => break,
@@ -241,15 +241,14 @@ impl Committer {
         accumulator.absorb_jobs(jobs);
     }
 
-    fn finalize_slot_hash(&mut self, slot: u64, timestamp: u64) {
+    fn finalize_slot_hash(&mut self, slot: u64) {
         let hash = self
             .slot_hash_accumulators
             .remove(&slot)
             .map(SlotHashAccumulator::finalize)
             .unwrap_or_else(|| {
                 let slot_bytes = slot.to_le_bytes();
-                let timestamp_bytes = timestamp.to_le_bytes();
-                hashv(&[&slot_bytes, &timestamp_bytes])
+                hashv(&[&slot_bytes])
             });
 
         if let Ok(mut bank) = self.bank.write() {
@@ -292,22 +291,30 @@ impl Committer {
     }
 
     fn process_pending_finalizations(&mut self) {
-        while let Some((slot, timestamp)) = self.pending_finalizations.front().copied() {
+        while let Some(slot) = self.pending_finalizations.front().copied() {
             if !self.flush_pending_batch() {
                 break;
             }
 
             let _ = self.pending_finalizations.pop_front();
-            self.broadcast_finalization(slot, timestamp);
-            self.finalize_slot_hash(slot, timestamp);
+            let mut job_ids = {
+                let bank = self.bank.read().unwrap();
+                bank.job_ids_for_slot(slot).unwrap_or_default()
+            };
+            job_ids.sort_unstable();
+            job_ids.dedup();
+
+            self.bank.write().unwrap().mark_slot_range_finalized(slot);
+            self.broadcast_finalization(slot, job_ids);
+            self.finalize_slot_hash(slot);
         }
     }
 
-    fn broadcast_finalization(&self, slot: u64, timestamp: u64) {
+    fn broadcast_finalization(&self, slot: u64, job_ids: Vec<u64>) {
         info!("Broadcasting finalization for slot {slot}");
         if let Some(ref broadcaster) = self.batch_broadcaster {
             for b in broadcaster.iter() {
-                if let Err(e) = b.broadcast_finalization(slot, timestamp) {
+                if let Err(e) = b.broadcast_finalization(slot, job_ids.clone()) {
                     warn!("Failed to broadcast block finalization for slot {}: {}", slot, e);
                 }
             }

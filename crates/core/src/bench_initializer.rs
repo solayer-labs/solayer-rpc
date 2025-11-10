@@ -122,7 +122,11 @@ impl BenchInitializer {
             SanitizedTransaction::try_from_legacy_transaction(tx, &std::collections::HashSet::new()).unwrap()
         };
 
-        tx_sender.send((init_tx, 0)).unwrap();
+        // send this tx 10 seconds later in another thread
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(10));
+            tx_sender.send((init_tx, 0)).unwrap();
+        });
     }
 
     pub fn get_discriminator(name: &str) -> [u8; 8] {

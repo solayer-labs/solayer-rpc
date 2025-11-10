@@ -48,7 +48,6 @@ pub async fn start_http_server(
 
 // Handler for snapshots API
 async fn handle_snapshots(State(state): State<Arc<AppState>>) -> Response {
-    info!("Served snapshots request");
     let db_path = PathBuf::from(&state.db_path);
 
     if !db_path.exists() {

@@ -14,58 +14,53 @@ use tonic::{
     Request,
 };
 
-use crate::types::SerializableBatch;
+use crate::types::{FinalizationMarker, SerializableBatch, SerializableNotification};
 
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub fn process_commit_notification(
     notification: &CommitBatchNotification,
-) -> Result<SerializableBatch, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<SerializableNotification, Box<dyn std::error::Error + Send + Sync>> {
     info!(
         "Received batch notification: slot={}, batch_size={}, compression_ratio={}%",
         notification.slot, notification.batch_size, notification.compression_ratio
     );
 
     if notification.is_final {
-        return Ok(SerializableBatch {
+        return Ok(SerializableNotification::Finalization(FinalizationMarker {
             slot: notification.slot,
             timestamp: notification.timestamp,
-            job_id: notification.job_id as usize,
-            transactions: Vec::new(),
-            worker_id: notification.worker_id,
-            is_final: true,
-        });
+            job_ids: notification.job_ids.clone(),
+        }));
     }
 
     // Handle empty batches gracefully to avoid zstd "incomplete frame" errors
     if notification.batch_size == 0 || notification.compressed_transactions.is_empty() {
         // Preserve real metadata so receivers can mark presence for (slot, job_id)
-        return Ok(SerializableBatch {
+        return Ok(SerializableNotification::Batch(SerializableBatch {
             slot: notification.slot,
             timestamp: notification.timestamp,
             job_id: notification.job_id as usize,
             transactions: Vec::new(),
             worker_id: notification.worker_id,
-            is_final: false,
-        });
+        }));
     }
 
     // Decompress the transaction data
     let decompressed = zstd::decode_all(&notification.compressed_transactions[..])?;
 
     // Deserialize the batch
-    let mut batch: SerializableBatch = bincode::deserialize(&decompressed)?;
-    batch.is_final = notification.is_final;
+    let batch: SerializableBatch = bincode::deserialize(&decompressed)?;
 
-    Ok(batch)
+    Ok(SerializableNotification::Batch(batch))
 }
 
 pub struct TransactionBatchSubscriber {
     endpoint: String,
     client: Option<InfiniSvmServiceClient<Channel>>,
-    notification_sender: mpsc::UnboundedSender<SerializableBatch>,
-    _notification_receiver: mpsc::UnboundedReceiver<SerializableBatch>,
+    notification_sender: mpsc::UnboundedSender<SerializableNotification>,
+    _notification_receiver: mpsc::UnboundedReceiver<SerializableNotification>,
 }
 
 impl TransactionBatchSubscriber {
@@ -150,14 +145,14 @@ impl TransactionBatchSubscriber {
         &self,
         notification: CommitBatchNotification,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let batch = process_commit_notification(&notification)?;
+        let notification = process_commit_notification(&notification)?;
 
-        self.notification_sender.send(batch)?;
+        self.notification_sender.send(notification)?;
 
         Ok(())
     }
 
-    pub fn get_notification_receiver(&self) -> mpsc::UnboundedReceiver<SerializableBatch> {
+    pub fn get_notification_receiver(&self) -> mpsc::UnboundedReceiver<SerializableNotification> {
         let (_sender, receiver) = mpsc::unbounded_channel();
         // This is a simplified version - in a real implementation you'd want to
         // properly handle multiple receivers or use a broadcast channel
@@ -168,7 +163,7 @@ impl TransactionBatchSubscriber {
 // Utility function to start a subscriber as a background task
 pub async fn start_subscriber_task(
     grpc_endpoint: String,
-    mut batch_handler: impl FnMut(SerializableBatch) -> Result<(), String> + Send + 'static,
+    mut batch_handler: impl FnMut(SerializableNotification) -> Result<(), String> + Send + 'static,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut subscriber = TransactionBatchSubscriber::new(grpc_endpoint).await?;
     let mut receiver = subscriber.get_notification_receiver();

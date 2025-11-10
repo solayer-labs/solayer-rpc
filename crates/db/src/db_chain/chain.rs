@@ -281,8 +281,8 @@ impl<T: MergeableDB> DBChain<T> {
                             warn!(
                                 "Slot {} appears overfilled relative to plan; current shred count: {}, remaining plan count: {}",
                                 s,
-                                present_counts.get(&s).unwrap_or(&0),
-                                slot_plan_to_fill.get(&s).unwrap_or(&0)
+                                present_counts.get(&s).unwrap_or(&usize::MAX),
+                                slot_plan_to_fill.get(&s).unwrap_or(&usize::MAX)
                             );
                         } else {
                             *v -= 1;

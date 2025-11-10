@@ -29,8 +29,8 @@ tower-http = { workspace = true }
 serde = { workspace = true }
 prost = { workspace = true }
 reqwest = { workspace = true }
-rayon = { workspace = true }        
-indicatif = { workspace = true }    
+rayon = { workspace = true }
+indicatif = { workspace = true }
 futures-util = { workspace = true }
 hashbrown = { workspace = true }
 http = "1"

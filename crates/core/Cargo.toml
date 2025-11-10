@@ -56,7 +56,6 @@ tempfile = "3.10"
 [features]
 default = []
 no_bind_cpu = []
-track_memory = []
 in_memory_db = []
 mainnet = []
 devnet = []

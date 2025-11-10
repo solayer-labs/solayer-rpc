@@ -1,29 +1,29 @@
 use serde::{Deserialize, Serialize};
-
+use solana_hash::Hash;
 // Bincode-based gRPC message types
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StartReceivingSlotsRequest {}
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SlotDataResponse {
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RawSlot {
     pub slot: u64,
-    pub blockhash: Vec<u8>,
-    pub parent_blockhash: Vec<u8>,
+    pub hash: Hash,
+    pub parent_hash: Hash,
     pub timestamp: u64,
     pub job_ids: Vec<u64>,
+    pub is_finalized: bool,
+}
+
+impl RawSlot {
+    pub fn add_job_id(&mut self, job_id: u64) {
+        self.job_ids.push(job_id);
+        self.job_ids.sort_unstable();
+        self.job_ids.dedup();
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetLatestSlotRequest {}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GetLatestSlotResponse {
-    pub slot: u64,
-    pub hash: Vec<u8>,
-    pub parent_blockhash: Vec<u8>,
-    pub timestamp: u64,
-    pub job_ids: Vec<u64>,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransactionBatchRequest {}
@@ -55,6 +55,7 @@ pub struct CommitBatchNotification {
     pub compression_ratio: u64,
     pub job_id: u64,
     pub worker_id: usize,
+    pub job_ids: Vec<u64>,
     pub is_final: bool,
 }
 
@@ -77,7 +78,7 @@ pub mod grpc {
     // Service trait
     #[tonic::async_trait]
     pub trait InfiniSvmService: Send + Sync + 'static + Clone {
-        type StartReceivingSlotsStream: Stream<Item = Result<SlotDataResponse, tonic::Status>> + Send + 'static;
+        type StartReceivingSlotsStream: Stream<Item = Result<RawSlot, tonic::Status>> + Send + 'static;
         type SubscribeTransactionBatchesStream: Stream<Item = Result<CommitBatchNotification, tonic::Status>>
             + Send
             + 'static;
@@ -90,7 +91,7 @@ pub mod grpc {
         async fn get_latest_slot(
             &self,
             request: tonic::Request<GetLatestSlotRequest>,
-        ) -> Result<tonic::Response<GetLatestSlotResponse>, tonic::Status>;
+        ) -> Result<tonic::Response<RawSlot>, tonic::Status>;
 
         async fn subscribe_transaction_batches(
             &self,
@@ -185,7 +186,7 @@ pub mod grpc {
                             let stream = response.into_inner();
 
             // For streaming responses, directly map the stream into framed bytes to avoid extra hops
-            let body_stream = tokio_stream::StreamExt::map(stream, |item_res: Result<SlotDataResponse, tonic::Status>| {
+            let body_stream = tokio_stream::StreamExt::map(stream, |item_res: Result<RawSlot, tonic::Status>| {
                 match item_res {
                     Ok(item) => match bincode::serialize(&item) {
                         Ok(serialized) => {
@@ -494,7 +495,7 @@ pub mod grpc {
         pub async fn start_receiving_slots(
             &mut self,
             request: impl tonic::IntoRequest<StartReceivingSlotsRequest>,
-        ) -> Result<tonic::Response<BincodeStreaming<SlotDataResponse>>, tonic::Status> {
+        ) -> Result<tonic::Response<BincodeStreaming<RawSlot>>, tonic::Status> {
             // Create a bincode-based HTTP request
             let req = request.into_request();
             let request_data = req.into_inner();
@@ -564,7 +565,7 @@ pub mod grpc {
                                     let message_bytes = &buffer[5..5 + length];
 
                                     // Deserialize the message
-                                    match bincode::deserialize::<SlotDataResponse>(message_bytes) {
+                                    match bincode::deserialize::<RawSlot>(message_bytes) {
                                         Ok(response) => {
                                             if tx.send(Ok(response)).await.is_err() {
                                                 // Receiver dropped
@@ -614,7 +615,7 @@ pub mod grpc {
         pub async fn get_latest_slot(
             &mut self,
             request: impl tonic::IntoRequest<GetLatestSlotRequest>,
-        ) -> Result<tonic::Response<GetLatestSlotResponse>, tonic::Status> {
+        ) -> Result<tonic::Response<RawSlot>, tonic::Status> {
             // Create a bincode-based HTTP request
             let req = request.into_request();
             let request_data = req.into_inner();
@@ -663,7 +664,7 @@ pub mod grpc {
             };
 
             // Deserialize response with bincode
-            let response_data: GetLatestSlotResponse = bincode::deserialize(message_bytes)
+            let response_data: RawSlot = bincode::deserialize(message_bytes)
                 .map_err(|e| tonic::Status::internal(format!("Failed to deserialize response: {e}")))?;
 
             // Metrics: client unary bytes/messages and latency
@@ -773,6 +774,7 @@ pub mod grpc {
                                                     compression_ratio: legacy.compression_ratio,
                                                     job_id: 0,
                                                     worker_id: legacy.worker_id,
+                                                    job_ids: Vec::new(),
                                                     is_final: false,
                                                 },
                                             )
@@ -916,6 +918,7 @@ pub mod grpc {
                             compression_ratio: legacy.compression_ratio,
                             job_id: 0,
                             worker_id: legacy.worker_id,
+                            job_ids: Vec::new(),
                             is_final: false,
                         }
                     })

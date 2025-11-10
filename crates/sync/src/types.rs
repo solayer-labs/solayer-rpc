@@ -8,8 +8,19 @@ pub struct SerializableBatch {
     pub job_id: usize,
     pub transactions: Vec<SerializableTxRow>,
     pub worker_id: usize,
-    #[serde(default)]
-    pub is_final: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FinalizationMarker {
+    pub slot: u64,
+    pub timestamp: u64,
+    pub job_ids: Vec<u64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum SerializableNotification {
+    Finalization(FinalizationMarker),
+    Batch(SerializableBatch),
 }
 
 impl SerializableBatch {
@@ -21,7 +32,6 @@ impl SerializableBatch {
                 job_id: 0,
                 transactions: Vec::new(),
                 worker_id: 0,
-                is_final: false,
             };
         }
 
@@ -42,7 +52,23 @@ impl SerializableBatch {
             job_id: first_job.job_id,
             transactions,
             worker_id: first_job.worker_id,
-            is_final: false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_row(seq: u64) -> SerializableTxRow {
+        SerializableTxRow {
+            signature: vec![1, 2, 3],
+            transaction: vec![4, 5, 6],
+            result: vec![7, 8, 9],
+            slot: 99,
+            pre_accounts: vec![10, 11],
+            block_unix_timestamp: 123456,
+            seq_number: seq,
         }
     }
 }

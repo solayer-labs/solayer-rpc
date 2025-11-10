@@ -1,22 +1,20 @@
 use std::{collections::HashMap, sync::Arc};
 
-use infinisvm_types::sync::grpc::SlotDataResponse;
+use infinisvm_types::sync::grpc::RawSlot;
 
 const MAX_RETAINED_SLOTS: usize = 9000;
 
 pub struct SyncState {
-    cached_slots: HashMap<u64, Arc<SlotDataResponse>>,
+    cached_slots: HashMap<u64, Arc<RawSlot>>,
     max_slot: u64,
     min_slot: u64,
 
-    latest_slot_sender: crossbeam_channel::Sender<Arc<SlotDataResponse>>,
-    pub latest_slot: (u64, Vec<u8>, Vec<u8>, u64, Vec<u64>),
+    latest_slot_sender: crossbeam_channel::Sender<Arc<RawSlot>>,
+    pub latest_slot: RawSlot,
 }
 
 impl SyncState {
-    pub fn new(
-        latest_slot: (u64, Vec<u8>, Vec<u8>, u64, Vec<u64>),
-    ) -> (Self, crossbeam_channel::Receiver<Arc<SlotDataResponse>>) {
+    pub fn new(latest_slot: RawSlot) -> (Self, crossbeam_channel::Receiver<Arc<RawSlot>>) {
         let (latest_slot_sender, latest_slot_receiver) = crossbeam_channel::bounded(128);
 
         let state = Self {
@@ -31,31 +29,24 @@ impl SyncState {
         (state, latest_slot_receiver)
     }
 
-    pub fn get_slot(&self, slot: u64) -> Option<Arc<SlotDataResponse>> {
+    pub fn get_slot(&self, slot: u64) -> Option<Arc<RawSlot>> {
         self.cached_slots.get(&slot).cloned()
     }
 
-    pub fn notify_new_slot(&mut self, slot_data: (u64, Vec<u8>, Vec<u8>, u64, Vec<u64>)) {
-        let (slot, blockhash, parent_blockhash, timestamp, job_ids) = slot_data;
+    pub fn notify_new_slot(&mut self, slot_data: RawSlot) {
         while self.cached_slots.len() > MAX_RETAINED_SLOTS {
             self.cached_slots.remove(&self.min_slot);
             self.min_slot += 1;
         }
 
-        if slot > self.max_slot {
-            self.max_slot = slot;
+        if slot_data.slot > self.max_slot {
+            self.max_slot = slot_data.slot;
         }
-        if slot < self.min_slot {
-            self.min_slot = slot;
+        if slot_data.slot < self.min_slot {
+            self.min_slot = slot_data.slot;
         }
 
-        let arc_slot: Arc<SlotDataResponse> = Arc::new(SlotDataResponse {
-            slot,
-            blockhash,
-            parent_blockhash,
-            timestamp,
-            job_ids,
-        });
+        let arc_slot: Arc<RawSlot> = Arc::new(slot_data);
 
         self.cached_slots.insert(arc_slot.slot, arc_slot.clone());
         self.latest_slot_sender.send(arc_slot).unwrap();

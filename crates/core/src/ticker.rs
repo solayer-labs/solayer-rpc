@@ -22,13 +22,6 @@ impl Ticker {
         while !exit.load(Ordering::Relaxed) {
             if crossbeam_ticker.recv().is_ok() {
                 self.bank.write().unwrap().tick();
-
-                #[cfg(feature = "track_memory")]
-                {
-                    infinisvm_logger::info!("{:?} memory usage: {} MB", std::thread::current().name(), unsafe {
-                        crate::get_memory_usage() as f64 / 1024.0 / 1024.0
-                    });
-                }
             }
         }
     }

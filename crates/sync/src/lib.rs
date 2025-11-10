@@ -10,7 +10,7 @@ use std::{net::SocketAddr, path::Path, sync::Arc};
 pub use grpc::client::SyncClient;
 pub use http::start_http_server;
 use infinisvm_logger::{error, info};
-use infinisvm_types::sync::grpc::infini_svm_service_server::InfiniSvmServiceServer;
+use infinisvm_types::sync::{grpc::infini_svm_service_server::InfiniSvmServiceServer, RawSlot};
 use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair};
 pub use state::SyncState;
 use tokio::sync::RwLock;
@@ -22,7 +22,7 @@ pub async fn start_server(
     grpc_addr: SocketAddr,
     http_addr: SocketAddr,
     db_path: String,
-    latest_slot: (u64, Vec<u8>, Vec<u8>, u64, Vec<u64>),
+    latest_slot: RawSlot,
     broadcaster: Arc<TransactionBatchBroadcaster>,
     // If provided, enables TLS for gRPC using a self-signed Ed25519 certificate generated
     // from the given private key material. The value can be either a file path to a PEM-encoded

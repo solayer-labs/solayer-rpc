@@ -4,8 +4,8 @@ use hashbrown::HashMap;
 use infinisvm_logger::{error, info};
 use infinisvm_types::sync::{
     grpc::{infini_svm_service_server::InfiniSvmService, InfiniSvmServiceServer},
-    CommitBatchNotification, GetLatestSlotRequest, GetLatestSlotResponse, GetTransactionBatchRequest, SlotDataResponse,
-    StartReceivingSlotsRequest, TransactionBatchRequest,
+    CommitBatchNotification, GetLatestSlotRequest, GetTransactionBatchRequest, RawSlot, StartReceivingSlotsRequest,
+    TransactionBatchRequest,
 };
 use metrics::{counter, gauge, histogram};
 use tokio::sync::{broadcast, mpsc, RwLock};
@@ -17,7 +17,7 @@ use crate::{grpc::TransactionBatchBroadcaster, state::SyncState};
 #[derive(Clone)]
 pub struct InfiniSVMServiceImpl {
     sync_state: Arc<RwLock<SyncState>>,
-    slot_broadcast_sender: broadcast::Sender<Arc<SlotDataResponse>>,
+    slot_broadcast_sender: broadcast::Sender<Arc<RawSlot>>,
     batch_broadcaster: Arc<TransactionBatchBroadcaster>,
     recent_batches: Arc<RwLock<HashMap<(u64, u64), (Arc<CommitBatchNotification>, Instant)>>>,
 }
@@ -25,10 +25,10 @@ pub struct InfiniSVMServiceImpl {
 impl InfiniSVMServiceImpl {
     pub async fn new(
         sync_state: Arc<RwLock<SyncState>>,
-        latest_slot_receiver: crossbeam_channel::Receiver<Arc<SlotDataResponse>>,
+        latest_slot_receiver: crossbeam_channel::Receiver<Arc<RawSlot>>,
         batch_broadcaster: Arc<TransactionBatchBroadcaster>,
     ) -> Self {
-        let (slot_broadcast_sender, mut slot_broadcast_receiver) = broadcast::channel::<Arc<SlotDataResponse>>(128);
+        let (slot_broadcast_sender, mut slot_broadcast_receiver) = broadcast::channel::<Arc<RawSlot>>(128);
 
         tokio::spawn({
             async move {
@@ -124,7 +124,7 @@ impl InfiniSVMServiceImpl {
 
 #[tonic::async_trait]
 impl InfiniSvmService for InfiniSVMServiceImpl {
-    type StartReceivingSlotsStream = Pin<Box<dyn tokio_stream::Stream<Item = Result<SlotDataResponse, Status>> + Send>>;
+    type StartReceivingSlotsStream = Pin<Box<dyn tokio_stream::Stream<Item = Result<RawSlot, Status>> + Send>>;
     type SubscribeTransactionBatchesStream =
         Pin<Box<dyn tokio_stream::Stream<Item = Result<CommitBatchNotification, Status>> + Send>>;
 
@@ -158,22 +158,13 @@ impl InfiniSvmService for InfiniSVMServiceImpl {
         Ok(Response::new(Box::pin(stream)))
     }
 
-    async fn get_latest_slot(
-        &self,
-        _request: Request<GetLatestSlotRequest>,
-    ) -> Result<Response<GetLatestSlotResponse>, Status> {
+    async fn get_latest_slot(&self, _request: Request<GetLatestSlotRequest>) -> Result<Response<RawSlot>, Status> {
         let start = Instant::now();
-        let (slot, hash, parent_blockhash, timestamp, job_ids) = self.sync_state.read().await.latest_slot.clone();
-        let response = GetLatestSlotResponse {
-            slot,
-            hash,
-            parent_blockhash,
-            timestamp,
-            job_ids,
-        };
+        let raw_slot = self.sync_state.read().await.latest_slot.clone();
+
         let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
         histogram!("grpc_server_unary_latency_ms", "method" => "GetLatestSlot").record(elapsed_ms);
-        Ok(Response::new(response))
+        Ok(Response::new(raw_slot))
     }
 
     async fn subscribe_transaction_batches(

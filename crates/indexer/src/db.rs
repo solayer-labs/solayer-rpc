@@ -2320,19 +2320,3 @@ impl RpcIndexer for NoopIndexer {
         Ok(None)
     }
 }
-
-/// Reports all metrics for both indexers
-/// This function can be called periodically to report current metrics
-pub fn report_all_metrics<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB>(
-    indexer: &DatabaseIndexer<TX, SLOT, SIGNATURE, ACCOUNT>,
-) {
-    indexer.report_metrics();
-}
-
-/// Reports all metrics for multi database indexer
-/// This function can be called periodically to report current metrics
-pub fn report_all_multi_metrics<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB>(
-    indexer: &MultiDatabaseIndexer<TX, SLOT, SIGNATURE, ACCOUNT>,
-) {
-    indexer.report_metrics();
-}

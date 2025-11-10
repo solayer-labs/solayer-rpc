@@ -50,17 +50,12 @@ jemalloc_pprof = { version = "0.7", features = [
 url = "2.5.7"
 
 
-
 [features]
-pyroscope = [
-    "dep:pyroscope",
-    "dep:pyroscope_pprofrs",
-]
+pyroscope = ["dep:pyroscope", "dep:pyroscope_pprofrs"]
 
-track_memory = ["dep:cap"]
 track_oom = [
     "tikv-jemallocator/profiling",
     "tikv-jemallocator/unprefixed_malloc_on_supported_platforms",
     "dep:axum",
-    "dep:jemalloc_pprof"
+    "dep:jemalloc_pprof",
 ]

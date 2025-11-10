@@ -18,8 +18,3 @@ pub mod indexer;
 pub mod metrics;
 
 pub mod subscription;
-
-#[cfg(feature = "track_memory")]
-extern "C" {
-    fn get_memory_usage() -> usize;
-}
