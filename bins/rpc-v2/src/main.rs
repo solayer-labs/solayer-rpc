@@ -97,7 +97,14 @@ struct Args {
     #[arg(long, default_value = "")]
     sequencer_rpc_server_addr: String,
 
-    #[arg(long, default_value = "s3://infinisvm-dev/")]
+    #[arg(long, default_value = "/mnt/data/slots-internal")]
+    pub local_slots_path: PathBuf,
+
+    /// S3 region (optional) for storing slots
+    #[arg(long, default_value = "us-west-2")]
+    pub s3_region: Option<String>,
+
+    #[arg(long, default_value = "s3://solayer-devnet/")]
     pub s3_path: String,
 
     /// S3 access key id (optional) for storing slots
@@ -131,10 +138,13 @@ async fn create_indexer(args: &Args) -> (Arc<Mutex<dyn Indexer>>, Arc<dyn RpcInd
         return (indexer, rpc_indexer);
     }
 
+    // Region will be determined from S3_REGION env var or default to us-west-2
     let s3 = S3FsClient::new_with_credentials(
-        PathBuf::from(args.s3_path.clone()),
+        args.local_slots_path.clone(),
         args.s3_access_key_id.clone(),
         args.s3_secret_key.clone(),
+        args.s3_path.clone(),
+        args.s3_region.clone(),
     );
 
     let rep_factor = args.cassandra_replication_factor.unwrap_or(1);

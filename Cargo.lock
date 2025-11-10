@@ -2762,6 +2762,7 @@ dependencies = [
  "tonic",
  "tower 0.4.13",
  "tower-http",
+ "walkdir",
  "zstd 0.13.3",
 ]
 

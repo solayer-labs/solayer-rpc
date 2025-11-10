@@ -14,6 +14,8 @@ use solana_sdk::{account::AccountSharedData, pubkey::Pubkey};
 use tempfile::tempdir;
 use tokio::{fs, process::Command, sync::mpsc};
 
+use crate::{http::BatchSlotsResponse, slots::SlotData};
+
 const MIN_ARIA2C_VERSION: (u32, u32, u32) = (1, 35, 0);
 
 #[derive(Debug, Deserialize)]
@@ -181,6 +183,91 @@ impl HttpClient {
         let response = self.client.get(&url).send().await?;
         let bytes = response.bytes().await?;
         Ok(bytes.to_vec())
+    }
+
+    /// Get a single slot's data
+    pub async fn get_slot(&self, slot: u64) -> Result<Option<SlotData>> {
+        let url = format!("{}/solayer/slots/{}", self.base_url, slot);
+        info!("Getting slot {} from {}", slot, url);
+        let response = self.client.get(&url).send().await?;
+
+        let status = response.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+
+        if !status.is_success() {
+            return Err(eyre::eyre!("Failed to fetch slot {} (status {})", slot, status));
+        }
+
+        let slot_data = response.json::<SlotData>().await?;
+        Ok(Some(slot_data))
+    }
+
+    /// Get multiple slots' data in a range
+    pub async fn get_slots(&self, min_slot: u64, max_slot: u64) -> Result<HashMap<u64, SlotData>> {
+        let url = format!(
+            "{}/solayer/slots?min_slot={}&max_slot={}",
+            self.base_url, min_slot, max_slot
+        );
+        info!("Getting slots {}-{} from {}", min_slot, max_slot, url);
+        let response = self.client.get(&url).send().await?;
+
+        let status = response.status();
+        if !status.is_success() {
+            return Err(eyre::eyre!(
+                "Failed to fetch slots {}-{} (status {})",
+                min_slot,
+                max_slot,
+                status
+            ));
+        }
+
+        let batch_response = response.json::<BatchSlotsResponse>().await?;
+        Ok(batch_response.slots.into_iter().collect())
+    }
+
+    /// Get a slot's info file as binary data
+    pub async fn get_slot_info(&self, slot: u64) -> Result<Option<Vec<u8>>> {
+        let url = format!("{}/solayer/slots/{}/info", self.base_url, slot);
+        info!("Getting slot {} info from {}", slot, url);
+        let response = self.client.get(&url).send().await?;
+
+        let status = response.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+
+        if !status.is_success() {
+            return Err(eyre::eyre!("Failed to fetch slot info {} (status {})", slot, status));
+        }
+
+        let bytes = response.bytes().await?;
+        Ok(Some(bytes.to_vec()))
+    }
+
+    /// Get a slot's shard file as binary data
+    pub async fn get_slot_shard(&self, slot: u64, shard: u64) -> Result<Option<Vec<u8>>> {
+        let url = format!("{}/solayer/slots/{}/shards/{}", self.base_url, slot, shard);
+        info!("Getting slot {} shard {} from {}", slot, shard, url);
+        let response = self.client.get(&url).send().await?;
+
+        let status = response.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+
+        if !status.is_success() {
+            return Err(eyre::eyre!(
+                "Failed to fetch slot shard {}:{} (status {})",
+                slot,
+                shard,
+                status
+            ));
+        }
+
+        let bytes = response.bytes().await?;
+        Ok(Some(bytes.to_vec()))
     }
 }
 

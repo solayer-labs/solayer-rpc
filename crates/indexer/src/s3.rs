@@ -1,4 +1,5 @@
 use std::{
+    error::Error as StdError,
     fmt,
     path::PathBuf,
     sync::{Arc, Mutex, OnceLock, RwLock},
@@ -28,6 +29,8 @@ struct S3FsClientInner {
     access_key_id: Option<String>,
     secret_key: Option<String>,
     s3_client: Mutex<Option<AmazonS3>>,
+    s3_path: String,
+    region: Option<String>,
     uploader: Uploader,
 }
 
@@ -45,21 +48,28 @@ struct UploadTask {
 }
 
 pub const REGION: &str = "auto";
-pub const BUCKET_NAME: &str = "sequencer-slots";
 const DEFAULT_UPLOAD_THREADS: usize = 8;
 
 impl S3FsClient {
-    pub fn new(local_tmp_path: PathBuf) -> Self {
-        Self::new_with_credentials(local_tmp_path, None, None)
+    pub fn new(local_tmp_path: PathBuf, s3_bucket_name: String) -> Self {
+        Self::new_with_credentials(local_tmp_path, None, None, s3_bucket_name, None)
     }
 
     pub fn new_with_credentials(
         local_tmp_path: PathBuf,
         access_key_id: Option<String>,
         secret_key: Option<String>,
+        s3_path: String,
+        region: Option<String>,
     ) -> Self {
         Self {
-            inner: Arc::new(S3FsClientInner::new(local_tmp_path, access_key_id, secret_key)),
+            inner: Arc::new(S3FsClientInner::new(
+                local_tmp_path,
+                access_key_id,
+                secret_key,
+                s3_path,
+                region,
+            )),
         }
     }
 
@@ -190,13 +200,21 @@ impl fmt::Debug for S3FsClient {
 }
 
 impl S3FsClientInner {
-    fn new(local_tmp_path: PathBuf, access_key_id: Option<String>, secret_key: Option<String>) -> Self {
+    fn new(
+        local_tmp_path: PathBuf,
+        access_key_id: Option<String>,
+        secret_key: Option<String>,
+        s3_path: String,
+        region: Option<String>,
+    ) -> Self {
         Self {
             local_tmp_path,
             lock: RwLock::new(HashMap::new()),
             access_key_id,
             secret_key,
             s3_client: Mutex::new(None),
+            s3_path,
+            region,
             uploader: Uploader::new(resolved_worker_count()),
         }
     }
@@ -227,22 +245,26 @@ impl S3FsClientInner {
             return Ok(None);
         };
 
-        let bucket = format!(
-            "{}{}",
-            BUCKET_NAME,
-            if std::env::var("ENV").unwrap_or_else(|_| "dev".to_string()) == "dev" {
-                "-dev"
-            } else {
-                ""
-            }
-        );
+        // Determine region: use provided region, then env var, then default to us-west-2
+        let region = self
+            .region
+            .clone()
+            .or_else(|| std::env::var("S3_REGION").ok())
+            .unwrap_or_else(|| "us-west-2".to_string());
 
-        let s3 = AmazonS3Builder::new()
-            .with_region(REGION)
+        let mut builder = AmazonS3Builder::new()
+            .with_region(region.clone())
             .with_access_key_id(access_key_id)
             .with_secret_access_key(secret_key)
-            .with_bucket_name(bucket)
-            .with_endpoint("s3.us-west-2.amazonaws.com")
+            .with_bucket_name(self.s3_path.clone());
+
+        // Only set endpoint if explicitly provided via environment variable
+        // The object_store library constructs the endpoint automatically for standard AWS regions
+        if let Ok(endpoint) = std::env::var("S3_ENDPOINT") {
+            builder = builder.with_endpoint(endpoint);
+        }
+
+        let s3 = builder
             .build()
             .map_err(|e| eyre::eyre!("Failed to create S3 client: {}", e))?;
 
@@ -313,10 +335,15 @@ fn process_upload(runtime: &Runtime, client: &AmazonS3, key: String, local_path:
     let location_repr = location.to_string();
 
     runtime.block_on(async {
-        client
-            .put(&location, Bytes::from(data).into())
-            .await
-            .map_err(|e| eyre::eyre!("Failed to upload {location_repr} to S3: {e}"))
+        client.put(&location, Bytes::from(data).into()).await.map_err(|e| {
+            // Log detailed error information for debugging
+            let error_msg = format!("Failed to upload {location_repr} to S3: {e:?}");
+            if let Some(source) = e.source() {
+                eyre::eyre!("{} (source: {})", error_msg, source)
+            } else {
+                eyre::eyre!("{}", error_msg)
+            }
+        })
     })?;
 
     if let Err(err) = std::fs::remove_file(&local_path) {

@@ -1,6 +1,7 @@
 pub mod grpc;
 pub mod http;
 pub mod http_client;
+pub mod slots;
 pub mod state;
 pub mod types;
 
@@ -22,6 +23,7 @@ pub async fn start_server(
     grpc_addr: SocketAddr,
     http_addr: SocketAddr,
     db_path: String,
+    slots_path: String,
     latest_slot: RawSlot,
     broadcaster: Arc<TransactionBatchBroadcaster>,
     // If provided, enables TLS for gRPC using a self-signed Ed25519 certificate generated
@@ -81,7 +83,7 @@ pub async fn start_server(
         }
     });
 
-    tokio::spawn(start_http_server(http_addr, db_path.clone(), sync_state.clone()));
+    tokio::spawn(start_http_server(http_addr, db_path.clone(), slots_path.clone(), sync_state.clone()));
 
     Ok(sync_state)
 }
