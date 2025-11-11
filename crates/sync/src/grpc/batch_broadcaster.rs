@@ -99,24 +99,26 @@ impl TransactionBatchBroadcaster {
                 );
                 metrics::counter!("broadcast_batches_all_failed_total").increment(1);
 
-                let notification = infinisvm_types::sync::CommitBatchNotification {
-                    slot,
-                    timestamp,
-                    batch_size: 0,
-                    compressed_transactions: Vec::new(),
-                    compression_ratio: 0,
-                    job_id: job_id as u64,
-                    worker_id: 0,
-                    job_ids: Vec::new(),
-                    is_final: false,
-                };
+                let notification = infinisvm_types::sync::CommitBatchNotification::Batch(
+                    infinisvm_types::sync::BatchData {
+                        slot,
+                        timestamp,
+                        batch_size: 0,
+                        compressed_transactions: Vec::new(),
+                        compression_ratio: 0,
+                        job_id: job_id as u64,
+                        worker_id: 0,
+                    },
+                );
 
                 let processing_time = start_time.elapsed();
-                infinisvm_logger::debug!(
-                    "Serialized batch in {:?}, compression ratio: {}%",
-                    processing_time,
-                    notification.compression_ratio
-                );
+                if let CommitBatchNotification::Batch(ref batch_data) = notification {
+                    infinisvm_logger::debug!(
+                        "Serialized batch in {:?}, compression ratio: {}%",
+                        processing_time,
+                        batch_data.compression_ratio
+                    );
+                }
 
                 let notification = Arc::new(notification);
                 return self
@@ -138,10 +140,12 @@ impl TransactionBatchBroadcaster {
         let notification = Self::serialize_and_compress_batch(filtered)?;
 
         let processing_time = start_time.elapsed();
-        debug!(
-            "Serialized batch in {:?}, compression ratio: {}%",
-            processing_time, notification.compression_ratio
-        );
+        if let CommitBatchNotification::Batch(ref batch_data) = notification {
+            debug!(
+                "Serialized batch in {:?}, compression ratio: {}%",
+                processing_time, batch_data.compression_ratio
+            );
+        }
 
         // Send to broadcaster threads (non-blocking)
         let notification = Arc::new(notification);
@@ -150,18 +154,22 @@ impl TransactionBatchBroadcaster {
             .map_err(|e| format!("Failed to send notification to broadcaster: {e}"))
     }
 
-    pub fn broadcast_finalization(&self, slot: u64, job_ids: Vec<u64>) -> Result<(), String> {
-        let notification = Arc::new(CommitBatchNotification {
-            slot,
-            timestamp: 0,
-            batch_size: 0,
-            compressed_transactions: Vec::new(),
-            compression_ratio: 0,
-            job_id: u64::MAX,
-            worker_id: usize::MAX,
-            job_ids,
-            is_final: true,
-        });
+    pub fn broadcast_finalization(
+        &self,
+        slot: u64,
+        job_ids: Vec<u64>,
+        hash: solana_sdk::hash::Hash,
+        parent_hash: solana_sdk::hash::Hash,
+    ) -> Result<(), String> {
+        let notification = Arc::new(CommitBatchNotification::Finalization(
+            infinisvm_types::sync::FinalizationData {
+                slot,
+                timestamp: 0,
+                job_ids,
+                hash,
+                parent_hash,
+            },
+        ));
 
         self.notification_sender
             .send(notification)
@@ -194,10 +202,20 @@ impl TransactionBatchBroadcaster {
             match notification_broadcast.send(notification.clone()) {
                 Ok(subscriber_count) => {
                     let broadcast_time = start_time.elapsed();
-                    debug!(
-                        "Broadcaster {} sent batch (slot: {}, {} transactions) to {} subscribers in {:?}",
-                        broadcaster_id, notification.slot, notification.batch_size, subscriber_count, broadcast_time
-                    );
+                    match notification.as_ref() {
+                        CommitBatchNotification::Batch(batch_data) => {
+                            debug!(
+                                "Broadcaster {} sent batch (slot: {}, {} transactions) to {} subscribers in {:?}",
+                                broadcaster_id, batch_data.slot, batch_data.batch_size, subscriber_count, broadcast_time
+                            );
+                        }
+                        CommitBatchNotification::Finalization(finalization_data) => {
+                            debug!(
+                                "Broadcaster {} sent finalization (slot: {}) to {} subscribers in {:?}",
+                                broadcaster_id, finalization_data.slot, subscriber_count, broadcast_time
+                            );
+                        }
+                    }
                 }
                 Err(_) => {
                     debug!("Broadcaster {} - no active subscribers", broadcaster_id);
@@ -237,7 +255,7 @@ impl TransactionBatchBroadcaster {
             compression_ratio
         );
 
-        Ok(CommitBatchNotification {
+        Ok(CommitBatchNotification::Batch(infinisvm_types::sync::BatchData {
             slot: batch[0].slot,
             timestamp: batch[0].timestamp,
             batch_size: batch.len() as u32,
@@ -245,9 +263,7 @@ impl TransactionBatchBroadcaster {
             compression_ratio: compression_ratio as u64,
             job_id: batch[0].job_id as u64,
             worker_id: batch[0].worker_id,
-            job_ids: Vec::new(),
-            is_final: false,
-        })
+        }))
     }
 }
 

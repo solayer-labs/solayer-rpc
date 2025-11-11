@@ -58,38 +58,41 @@ impl InfiniSVMServiceImpl {
                 loop {
                     match internal_batch_rx.recv().await {
                         Ok(batch_notification) => {
-                            let key = (batch_notification.slot, batch_notification.job_id);
-                            info!(
-                                "Adding batch to cache: slot={}, job_id={}",
-                                batch_notification.slot, batch_notification.job_id
-                            );
-                            if batch_notification.slot == 0 || batch_notification.job_id == 0 {
+                            // Only cache Batch notifications, not Finalization
+                            if let CommitBatchNotification::Batch(batch_data) = batch_notification.as_ref() {
+                                let key = (batch_data.slot, batch_data.job_id);
                                 info!(
-                                    "Cached empty/placeholder batch (slot={}, job_id={}, size={})",
-                                    batch_notification.slot, batch_notification.job_id, batch_notification.batch_size
+                                    "Adding batch to cache: slot={}, job_id={}",
+                                    batch_data.slot, batch_data.job_id
                                 );
-                            }
-                            let mut map = recent_batches_clone.write().await;
-                            map.insert(key, (batch_notification.clone(), Instant::now()));
-                            gauge!("grpc_cache_size").set(map.len() as f64);
-                            if map.len() > 10000 {
-                                let mut removed = 0usize;
-                                let now = Instant::now();
-                                let old_entries: Vec<_> = map
-                                    .iter()
-                                    .filter(|(_, (_, timestamp))| now.duration_since(*timestamp).as_secs() > 300)
-                                    .map(|((slot, job_id), _)| (*slot, *job_id))
-                                    .collect();
-
-                                for (slot, job_id) in old_entries {
-                                    info!("Evicting batch from cache: slot={}, job_id={}", slot, job_id);
-                                    map.remove(&(slot, job_id));
-                                    removed += 1;
+                                if batch_data.slot == 0 || batch_data.job_id == 0 {
+                                    info!(
+                                        "Cached empty/placeholder batch (slot={}, job_id={}, size={})",
+                                        batch_data.slot, batch_data.job_id, batch_data.batch_size
+                                    );
                                 }
-
-                                info!("Pruned recent_batches cache by {} entries", removed);
-                                counter!("grpc_cache_evictions_total").increment(removed as u64);
+                                let mut map = recent_batches_clone.write().await;
+                                map.insert(key, (batch_notification.clone(), Instant::now()));
                                 gauge!("grpc_cache_size").set(map.len() as f64);
+                                if map.len() > 10000 {
+                                    let mut removed = 0usize;
+                                    let now = Instant::now();
+                                    let old_entries: Vec<_> = map
+                                        .iter()
+                                        .filter(|(_, (_, timestamp))| now.duration_since(*timestamp).as_secs() > 300)
+                                        .map(|((slot, job_id), _)| (*slot, *job_id))
+                                        .collect();
+
+                                    for (slot, job_id) in old_entries {
+                                        info!("Evicting batch from cache: slot={}, job_id={}", slot, job_id);
+                                        map.remove(&(slot, job_id));
+                                        removed += 1;
+                                    }
+
+                                    info!("Pruned recent_batches cache by {} entries", removed);
+                                    counter!("grpc_cache_evictions_total").increment(removed as u64);
+                                    gauge!("grpc_cache_size").set(map.len() as f64);
+                                }
                             }
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {

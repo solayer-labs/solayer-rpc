@@ -47,7 +47,7 @@ pub struct TransactionInfo {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CommitBatchNotification {
+pub struct BatchData {
     pub slot: u64,
     pub timestamp: u64,
     pub batch_size: u32,
@@ -55,8 +55,21 @@ pub struct CommitBatchNotification {
     pub compression_ratio: u64,
     pub job_id: u64,
     pub worker_id: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FinalizationData {
+    pub slot: u64,
+    pub timestamp: u64,
     pub job_ids: Vec<u64>,
-    pub is_final: bool,
+    pub hash: Hash,
+    pub parent_hash: Hash,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum CommitBatchNotification {
+    Batch(BatchData),
+    Finalization(FinalizationData),
 }
 
 // Simple gRPC service definitions for bincode
@@ -766,7 +779,7 @@ pub mod grpc {
                                                 compression_ratio: u64,
                                             }
                                             bincode::deserialize::<LegacyCommitBatchNotification>(message_bytes).map(
-                                                |legacy| CommitBatchNotification {
+                                                |legacy| CommitBatchNotification::Batch(BatchData {
                                                     slot: legacy.slot,
                                                     timestamp: legacy.timestamp,
                                                     batch_size: legacy.batch_size,
@@ -774,9 +787,7 @@ pub mod grpc {
                                                     compression_ratio: legacy.compression_ratio,
                                                     job_id: 0,
                                                     worker_id: legacy.worker_id,
-                                                    job_ids: Vec::new(),
-                                                    is_final: false,
-                                                },
+                                                }),
                                             )
                                         });
 
@@ -910,7 +921,7 @@ pub mod grpc {
                         compression_ratio: u64,
                     }
                     bincode::deserialize::<LegacyCommitBatchNotification>(message_bytes).map(|legacy| {
-                        CommitBatchNotification {
+                        CommitBatchNotification::Batch(BatchData {
                             slot: legacy.slot,
                             timestamp: legacy.timestamp,
                             batch_size: legacy.batch_size,
@@ -918,9 +929,7 @@ pub mod grpc {
                             compression_ratio: legacy.compression_ratio,
                             job_id: 0,
                             worker_id: legacy.worker_id,
-                            job_ids: Vec::new(),
-                            is_final: false,
-                        }
+                        })
                     })
                 })
                 .map_err(|e| tonic::Status::internal(format!("Failed to deserialize response: {e}")))?;

@@ -48,7 +48,8 @@ pub(super) struct TxProcessorConfig {
     pub finalized_job_ids: Arc<RwLock<HashMap<u64, Vec<u64>>>>,
     pub refetch_pool: Arc<Vec<tokio::sync::Mutex<SyncClient>>>,
     pub blockhash_to_signatures: Arc<RwLock<HashMap<Hash, Vec<Signature>>>>,
-    pub pending_signature_count: Arc<AtomicU64>,
+    pub current_slot: Arc<AtomicU64>,
+    pub pending_batches: Arc<DashMap<(u64, u64), SerializableBatch>>,
 }
 
 pub(super) fn spawn_tx_processors(config: TxProcessorConfig) -> Vec<JoinHandle<()>> {
@@ -66,7 +67,8 @@ pub(super) fn spawn_tx_processors(config: TxProcessorConfig) -> Vec<JoinHandle<(
         finalized_job_ids,
         refetch_pool,
         blockhash_to_signatures,
-        pending_signature_count,
+        current_slot,
+        pending_batches,
     } = config;
 
     let mut handles = Vec::new();
@@ -87,7 +89,9 @@ pub(super) fn spawn_tx_processors(config: TxProcessorConfig) -> Vec<JoinHandle<(
         let refetch_pool_clone = refetch_pool.clone();
         let refetch_semaphore = Arc::new(Semaphore::new(16));
         let blockhash_to_signatures_clone = blockhash_to_signatures.clone();
-        let pending_signature_count_clone = pending_signature_count.clone();
+        let current_slot_tracker = current_slot.clone();
+        let indexer_for_block = indexer_clone.clone();
+        let pending_batches_clone = pending_batches.clone();
         let handle = tokio::spawn({
             let indexer = indexer_clone;
             async move {
@@ -99,17 +103,6 @@ pub(super) fn spawn_tx_processors(config: TxProcessorConfig) -> Vec<JoinHandle<(
                 //    - c. flush (empty batch)
                 // 2. refetch path
                 while let Some(tx_batch) = tx_receiver.recv().await {
-                    counter!("tx_batches_received_total").increment(1);
-                    histogram!("tx_batch_jobs_count").record(tx_batch.batch_size as f64);
-                    info!(
-                        "Processor {}: Received tx-batch slot={} job_id={} size={} comp_ratio={}",
-                        i, tx_batch.slot, tx_batch.job_id, tx_batch.batch_size, tx_batch.compression_ratio
-                    );
-
-                    let info_slot = tx_batch.slot;
-                    let info_job_id = tx_batch.job_id;
-                    let info_batch_size = tx_batch.batch_size;
-
                     let parsed = match process_commit_notification(tx_batch.as_ref()) {
                         Ok(parsed) => parsed,
                         Err(e) => {
@@ -118,7 +111,7 @@ pub(super) fn spawn_tx_processors(config: TxProcessorConfig) -> Vec<JoinHandle<(
                         }
                     };
 
-                    let mut parsed = match parsed {
+                    let parsed = match parsed {
                         SerializableNotification::Finalization(marker) => {
                             info!("Processor {}: Received finalization marker for slot {}", i, marker.slot);
                             let mut marker_job_ids = marker.job_ids.clone();
@@ -144,110 +137,110 @@ pub(super) fn spawn_tx_processors(config: TxProcessorConfig) -> Vec<JoinHandle<(
                                 &finalized_timestamps_clone,
                                 &refetch_pool_clone,
                                 &refetch_semaphore,
+                                &pending_batches_clone,
+                                &blockhash_to_signatures_clone,
                                 i,
                             )
                             .await
                             {
                                 error!("Processor {}: Failed to finalize slot {}: {}", i, marker.slot, e);
                             }
+                            // Flush blockhash_to_signatures and call bank.tick_as_slave()
+                            let blockhash_to_signatures = {
+                                let mut guard = blockhash_to_signatures_clone.write().unwrap();
+                                std::mem::take(&mut *guard)
+                            };
+
+                            // Call bank.tick_as_slave() to update slot/hash/timestamp
+                            {
+                                let mut bank_writer = bank_clone.write().unwrap();
+                                bank_writer.tick_as_slave(&infinisvm_core::bank::RawSlot {
+                                    slot: marker.slot,
+                                    hash: marker.hash,
+                                    parent_hash: marker.parent_hash,
+                                    timestamp: marker.timestamp,
+                                    job_ids: vec![],
+                                    is_finalized: false,
+                                });
+                                if !blockhash_to_signatures.is_empty() {
+                                    bank_writer.commit_blockhash_to_signatures(blockhash_to_signatures);
+                                }
+                                // Update current slot tracker after bank is updated
+                                current_slot_tracker.store(marker.slot, Ordering::SeqCst);
+                            }
+
+                            // Handle DB merging every 4 slots
+                            if marker.slot > 0 && marker.slot % 4 == 0 {
+                                info!("Processor {}: Attempting merge at slot {}", i, marker.slot);
+                                counter!("cold_start_merge_attempts_total").increment(1);
+                                let t_merge = Instant::now();
+                                let merge_result = {
+                                    let mut db_chain = db_chain_ref_clone.write().unwrap();
+                                    info!("Acquired lock. Pre-merge: {}", db_chain.summary());
+                                    let plan = finalized_job_ids_clone.read().unwrap().clone();
+                                    let res = db_chain.merge(plan);
+                                    info!("Merge finished; Post-merge: {}", db_chain.summary());
+                                    res
+                                };
+                                let latest_slot = match merge_result {
+                                    Ok(latest_slot) => latest_slot,
+                                    Err(e) => {
+                                        error!("Processor {}: Error merging db_chain at slot {}: {}", i, marker.slot, e);
+                                        counter!("cold_start_merge_errors_total").increment(1);
+                                        None // Continue processing even if merge fails
+                                    }
+                                };
+                                histogram!("cold_start_merge_attempt_ms").record(t_merge.elapsed().as_secs_f64() * 1000.0);
+                                if let Some(latest_slot) = latest_slot {
+                                    info!("Processor {}: Successfully merged db_chain to slot {}", i, latest_slot);
+                                    counter!("cold_start_merge_success_total").increment(1);
+                                    {
+                                        let mut guard = finalized_job_ids_clone.write().unwrap();
+                                        let before = guard.len();
+                                        guard.retain(|slot_key, _| *slot_key > latest_slot);
+                                        if before != guard.len() {
+                                            counter!("finalized_job_ids_pruned_total").increment((before - guard.len()) as u64);
+                                        }
+                                        gauge!("finalized_job_ids_len").set(guard.len() as f64);
+                                    }
+                                } else {
+                                    info!(
+                                        "Processor {}: Merge returned None at slot {} (no confirmed slot yet)",
+                                        i, marker.slot
+                                    );
+                                }
+                            }
+
+                            // Index block
+                            let t_index_block = Instant::now();
+                            indexer_for_block
+                                .lock()
+                                .await
+                                .index_block(marker.slot, marker.timestamp, marker.hash, marker.parent_hash);
+                            histogram!("slot_index_block_ms").record(t_index_block.elapsed().as_secs_f64() * 1000.0);
+                            
                             continue;
                         }
                         SerializableNotification::Batch(batch) => batch,
                     };
 
-                    // not finalized yet. stage
-                    let job_id_u64 = parsed.job_id as u64;
-                    let mut target_slot = parsed.slot;
-
-                    // ?
-                    let existing_slot_hint = {
-                        let chain = db_chain_ref_clone.read().unwrap();
-                        chain.find_shred_slot(job_id_u64)
-                    };
-                    if let Some(existing_slot) = existing_slot_hint {
-                        if existing_slot != target_slot {
-                            info!(
-                                "Processor {}: adjusting target slot for job {} from {} to {} based on current chain placement",
-                                i, job_id_u64, target_slot, existing_slot
-                            );
-                            target_slot = existing_slot;
-                        }
-                    }
-
-                    // Keep the original slot around for cleanup; target_slot may differ.
-                    let old_slot = parsed.slot;
-                    parsed.slot = target_slot;
-
-                    // empty batch. could be flush or just real empty batch
-                    if parsed.transactions.is_empty() {
-                        counter!("tx_batch_empty_total").increment(1);
+                    // Check if slot is already finalized - add to pending pool instead of staging
+                    // Check both finalized_slots (for recent slots) and current_slot (for pruned ancient slots)
+                    let current_slot_value = current_slot_tracker.load(Ordering::SeqCst) - 1;
+                    if parsed.slot < current_slot_value || finalized_slots_clone.contains(&parsed.slot) {
                         info!(
-                            "Processor {}: Empty batch after parse for slot={} job_id={} (orig_size={}) — marking presence",
-                            i,
-                            info_slot,
-                            info_job_id,
-                            info_batch_size
+                            "Processor {}: Batch for already-finalized slot {} (job_id={}, current_slot={}) - adding to pending pool",
+                            i, parsed.slot, parsed.job_id, current_slot_value
                         );
-                        if old_slot != target_slot {
-                            seen_shreds_clone.remove(&(old_slot, job_id_u64));
-                        }
-                        seen_shreds_clone.remove(&(target_slot, job_id_u64));
-                        record_dashset_len(seen_shreds_clone.as_ref(), "seen_shreds_len");
-                        let slot_len = {
-                            let mut entry = staged_batches_clone.entry(target_slot).or_default();
-                            entry.insert(job_id_u64, parsed);
-                            entry.len()
-                        };
-                        histogram!("staged_batches_slot_jobs").record(slot_len as f64);
-                        record_staged_batches_metrics(staged_batches_clone.as_ref());
+                        pending_batches_clone.insert((parsed.slot, parsed.job_id as u64), parsed);
                         continue;
                     }
 
-                    if old_slot != target_slot {
-                        seen_shreds_clone.remove(&(old_slot, job_id_u64));
-                    }
-                    seen_shreds_clone.remove(&(target_slot, job_id_u64));
-                    record_dashset_len(seen_shreds_clone.as_ref(), "seen_shreds_len");
+                    // not finalized yet. stage
+                    let job_id_u64 = parsed.job_id as u64;
+                    let target_slot = parsed.slot;
 
-                    // ??
-                    if !parsed.transactions.is_empty() {
-                        let mut signatures = HashMap::new();
-                        for tx in parsed.transactions.iter() {
-                            let transaction = match tx.get_transaction() {
-                                Ok(transaction) => transaction,
-                                Err(e) => {
-                                    error!("Processor {}: Error getting transaction, bincode error: {}", i, e);
-                                    continue;
-                                }
-                            };
-                            let blockhash = *transaction.message.recent_blockhash();
-                            let signature = tx.get_signature();
-                            trace!("Processor {}: Processing transaction {}", i, signature);
-                            signatures.entry(blockhash).or_insert_with(Vec::new).push(signature);
-                        }
-                        if !signatures.is_empty() {
-                            let mut guard = blockhash_to_signatures_clone.write().unwrap();
-                            let mut added_signatures = 0usize;
-                            for (bh, sigs) in signatures.into_iter() {
-                                let entry = guard.entry(bh).or_insert_with(Vec::new);
-                                let before = entry.len();
-                                entry.extend(sigs);
-                                added_signatures += entry.len() - before;
-                            }
-                            let pending_blockhashes = guard.len();
-                            gauge!("blockhash_signature_pending_blockhashes").set(pending_blockhashes as f64);
-                            if added_signatures > 0 {
-                                histogram!("blockhash_signature_batch_inserted").record(added_signatures as f64);
-                                let prev_total =
-                                    pending_signature_count_clone.fetch_add(added_signatures as u64, Ordering::SeqCst);
-                                let new_total = prev_total.saturating_add(added_signatures as u64);
-                                gauge!("blockhash_signature_pending_signatures").set(new_total as f64);
-                            } else {
-                                let current_total = pending_signature_count_clone.load(Ordering::SeqCst);
-                                gauge!("blockhash_signature_pending_signatures").set(current_total as f64);
-                            }
-                        }
-                    }
+                    // Stage the batch (transaction processing happens during finalization via write_to_indexer)
                     let slot_len = {
                         let mut entry = staged_batches_clone.entry(target_slot).or_default();
                         entry.insert(job_id_u64, parsed);
@@ -265,9 +258,44 @@ pub(super) fn spawn_tx_processors(config: TxProcessorConfig) -> Vec<JoinHandle<(
     handles
 }
 
+
+fn write_to_indexer(
+    processor_id: usize,
+    parsed: &SerializableBatch,
+    blockhash_to_signatures_clone: &Arc<RwLock<HashMap<Hash, Vec<Signature>>>>,
+) -> eyre::Result<()> {
+    if !parsed.transactions.is_empty() {
+        let mut signatures = HashMap::new();
+        for tx in parsed.transactions.iter() {
+            let transaction = tx.get_transaction()?;
+            let blockhash = *transaction.message.recent_blockhash();
+            let signature = tx.get_signature();
+            trace!("Processor {}: Processing transaction {}", processor_id, signature);
+            signatures.entry(blockhash).or_insert_with(Vec::new).push(signature);
+        }
+        if !signatures.is_empty() {
+            let mut guard = blockhash_to_signatures_clone.write().unwrap();
+            let mut added_signatures = 0usize;
+            for (bh, sigs) in signatures.into_iter() {
+                let entry = guard.entry(bh).or_insert_with(Vec::new);
+                let before = entry.len();
+                entry.extend(sigs);
+                added_signatures += entry.len() - before;
+            }
+            let pending_blockhashes = guard.len();
+            gauge!("blockhash_signature_pending_blockhashes").set(pending_blockhashes as f64);
+            if added_signatures > 0 {
+                histogram!("blockhash_signature_batch_inserted").record(added_signatures as f64);
+            }
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 pub(super) enum RefetchErr {
     NotFound,
+    #[allow(dead_code)]
     Other(String),
 }
 
@@ -286,6 +314,8 @@ async fn finalize_staged_slot(
     finalized_timestamps: &Arc<DashMap<u64, u64>>,
     refetch_pool: &Arc<Vec<tokio::sync::Mutex<SyncClient>>>,
     refetch_sem: &Arc<Semaphore>,
+    pending_batches: &Arc<DashMap<(u64, u64), SerializableBatch>>,
+    blockhash_to_signatures: &Arc<RwLock<HashMap<Hash, Vec<Signature>>>>,
     processor_id: usize,
 ) -> eyre::Result<()> {
     if finalized_slots.insert(slot) {
@@ -309,6 +339,8 @@ async fn finalize_staged_slot(
         seen_shreds,
         refetch_pool,
         refetch_sem,
+        pending_batches,
+        blockhash_to_signatures,
         processor_id,
     )
     .await
@@ -328,6 +360,8 @@ pub(super) async fn finalize_staged_slot_once(
     seen_shreds: &Arc<DashSet<(u64, u64)>>,
     refetch_pool: &Arc<Vec<tokio::sync::Mutex<SyncClient>>>,
     refetch_sem: &Arc<Semaphore>,
+    pending_batches: &Arc<DashMap<(u64, u64), SerializableBatch>>,
+    blockhash_to_signatures: &Arc<RwLock<HashMap<Hash, Vec<Signature>>>>,
     processor_id: usize,
 ) -> eyre::Result<()> {
     let staged_entry = staged_batches.remove(&slot);
@@ -351,8 +385,18 @@ pub(super) async fn finalize_staged_slot_once(
             missing_job_ids.len()
         );
         for job_id in missing_job_ids {
+            // Check pending pool first before refetching
+            if let Some((_, pending_batch)) = pending_batches.remove(&(slot, job_id)) {
+                info!(
+                    "Processor {}: Found batch for slot {} job_id {} in pending pool",
+                    processor_id, slot, job_id
+                );
+                batches.insert(job_id, pending_batch);
+                continue;
+            }
+
             let permit = refetch_sem.acquire().await.expect("semaphore not closed");
-            match get_and_decode_batch(refetch_pool, slot, job_id).await {
+            match get_and_decode_batch(refetch_pool, slot, job_id, pending_batches).await {
                 Ok(maybe_batch) => {
                     batches.insert(job_id, maybe_batch);
                 }
@@ -425,6 +469,8 @@ pub(super) async fn finalize_staged_slot_once(
             }
             continue;
         }
+
+        write_to_indexer(processor_id, &batch, blockhash_to_signatures)?;
 
         histogram!("tx_batch_transactions_count").record(batch.transactions.len() as f64);
         num_transactions.fetch_add(batch.transactions.len() as u64, Ordering::SeqCst);
@@ -500,7 +546,13 @@ pub(super) async fn get_and_decode_batch(
     pool: &Arc<Vec<tokio::sync::Mutex<SyncClient>>>,
     slot: u64,
     job_id: u64,
+    pending_batches: &Arc<DashMap<(u64, u64), SerializableBatch>>,
 ) -> std::result::Result<SerializableBatch, RefetchErr> {
+    // Check pending pool first before making network requests
+    if let Some((_, pending_batch)) = pending_batches.remove(&(slot, job_id)) {
+        return Ok(pending_batch);
+    }
+
     let mut saw_not_found = false;
     let mut notification_opt = None;
     for client_mutex in pool.iter() {
@@ -533,18 +585,25 @@ pub(super) async fn get_and_decode_batch(
         });
     };
 
-    if notification.batch_size == 0 || notification.compressed_transactions.is_empty() {
+    let batch_data = match notification {
+        CommitBatchNotification::Batch(data) => data,
+        CommitBatchNotification::Finalization(_) => {
+            return Err(RefetchErr::Other("received finalization instead of batch".into()));
+        }
+    };
+
+    if batch_data.batch_size == 0 || batch_data.compressed_transactions.is_empty() {
         return Ok(SerializableBatch {
             // Important: use the server-reported slot (may differ from the probed one if we searched slot±1).
-            slot: notification.slot,
-            timestamp: notification.timestamp,
+            slot: batch_data.slot,
+            timestamp: batch_data.timestamp,
             job_id: job_id as usize,
             transactions: vec![],
-            worker_id: notification.worker_id,
+            worker_id: batch_data.worker_id,
         });
     }
 
-    let compressed = notification.compressed_transactions;
+    let compressed = batch_data.compressed_transactions;
     let decompressed =
         zstd::decode_all(&compressed[..]).map_err(|e| RefetchErr::Other(format!("decompress error: {e}")))?;
     bincode::deserialize(&decompressed).map_err(|e| RefetchErr::Other(format!("deserialize error: {e}")))

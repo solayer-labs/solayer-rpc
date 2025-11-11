@@ -547,8 +547,8 @@ impl Bank {
             .add_job_id(job_id);
     }
 
-    pub fn job_ids_for_slot(&self, slot: u64) -> Option<Vec<u64>> {
-        self.slot_job_ids.get(&slot).map(|raw_slot| raw_slot.job_ids.clone())
+    pub fn get_raw_slot(&self, slot: u64) -> Option<RawSlot> {
+        self.slot_job_ids.get(&slot).cloned()
     }
 
     fn prune_slot_history(&mut self, current_slot: u64) {

@@ -407,9 +407,9 @@ async fn subscribe_and_forward_streams(
                         state.latest_slot = slot.clone();
                         state.notify_new_slot(slot.clone());
                     }
-                    if forward_tx.send(slot).await.is_err() {
-                        break;
-                    }
+                    // if forward_tx.send(slot).await.is_err() {
+                    //     break;
+                    // }
                 }
                 info!("Slot forwarder {} terminated", i);
             });
@@ -521,8 +521,6 @@ async fn do_main() -> Result<(), BoxError> {
         indexer,
         bank.clone(),
         subscription_processor.clone(),
-        total_transaction_count.clone(),
-        samples.clone(),
         refetch_pool,
     )
     .await?;

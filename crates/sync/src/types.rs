@@ -1,5 +1,6 @@
 use infinisvm_types::{convert::to_tx_row, jobs::ConsumedJob, serializable::SerializableTxRow};
 use serde::{Deserialize, Serialize};
+use solana_sdk::hash::Hash;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SerializableBatch {
@@ -15,6 +16,8 @@ pub struct FinalizationMarker {
     pub slot: u64,
     pub timestamp: u64,
     pub job_ids: Vec<u64>,
+    pub hash: Hash,
+    pub parent_hash: Hash,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

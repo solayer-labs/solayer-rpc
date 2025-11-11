@@ -22,38 +22,44 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 pub fn process_commit_notification(
     notification: &CommitBatchNotification,
 ) -> Result<SerializableNotification, Box<dyn std::error::Error + Send + Sync>> {
-    info!(
-        "Received batch notification: slot={}, batch_size={}, compression_ratio={}%",
-        notification.slot, notification.batch_size, notification.compression_ratio
-    );
+    match notification {
+        CommitBatchNotification::Finalization(finalization_data) => {
+            info!("Received finalization notification: slot={}", finalization_data.slot);
+            return Ok(SerializableNotification::Finalization(FinalizationMarker {
+                slot: finalization_data.slot,
+                timestamp: finalization_data.timestamp,
+                job_ids: finalization_data.job_ids.clone(),
+                hash: finalization_data.hash,
+                parent_hash: finalization_data.parent_hash,
+            }));
+        }
+        CommitBatchNotification::Batch(batch_data) => {
+            info!(
+                "Received batch notification: slot={}, batch_size={}, compression_ratio={}%",
+                batch_data.slot, batch_data.batch_size, batch_data.compression_ratio
+            );
 
-    if notification.is_final {
-        return Ok(SerializableNotification::Finalization(FinalizationMarker {
-            slot: notification.slot,
-            timestamp: notification.timestamp,
-            job_ids: notification.job_ids.clone(),
-        }));
+            // Handle empty batches gracefully to avoid zstd "incomplete frame" errors
+            if batch_data.batch_size == 0 || batch_data.compressed_transactions.is_empty() {
+                // Preserve real metadata so receivers can mark presence for (slot, job_id)
+                return Ok(SerializableNotification::Batch(SerializableBatch {
+                    slot: batch_data.slot,
+                    timestamp: batch_data.timestamp,
+                    job_id: batch_data.job_id as usize,
+                    transactions: Vec::new(),
+                    worker_id: batch_data.worker_id,
+                }));
+            }
+
+            // Decompress the transaction data
+            let decompressed = zstd::decode_all(&batch_data.compressed_transactions[..])?;
+
+            // Deserialize the batch
+            let batch: SerializableBatch = bincode::deserialize(&decompressed)?;
+
+            Ok(SerializableNotification::Batch(batch))
+        }
     }
-
-    // Handle empty batches gracefully to avoid zstd "incomplete frame" errors
-    if notification.batch_size == 0 || notification.compressed_transactions.is_empty() {
-        // Preserve real metadata so receivers can mark presence for (slot, job_id)
-        return Ok(SerializableNotification::Batch(SerializableBatch {
-            slot: notification.slot,
-            timestamp: notification.timestamp,
-            job_id: notification.job_id as usize,
-            transactions: Vec::new(),
-            worker_id: notification.worker_id,
-        }));
-    }
-
-    // Decompress the transaction data
-    let decompressed = zstd::decode_all(&notification.compressed_transactions[..])?;
-
-    // Deserialize the batch
-    let batch: SerializableBatch = bincode::deserialize(&decompressed)?;
-
-    Ok(SerializableNotification::Batch(batch))
 }
 
 pub struct TransactionBatchSubscriber {

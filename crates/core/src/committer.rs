@@ -297,24 +297,29 @@ impl Committer {
             }
 
             let _ = self.pending_finalizations.pop_front();
-            let mut job_ids = {
+            let (mut job_ids, hash, parent_hash) = {
                 let bank = self.bank.read().unwrap();
-                bank.job_ids_for_slot(slot).unwrap_or_default()
+                // Get all slot data from raw_slot
+                let raw_slot = bank.get_raw_slot(slot);
+                let job_ids = raw_slot.as_ref().map(|rs| rs.job_ids.clone()).unwrap_or_default();
+                let hash = raw_slot.as_ref().map(|rs| rs.hash).unwrap_or_default();
+                let parent_hash = raw_slot.as_ref().map(|rs| rs.parent_hash).unwrap_or_default();
+                (job_ids, hash, parent_hash)
             };
             job_ids.sort_unstable();
             job_ids.dedup();
 
             self.bank.write().unwrap().mark_slot_range_finalized(slot);
-            self.broadcast_finalization(slot, job_ids);
+            self.broadcast_finalization(slot, job_ids, hash, parent_hash);
             self.finalize_slot_hash(slot);
         }
     }
 
-    fn broadcast_finalization(&self, slot: u64, job_ids: Vec<u64>) {
+    fn broadcast_finalization(&self, slot: u64, job_ids: Vec<u64>, hash: Hash, parent_hash: Hash) {
         info!("Broadcasting finalization for slot {slot}");
         if let Some(ref broadcaster) = self.batch_broadcaster {
             for b in broadcaster.iter() {
-                if let Err(e) = b.broadcast_finalization(slot, job_ids.clone()) {
+                if let Err(e) = b.broadcast_finalization(slot, job_ids.clone(), hash, parent_hash) {
                     warn!("Failed to broadcast block finalization for slot {}: {}", slot, e);
                 }
             }
