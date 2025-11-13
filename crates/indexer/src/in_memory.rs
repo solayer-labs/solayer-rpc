@@ -1,11 +1,17 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use async_trait::async_trait;
 use infinisvm_core::indexer::Indexer;
 use infinisvm_jsonrpc::rpc_state::RpcIndexer;
-use infinisvm_types::{jobs::ConsumedJob, BlockWithTransactions, TransactionWithMetadata};
+use infinisvm_types::{
+    convert::{to_signature_rows, to_tx_row},
+    jobs::ConsumedJob,
+    serializable::{SignatureRow, TxRow},
+    BlockWithTransactions, SignatureFilters, TransactionWithMetadata,
+};
 use solana_hash::Hash;
 use solana_sdk::{clock::Slot, pubkey::Pubkey, signature::Signature};
+use spl_token;
 
 use crate::to_transaction_with_metadata;
 
@@ -19,7 +25,14 @@ struct BlockMetadata {
 }
 
 pub struct IndexState {
+    // Keep existing block storage
     block: VecDeque<(BlockMetadata, Vec<ConsumedJob>)>,
+    
+    // HashMap-based indices for fast lookups
+    tx_by_signature: HashMap<Signature, TxRow>,
+    signatures_by_account: HashMap<Pubkey, Vec<SignatureRow>>, // account -> sorted by seq_number
+    account_ops: HashMap<Pubkey, HashSet<Pubkey>>, // owner -> accounts
+    account_ops_mint: HashMap<(Pubkey, u8, Pubkey), HashSet<Pubkey>>, // (owner, account_type, mint) -> accounts
 }
 
 pub struct InMemoryIndexer {
@@ -34,6 +47,10 @@ impl InMemoryIndexer {
         Self {
             state: IndexState {
                 block: VecDeque::with_capacity(MAX_BLOCKS),
+                tx_by_signature: HashMap::new(),
+                signatures_by_account: HashMap::new(),
+                account_ops: HashMap::new(),
+                account_ops_mint: HashMap::new(),
             },
         }
     }
@@ -94,9 +111,84 @@ impl Indexer for InMemoryIndexer {
     }
 
     fn index_transactions(&mut self, batch: Vec<ConsumedJob>, _block_unix_timestamp: u64) {
-        // all txs in the batch should be in the same block
-        // find the slot and push the batch to the block
+        if batch.is_empty() {
+            return;
+        }
+
         let slot = batch[0].slot;
+
+        // Process each transaction and index it
+        for job in &batch {
+            // Skip failed transactions
+            if job.processed_transaction.is_err() {
+                continue;
+            }
+
+            // Extract signature rows and transaction row
+            let signature_rows = to_signature_rows(job);
+            let (tx_row, account_delta) = to_tx_row(job);
+
+            // Store transaction by signature
+            let signature = Signature::try_from(tx_row.signature.as_ref())
+                .expect("Invalid signature bytes");
+            self.state.tx_by_signature.insert(signature, tx_row);
+
+            // Store signatures by account
+            for sig_row in signature_rows {
+                let account = Pubkey::try_from(sig_row.account.as_ref())
+                    .expect("Invalid account bytes");
+                self.state
+                    .signatures_by_account
+                    .entry(account)
+                    .or_insert_with(Vec::new)
+                    .push(sig_row);
+            }
+
+            // Process account operations if available
+            if let Some((account_ops_create, account_ops_delete, account_ops_mint_create, account_ops_mint_delete)) =
+                account_delta
+            {
+                // Handle account_ops create
+                for (owner, account) in account_ops_create {
+                    self.state
+                        .account_ops
+                        .entry(owner)
+                        .or_insert_with(HashSet::new)
+                        .insert(account);
+                }
+
+                // Handle account_ops delete
+                for (owner, account) in account_ops_delete {
+                    if let Some(accounts) = self.state.account_ops.get_mut(&owner) {
+                        accounts.remove(&account);
+                    }
+                }
+
+                // Handle account_ops_mint create
+                for (owner, account, account_type, mint) in account_ops_mint_create {
+                    let key = (owner, account_type, mint);
+                    self.state
+                        .account_ops_mint
+                        .entry(key)
+                        .or_insert_with(HashSet::new)
+                        .insert(account);
+                }
+
+                // Handle account_ops_mint delete
+                for (owner, account) in account_ops_mint_delete {
+                    // Need to find and remove from all matching entries
+                    // Since we don't have account_type and mint in delete, we need to iterate
+                    self.state.account_ops_mint.retain(|(o, _, _), accounts| {
+                        if *o == owner {
+                            accounts.remove(&account);
+                        }
+                        !accounts.is_empty()
+                    });
+                }
+            }
+        }
+
+        // Keep existing block storage logic
         let block_metadata = self.state.block.back_mut().unwrap();
 
         if block_metadata.0.slot != slot {
@@ -118,29 +210,103 @@ impl Indexer for InMemoryIndexer {
 
 #[async_trait]
 impl RpcIndexer for InMemoryIndexer {
-    async fn find_accounts_owned_by(&self, _: &Pubkey, _: usize, _: usize) -> Vec<Pubkey> {
-        vec![]
+    async fn find_accounts_owned_by(&self, owner: &Pubkey, limit: usize, offset: usize) -> Vec<Pubkey> {
+        self.state
+            .account_ops
+            .get(owner)
+            .map(|accounts| {
+                accounts
+                    .iter()
+                    .skip(offset)
+                    .take(limit)
+                    .copied()
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     async fn find_token_accounts_owned_by(
         &self,
-        _owner: &Pubkey,
-        _program_id: Option<Pubkey>,
-        _mint: Option<Pubkey>,
-        _limit: usize,
-        _offset: usize,
+        owner: &Pubkey,
+        program_id: Option<Pubkey>,
+        mint: Option<Pubkey>,
+        limit: usize,
+        offset: usize,
     ) -> Vec<Pubkey> {
-        vec![]
+        let account_type = program_id.map(|pid| {
+            if pid == spl_token::id() {
+                1u8
+            } else {
+                2u8
+            }
+        });
+
+        let mut results: Vec<Pubkey> = Vec::new();
+
+        for ((o, at, m), accounts) in &self.state.account_ops_mint {
+            // Check owner match (required)
+            if *o != *owner {
+                continue;
+            }
+
+            // Check account_type match if provided
+            if let Some(at_filter) = account_type {
+                if *at != at_filter {
+                    continue;
+                }
+            }
+
+            // Check mint match if provided
+            if let Some(mint_filter) = mint {
+                if *m != mint_filter {
+                    continue;
+                }
+            }
+
+            // Collect accounts from this entry
+            results.extend(accounts.iter().copied());
+        }
+
+        // Apply offset and limit
+        results.into_iter().skip(offset).take(limit).collect()
     }
 
     async fn find_token_accounts_by_mint(
         &self,
-        _program_id: Option<Pubkey>,
-        _mint: Pubkey,
-        _limit: usize,
-        _offset: usize,
+        program_id: Option<Pubkey>,
+        mint: Pubkey,
+        limit: usize,
+        offset: usize,
     ) -> Vec<Pubkey> {
-        vec![]
+        let account_type = program_id.map(|pid| {
+            if pid == spl_token::id() {
+                1u8
+            } else {
+                2u8
+            }
+        });
+
+        let mut results: Vec<Pubkey> = Vec::new();
+
+        for ((_owner, at, m), accounts) in &self.state.account_ops_mint {
+            // Check mint match (required)
+            if *m != mint {
+                continue;
+            }
+
+            // Check account_type match if provided
+            if let Some(at_filter) = account_type {
+                if *at != at_filter {
+                    continue;
+                }
+            }
+
+            // Collect accounts from this entry
+            results.extend(accounts.iter().copied());
+        }
+
+        // Apply offset and limit
+        results.into_iter().skip(offset).take(limit).collect()
     }
 
     async fn get_block_with_transactions(
@@ -192,18 +358,79 @@ impl RpcIndexer for InMemoryIndexer {
 
     async fn find_signatures_of_account(
         &self,
-        _: &Pubkey,
-        _: infinisvm_types::SignatureFilters,
-        _: usize,
+        account: &Pubkey,
+        filters: SignatureFilters,
+        limit: usize,
     ) -> eyre::Result<Vec<Signature>> {
-        Ok(vec![])
+        let signatures = self
+            .state
+            .signatures_by_account
+            .get(account)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
+
+        // Create a sorted vector of references
+        let mut sorted_indices: Vec<usize> = (0..signatures.len()).collect();
+        sorted_indices.sort_by_key(|&i| signatures[i].seq_number);
+
+        // Apply filters
+        let filtered: Vec<Signature> = sorted_indices
+            .into_iter()
+            .filter_map(|i| {
+                let sig_row = &signatures[i];
+                let sig = Signature::try_from(sig_row.signature.as_ref()).ok()?;
+
+                // Apply time range filter
+                match &filters {
+                    SignatureFilters::TimeRange(Some(start), Some(end)) => {
+                        if sig_row.block_unix_timestamp < *start
+                            || sig_row.block_unix_timestamp > *end
+                        {
+                            return None;
+                        }
+                    }
+                    SignatureFilters::TimeRange(Some(start), None) => {
+                        if sig_row.block_unix_timestamp < *start {
+                            return None;
+                        }
+                    }
+                    SignatureFilters::TimeRange(None, Some(end)) => {
+                        if sig_row.block_unix_timestamp > *end {
+                            return None;
+                        }
+                    }
+                    SignatureFilters::TimeRange(None, None) | SignatureFilters::None => {}
+                    SignatureFilters::Signature(Some(start_sig), Some(end_sig)) => {
+                        if sig < *start_sig || sig > *end_sig {
+                            return None;
+                        }
+                    }
+                    SignatureFilters::Signature(Some(start_sig), None) => {
+                        if sig < *start_sig {
+                            return None;
+                        }
+                    }
+                    SignatureFilters::Signature(None, Some(end_sig)) => {
+                        if sig > *end_sig {
+                            return None;
+                        }
+                    }
+                    SignatureFilters::Signature(None, None) => {}
+                }
+
+                Some(sig)
+            })
+            .take(limit)
+            .collect();
+
+        Ok(filtered)
     }
 
     async fn get_transaction_with_metadata(
         &self,
         signature: &Signature,
     ) -> eyre::Result<Option<TransactionWithMetadata>> {
-        // iterate over all blocks and find the transaction with the signature
+        // First try to find in blocks (for backward compatibility and full metadata)
         for (_, block) in self.state.block.iter() {
             for job in block.iter() {
                 let ConsumedJob {
@@ -222,8 +449,6 @@ impl RpcIndexer for InMemoryIndexer {
                             seq_number: job.job_id as u64,
                         }));
                     }
-                } else {
-                    return Ok(None);
                 }
             }
         }
