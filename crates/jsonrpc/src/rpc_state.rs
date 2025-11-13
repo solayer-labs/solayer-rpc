@@ -239,13 +239,13 @@ impl RpcServerState {
     /// Try to forward the request to another RPC endpoint. Return true if
     /// forwarding is enabled.
     #[tracing::instrument(name = "forward-request", skip_all, fields(%method))]
-    pub fn try_forward_to(&self, method: &str, params: serde_json::Value) -> bool {
+    pub async fn try_forward_to(&self, method: &str, params: serde_json::Value) -> eyre::Result<serde_json::Value> {
         if let Some(forward_to) = &self.forward_to {
             // info!(?params, "Forwarding request");
 
-            let client = reqwest::blocking::Client::new();
+            let client = reqwest::Client::new();
 
-            let r = client
+            let response = client
                 .post(forward_to)
                 .json(&serde_json::json!({
                     "jsonrpc": "2.0",
@@ -254,19 +254,26 @@ impl RpcServerState {
                     "id": 1,
                 }))
                 .send()
-                .context("Failed to send request")
-                .and_then(|v| v.error_for_status().context("Status error"))
-                .and_then(|v| v.json::<serde_json::Value>().context("Failed to parse response"));
+                .await
+                .context("Failed to send request")?;
 
-            if let Err(e) = r {
-                // TODO: metric
-                error!("Failed to forward request: {:?}", e);
+            let response = response.error_for_status().context("Status error")?;
+
+            let r = response
+                .json::<serde_json::Value>()
+                .await
+                .context("Failed to parse response");
+
+            match r {
+                Ok(r) => return Ok(r),
+                Err(e) => {
+                    // TODO: metric
+                    error!("Failed to forward request: {:?}", e);
+                }
             }
-
-            return true;
         }
 
-        false
+        Ok(serde_json::Value::Null)
     }
 
     pub fn get_current_slot(&self) -> RpcResult<u64> {

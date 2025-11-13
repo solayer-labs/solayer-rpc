@@ -57,8 +57,8 @@ use solana_svm::{
 use solana_svm_transaction::svm_message::SVMMessage;
 
 use crate::{
-    blockhash_generator::DummyRpcBlockhashGenerator, fork_graph::EmptyForkGraph, metrics::BankMetrics,
-    subscription::Notifier, wal, SCHEDULER_WORKER_COUNT,
+    blockhash_generator::DummyRpcBlockhashGenerator, committer::CommitEvent, fork_graph::EmptyForkGraph,
+    metrics::BankMetrics, subscription::Notifier, wal, SCHEDULER_WORKER_COUNT,
 };
 
 pub fn get_feature_set() -> FeatureSet {
@@ -194,6 +194,7 @@ pub struct Bank {
     hash_generator: DummyRpcBlockhashGenerator,
 
     raw_slot_sender: Option<Sender<RawSlot>>,
+    commit_sender: Option<Sender<CommitEvent>>,
 
     transaction_processor: TransactionBatchProcessor<EmptyForkGraph>,
     _feature_set: Arc<FeatureSet>,
@@ -331,6 +332,7 @@ impl Bank {
             slot_hash_timestamp: (slot, hash, timestamp),
             hash_generator,
             raw_slot_sender: None,
+            commit_sender: None,
 
             blockhash_pruner_sender,
             status_cache,
@@ -578,10 +580,11 @@ impl Bank {
             }
         }
 
-        info!(
-            "slot ({slot}) {:?} finalized",
-            self.slot_job_ids.get(&slot).unwrap().job_ids
-        );
+        
+        match self.slot_job_ids.get(&slot) {
+            Some(raw_slot) => info!("mark_slot_range_finalized: slot ({slot}) {:?} finalized", raw_slot.job_ids),
+            None => info!("mark_slot_range_finalized: slot ({slot}) not found"),
+        }
     }
 
     pub fn tick(&mut self) {
@@ -591,10 +594,17 @@ impl Bank {
         // mark slot - 2 as finalized
         // assume slot - 2 is always executed
         // todo: wal
-        if let Some(raw_slot) = self.slot_job_ids.get_mut(&slot.saturating_sub(2)) {
+        let finalized_slot = slot.saturating_sub(2);
+        if let Some(raw_slot) = self.slot_job_ids.get_mut(&finalized_slot) {
             if !raw_slot.is_finalized {
-                info!("slot ({}) {:?} finalized", slot.saturating_sub(2), raw_slot.job_ids);
+                info!("slot ({}) {:?} finalized", finalized_slot, raw_slot.job_ids);
                 raw_slot.is_finalized = true;
+                // Send finalization event to committer for empty slots
+                if let Some(ref commit_sender) = self.commit_sender {
+                    if let Err(e) = commit_sender.send(CommitEvent::Finalize { slot: finalized_slot }) {
+                        warn!("Failed to send finalization event for slot {}: {}", finalized_slot, e);
+                    }
+                }
             }
         }
 

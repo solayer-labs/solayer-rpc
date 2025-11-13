@@ -1417,7 +1417,7 @@ pub trait Rpc {
     fn get_recent_performance_samples(&self, limit: u64) -> RpcResult<Vec<RpcPerfSample>>;
 
     #[method(name = "requestAirdrop")]
-    fn request_airdrop(&self, pubkey_str: String, lamports: u64) -> RpcResult<String>;
+    async fn request_airdrop(&self, pubkey_str: String, lamports: u64) -> RpcResult<String>;
 
     /////// BEGIN WeBSocket RPC ///////
 
@@ -1932,7 +1932,7 @@ impl RpcServer for RpcServerState {
             return Err(err);
         }
 
-        self.try_forward_to("sendTransaction", json!([data, config]));
+        let _ = self.try_forward_to("sendTransaction", json!([data, config])).await;
 
         self.tx_service.send_transaction(versioned_transaction).map_err(|e| {
             error!("send_transaction error: {:?}", e);
@@ -2808,7 +2808,7 @@ impl RpcServer for RpcServerState {
         }
     }
 
-    fn request_airdrop(&self, pubkey_str: String, lamports: u64) -> RpcResult<String> {
+    async fn request_airdrop(&self, pubkey_str: String, lamports: u64) -> RpcResult<String> {
         counter!("rpc", "method" => "requestAirdrop").increment(1);
 
         let lamports = lamports.min(1_000_000_000); // 1 SOL
@@ -2816,17 +2816,10 @@ impl RpcServer for RpcServerState {
         let (_, recent_hash) = self.get_latest_context()?;
 
         if self.forward_to.is_some() {
-            let airdrop_tx = self
-                .tx_service
-                .build_airdrop_transaction(&pubkey, recent_hash, lamports);
-
-            let tx = match airdrop_tx.encode(UiTransactionEncoding::Binary) {
-                EncodedTransaction::LegacyBinary(tx) => tx,
-                _ => unreachable!(),
-            };
-            self.try_forward_to("sendTransaction", json!([tx,]));
-
-            Ok(airdrop_tx.signatures[0].to_string())
+            match self.try_forward_to("requestAirdrop", json!([pubkey_str, lamports])).await {
+                Ok(r) => Ok(r.get("result").and_then(|v| v.as_str()).unwrap_or_default().to_string()),
+                Err(e) => Err(RpcCustomError::ForwardingError(e.to_string()).into()),
+            }
         } else {
             self.tx_service
                 .request_airdrop(&pubkey, recent_hash, lamports)

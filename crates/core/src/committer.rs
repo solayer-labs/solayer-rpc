@@ -12,6 +12,7 @@ use infinisvm_logger::{info, warn};
 use infinisvm_sync::{grpc::TransactionBatchBroadcaster, types::SerializableBatch};
 use infinisvm_types::jobs::ConsumedJob;
 use metrics::gauge;
+use rand::Rng;
 use solana_hash::Hash;
 use solana_sha256_hasher::{hashv, Hasher};
 
@@ -318,10 +319,9 @@ impl Committer {
     fn broadcast_finalization(&self, slot: u64, job_ids: Vec<u64>, hash: Hash, parent_hash: Hash) {
         info!("Broadcasting finalization for slot {slot}");
         if let Some(ref broadcaster) = self.batch_broadcaster {
-            for b in broadcaster.iter() {
-                if let Err(e) = b.broadcast_finalization(slot, job_ids.clone(), hash, parent_hash) {
-                    warn!("Failed to broadcast block finalization for slot {}: {}", slot, e);
-                }
+            let random_index = rand::thread_rng().gen_range(0..broadcaster.len());
+            if let Err(e) = broadcaster[random_index].broadcast_finalization(slot, job_ids.clone(), hash, parent_hash) {
+                warn!("Failed to broadcast block finalization for slot {}: {}", slot, e);
             }
         }
     }
