@@ -312,7 +312,7 @@ impl Committer {
 
             self.bank.write().unwrap().mark_slot_range_finalized(slot);
             self.broadcast_finalization(slot, job_ids, hash, parent_hash);
-            self.finalize_slot_hash(slot);
+            // self.finalize_slot_hash(slot);
         }
     }
 
