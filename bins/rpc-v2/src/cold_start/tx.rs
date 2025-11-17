@@ -113,7 +113,7 @@ pub(super) fn spawn_tx_processors(config: TxProcessorConfig) -> Vec<JoinHandle<(
 
                     let parsed = match parsed {
                         SerializableNotification::Finalization(marker) => {
-                            info!("Processor {}: Received finalization marker for slot {}", i, marker.slot);
+                            info!("Processor {}: Received finalization marker for slot {}, job_ids={:?}", i, marker.slot, marker.job_ids);
                             let mut marker_job_ids = marker.job_ids.clone();
                             marker_job_ids.sort_unstable();
                             marker_job_ids.dedup();
@@ -445,7 +445,13 @@ pub(super) async fn finalize_staged_slot_once(
         if batch.transactions.is_empty() {
             if seen_shreds.insert((batch.slot, job_id)) {
                 record_dashset_len(seen_shreds.as_ref(), "seen_shreds_len");
-                let meta = DBMeta::from_shred(batch.slot, job_id);
+                if slot != batch.slot {
+                    info!(
+                        "Processor {}: relocating shred from slot {} to slot {}",
+                        processor_id, batch.slot, slot
+                    );
+                }
+                let meta = DBMeta::from_shred(slot, job_id);
                 let mut chain = db_chain.write().unwrap();
                 let before = chain.len();
                 let t_add = Instant::now();
@@ -481,8 +487,8 @@ pub(super) async fn finalize_staged_slot_once(
             let result = tx.get_result().expect("serialized batch result");
 
             let status = match result.status {
-                Ok(()) => TransactionStatus::Executed(None, batch.slot),
-                Err(e) => TransactionStatus::Executed(Some(e), batch.slot),
+                Ok(()) => TransactionStatus::Executed(None, slot),
+                Err(e) => TransactionStatus::Executed(Some(e), slot),
             };
             trace!(
                 "Processor {}: Processing finalized transaction {}",
@@ -504,7 +510,7 @@ pub(super) async fn finalize_staged_slot_once(
         }
         histogram!("tx_batch_build_shard_ms").record(t_build.elapsed().as_secs_f64() * 1000.0);
 
-        let meta = DBMeta::from_shred(batch.slot, job_id);
+        let meta = DBMeta::from_shred(slot, job_id);
         if seen_shreds.insert((batch.slot, job_id)) {
             record_dashset_len(seen_shreds.as_ref(), "seen_shreds_len");
             let mut chain = db_chain.write().unwrap();
