@@ -99,8 +99,8 @@ impl TransactionBatchBroadcaster {
                 );
                 metrics::counter!("broadcast_batches_all_failed_total").increment(1);
 
-                let notification = infinisvm_types::sync::CommitBatchNotification::Batch(
-                    infinisvm_types::sync::BatchData {
+                let notification =
+                    infinisvm_types::sync::CommitBatchNotification::Batch(infinisvm_types::sync::BatchData {
                         slot,
                         timestamp,
                         batch_size: 0,
@@ -108,8 +108,7 @@ impl TransactionBatchBroadcaster {
                         compression_ratio: 0,
                         job_id: job_id as u64,
                         worker_id: 0,
-                    },
-                );
+                    });
 
                 let processing_time = start_time.elapsed();
                 if let CommitBatchNotification::Batch(ref batch_data) = notification {
@@ -206,7 +205,11 @@ impl TransactionBatchBroadcaster {
                         CommitBatchNotification::Batch(batch_data) => {
                             debug!(
                                 "Broadcaster {} sent batch (slot: {}, {} transactions) to {} subscribers in {:?}",
-                                broadcaster_id, batch_data.slot, batch_data.batch_size, subscriber_count, broadcast_time
+                                broadcaster_id,
+                                batch_data.slot,
+                                batch_data.batch_size,
+                                subscriber_count,
+                                broadcast_time
                             );
                         }
                         CommitBatchNotification::Finalization(finalization_data) => {

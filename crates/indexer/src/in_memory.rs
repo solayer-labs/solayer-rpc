@@ -27,11 +27,11 @@ struct BlockMetadata {
 pub struct IndexState {
     // Keep existing block storage
     block: VecDeque<(BlockMetadata, Vec<ConsumedJob>)>,
-    
+
     // HashMap-based indices for fast lookups
     tx_by_signature: HashMap<Signature, TxRow>,
     signatures_by_account: HashMap<Pubkey, Vec<SignatureRow>>, // account -> sorted by seq_number
-    account_ops: HashMap<Pubkey, HashSet<Pubkey>>, // owner -> accounts
+    account_ops: HashMap<Pubkey, HashSet<Pubkey>>,             // owner -> accounts
     account_ops_mint: HashMap<(Pubkey, u8, Pubkey), HashSet<Pubkey>>, // (owner, account_type, mint) -> accounts
 }
 
@@ -129,18 +129,16 @@ impl Indexer for InMemoryIndexer {
             let (tx_row, account_delta) = to_tx_row(job);
 
             // Store transaction by signature
-            let signature = Signature::try_from(tx_row.signature.as_ref())
-                .expect("Invalid signature bytes");
+            let signature = Signature::try_from(tx_row.signature.as_ref()).expect("Invalid signature bytes");
             self.state.tx_by_signature.insert(signature, tx_row);
 
             // Store signatures by account
             for sig_row in signature_rows {
-                let account = Pubkey::try_from(sig_row.account.as_ref())
-                    .expect("Invalid account bytes");
+                let account = Pubkey::try_from(sig_row.account.as_ref()).expect("Invalid account bytes");
                 self.state
                     .signatures_by_account
                     .entry(account)
-                    .or_insert_with(Vec::new)
+                    .or_default()
                     .push(sig_row);
             }
 
@@ -153,7 +151,7 @@ impl Indexer for InMemoryIndexer {
                     self.state
                         .account_ops
                         .entry(owner)
-                        .or_insert_with(HashSet::new)
+                        .or_default()
                         .insert(account);
                 }
 
@@ -170,7 +168,7 @@ impl Indexer for InMemoryIndexer {
                     self.state
                         .account_ops_mint
                         .entry(key)
-                        .or_insert_with(HashSet::new)
+                        .or_default()
                         .insert(account);
                 }
 
@@ -214,14 +212,7 @@ impl RpcIndexer for InMemoryIndexer {
         self.state
             .account_ops
             .get(owner)
-            .map(|accounts| {
-                accounts
-                    .iter()
-                    .skip(offset)
-                    .take(limit)
-                    .copied()
-                    .collect()
-            })
+            .map(|accounts| accounts.iter().skip(offset).take(limit).copied().collect())
             .unwrap_or_default()
     }
 
@@ -233,13 +224,7 @@ impl RpcIndexer for InMemoryIndexer {
         limit: usize,
         offset: usize,
     ) -> Vec<Pubkey> {
-        let account_type = program_id.map(|pid| {
-            if pid == spl_token::id() {
-                1u8
-            } else {
-                2u8
-            }
-        });
+        let account_type = program_id.map(|pid| if pid == spl_token::id() { 1u8 } else { 2u8 });
 
         let mut results: Vec<Pubkey> = Vec::new();
 
@@ -278,13 +263,7 @@ impl RpcIndexer for InMemoryIndexer {
         limit: usize,
         offset: usize,
     ) -> Vec<Pubkey> {
-        let account_type = program_id.map(|pid| {
-            if pid == spl_token::id() {
-                1u8
-            } else {
-                2u8
-            }
-        });
+        let account_type = program_id.map(|pid| if pid == spl_token::id() { 1u8 } else { 2u8 });
 
         let mut results: Vec<Pubkey> = Vec::new();
 
@@ -383,9 +362,7 @@ impl RpcIndexer for InMemoryIndexer {
                 // Apply time range filter
                 match &filters {
                     SignatureFilters::TimeRange(Some(start), Some(end)) => {
-                        if sig_row.block_unix_timestamp < *start
-                            || sig_row.block_unix_timestamp > *end
-                        {
+                        if sig_row.block_unix_timestamp < *start || sig_row.block_unix_timestamp > *end {
                             return None;
                         }
                     }

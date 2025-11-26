@@ -245,7 +245,8 @@ impl S3FsClientInner {
             return Ok(None);
         };
 
-        // Determine region: use provided region, then env var, then default to us-west-2
+        // Determine region: use provided region, then env var, then default to
+        // us-west-2
         let region = self
             .region
             .clone()
@@ -259,7 +260,8 @@ impl S3FsClientInner {
             .with_bucket_name(self.s3_path.clone());
 
         // Only set endpoint if explicitly provided via environment variable
-        // The object_store library constructs the endpoint automatically for standard AWS regions
+        // The object_store library constructs the endpoint automatically for standard
+        // AWS regions
         if let Ok(endpoint) = std::env::var("S3_ENDPOINT") {
             builder = builder.with_endpoint(endpoint);
         }

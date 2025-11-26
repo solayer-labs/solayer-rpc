@@ -113,7 +113,10 @@ pub(super) fn spawn_tx_processors(config: TxProcessorConfig) -> Vec<JoinHandle<(
 
                     let parsed = match parsed {
                         SerializableNotification::Finalization(marker) => {
-                            info!("Processor {}: Received finalization marker for slot {}, job_ids={:?}", i, marker.slot, marker.job_ids);
+                            info!(
+                                "Processor {}: Received finalization marker for slot {}, job_ids={:?}",
+                                i, marker.slot, marker.job_ids
+                            );
                             let mut marker_job_ids = marker.job_ids.clone();
                             marker_job_ids.sort_unstable();
                             marker_job_ids.dedup();
@@ -185,12 +188,17 @@ pub(super) fn spawn_tx_processors(config: TxProcessorConfig) -> Vec<JoinHandle<(
                                 let latest_slot = match merge_result {
                                     Ok(latest_slot) => latest_slot,
                                     Err(e) => {
-                                        error!("Processor {}: Error merging db_chain at slot {}: {}", i, marker.slot, e);
+                                        error!(
+                                            "Processor {}: Error merging db_chain at slot {}: {}",
+                                            i, marker.slot, e
+                                        );
                                         counter!("cold_start_merge_errors_total").increment(1);
-                                        None // Continue processing even if merge fails
+                                        None // Continue processing even if
+                                             // merge fails
                                     }
                                 };
-                                histogram!("cold_start_merge_attempt_ms").record(t_merge.elapsed().as_secs_f64() * 1000.0);
+                                histogram!("cold_start_merge_attempt_ms")
+                                    .record(t_merge.elapsed().as_secs_f64() * 1000.0);
                                 if let Some(latest_slot) = latest_slot {
                                     info!("Processor {}: Successfully merged db_chain to slot {}", i, latest_slot);
                                     counter!("cold_start_merge_success_total").increment(1);
@@ -199,7 +207,8 @@ pub(super) fn spawn_tx_processors(config: TxProcessorConfig) -> Vec<JoinHandle<(
                                         let before = guard.len();
                                         guard.retain(|slot_key, _| *slot_key > latest_slot);
                                         if before != guard.len() {
-                                            counter!("finalized_job_ids_pruned_total").increment((before - guard.len()) as u64);
+                                            counter!("finalized_job_ids_pruned_total")
+                                                .increment((before - guard.len()) as u64);
                                         }
                                         gauge!("finalized_job_ids_len").set(guard.len() as f64);
                                     }
@@ -213,19 +222,22 @@ pub(super) fn spawn_tx_processors(config: TxProcessorConfig) -> Vec<JoinHandle<(
 
                             // Index block
                             let t_index_block = Instant::now();
-                            indexer_for_block
-                                .lock()
-                                .await
-                                .index_block(marker.slot, marker.timestamp, marker.hash, marker.parent_hash);
+                            indexer_for_block.lock().await.index_block(
+                                marker.slot,
+                                marker.timestamp,
+                                marker.hash,
+                                marker.parent_hash,
+                            );
                             histogram!("slot_index_block_ms").record(t_index_block.elapsed().as_secs_f64() * 1000.0);
-                            
+
                             continue;
                         }
                         SerializableNotification::Batch(batch) => batch,
                     };
 
                     // Check if slot is already finalized - add to pending pool instead of staging
-                    // Check both finalized_slots (for recent slots) and current_slot (for pruned ancient slots)
+                    // Check both finalized_slots (for recent slots) and current_slot (for pruned
+                    // ancient slots)
                     let current_slot_value = current_slot_tracker.load(Ordering::SeqCst) - 1;
                     if parsed.slot < current_slot_value || finalized_slots_clone.contains(&parsed.slot) {
                         info!(
@@ -240,7 +252,8 @@ pub(super) fn spawn_tx_processors(config: TxProcessorConfig) -> Vec<JoinHandle<(
                     let job_id_u64 = parsed.job_id as u64;
                     let target_slot = parsed.slot;
 
-                    // Stage the batch (transaction processing happens during finalization via write_to_indexer)
+                    // Stage the batch (transaction processing happens during finalization via
+                    // write_to_indexer)
                     let slot_len = {
                         let mut entry = staged_batches_clone.entry(target_slot).or_default();
                         entry.insert(job_id_u64, parsed);
@@ -257,7 +270,6 @@ pub(super) fn spawn_tx_processors(config: TxProcessorConfig) -> Vec<JoinHandle<(
 
     handles
 }
-
 
 fn write_to_indexer(
     processor_id: usize,

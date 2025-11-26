@@ -36,9 +36,9 @@ use solana_sdk::{
 };
 use solana_svm::transaction_processing_result::ProcessedTransaction;
 use solana_transaction_status::{
-    map_inner_instructions, Encodable, EncodedTransaction, EncodedTransactionWithStatusMeta, TransactionDetails,
-    TransactionStatusMeta, TransactionWithStatusMeta, UiConfirmedBlock, UiInnerInstructions, UiReturnDataEncoding,
-    UiTransactionEncoding, UiTransactionReturnData, VersionedTransactionWithStatusMeta,
+    map_inner_instructions, Encodable, EncodedTransactionWithStatusMeta, TransactionDetails, TransactionStatusMeta,
+    TransactionWithStatusMeta, UiConfirmedBlock, UiInnerInstructions, UiReturnDataEncoding, UiTransactionEncoding,
+    UiTransactionReturnData, VersionedTransactionWithStatusMeta,
 };
 use spl_token_2022::{extension::StateWithExtensions, state::Mint};
 use thiserror::Error;
@@ -2816,7 +2816,10 @@ impl RpcServer for RpcServerState {
         let (_, recent_hash) = self.get_latest_context()?;
 
         if self.forward_to.is_some() {
-            match self.try_forward_to("requestAirdrop", json!([pubkey_str, lamports])).await {
+            match self
+                .try_forward_to("requestAirdrop", json!([pubkey_str, lamports]))
+                .await
+            {
                 Ok(r) => Ok(r.get("result").and_then(|v| v.as_str()).unwrap_or_default().to_string()),
                 Err(e) => Err(RpcCustomError::ForwardingError(e.to_string()).into()),
             }

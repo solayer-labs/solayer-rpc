@@ -172,44 +172,36 @@ impl HttpClient {
     pub async fn get_snapshots(&self) -> Result<Snapshots> {
         let url = format!("{}/solayer/snapshots", self.base_url);
         info!("Getting snapshots from {}", url);
-        
+
         // Infinite retry with exponential backoff (capped at 1 minute)
         const INITIAL_BACKOFF_MS: u64 = 100;
         const MAX_BACKOFF_MS: u64 = 60_000; // 1 minute
         const BACKOFF_MULTIPLIER: f64 = 2.0;
-        
+
         let mut attempt = 1u32;
         loop {
             match self.client.get(&url).send().await {
-                Ok(response) => {
-                    match response.json::<SnapshotsResponse>().await {
-                        Ok(snapshots) => {
-                            return Ok(Snapshots::from(snapshots));
-                        }
-                        Err(e) => {
-                            warn!(
-                                "Failed to parse snapshots response (attempt {}): {}, retrying...",
-                                attempt, e
-                            );
-                        }
+                Ok(response) => match response.json::<SnapshotsResponse>().await {
+                    Ok(snapshots) => {
+                        return Ok(Snapshots::from(snapshots));
                     }
-                }
+                    Err(e) => {
+                        warn!(
+                            "Failed to parse snapshots response (attempt {}): {}, retrying...",
+                            attempt, e
+                        );
+                    }
+                },
                 Err(e) => {
-                    warn!(
-                        "Failed to get snapshots (attempt {}): {}, retrying...",
-                        attempt, e
-                    );
+                    warn!("Failed to get snapshots (attempt {}): {}, retrying...", attempt, e);
                 }
             }
-            
+
             // Calculate exponential backoff with cap
             let exponential_backoff = (INITIAL_BACKOFF_MS as f64 * BACKOFF_MULTIPLIER.powi(attempt as i32 - 1)) as u64;
             let backoff_ms = exponential_backoff.min(MAX_BACKOFF_MS);
-            
-            warn!(
-                "Retrying get_snapshots in {}ms (attempt {})",
-                backoff_ms, attempt
-            );
+
+            warn!("Retrying get_snapshots in {}ms (attempt {})", backoff_ms, attempt);
             sleep(Duration::from_millis(backoff_ms)).await;
             attempt += 1;
         }

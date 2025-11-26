@@ -58,7 +58,7 @@ use solana_svm_transaction::svm_message::SVMMessage;
 
 use crate::{
     blockhash_generator::DummyRpcBlockhashGenerator, committer::CommitEvent, fork_graph::EmptyForkGraph,
-    metrics::BankMetrics, subscription::Notifier, wal, SCHEDULER_WORKER_COUNT,
+    metrics::BankMetrics, subscription::Notifier, wal_writer, SCHEDULER_WORKER_COUNT,
 };
 
 pub fn get_feature_set() -> FeatureSet {
@@ -580,9 +580,11 @@ impl Bank {
             }
         }
 
-        
         match self.slot_job_ids.get(&slot) {
-            Some(raw_slot) => info!("mark_slot_range_finalized: slot ({slot}) {:?} finalized", raw_slot.job_ids),
+            Some(raw_slot) => info!(
+                "mark_slot_range_finalized: slot ({slot}) {:?} finalized",
+                raw_slot.job_ids
+            ),
             None => info!("mark_slot_range_finalized: slot ({slot}) not found"),
         }
     }

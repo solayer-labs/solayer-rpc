@@ -12,11 +12,10 @@ use std::{
 
 use base64::Engine;
 use clap::Parser;
-use infinisvm_core::{bank::Bank, indexer::Indexer, subscription::SubscriptionProcessor};
+use infinisvm_core::{bank::Bank, indexer::Indexer, s3::S3FsClient, subscription::SubscriptionProcessor};
 use infinisvm_indexer::{
     db::{MultiDatabaseIndexer, NoopIndexer},
     in_memory::InMemoryIndexer,
-    s3::S3FsClient,
 };
 use infinisvm_jsonrpc::{rpc_impl::RpcServer, rpc_state::RpcIndexer};
 use infinisvm_logger::{error, info};

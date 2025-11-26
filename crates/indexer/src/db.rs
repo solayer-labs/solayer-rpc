@@ -18,9 +18,9 @@ use cdrs_tokio::{
     transport::TransportTcp,
 };
 use futures_util::pin_mut;
-use infinisvm_core::indexer::Indexer;
+use infinisvm_core::{indexer::Indexer, s3::S3FsClient};
 use infinisvm_jsonrpc::rpc_state::RpcIndexer;
-use infinisvm_logger::{debug, error, info, timer::ScopedTimer, warn};
+use infinisvm_logger::{debug, error, info, timer::ScopedTimer};
 use infinisvm_types::{
     convert::{to_signature_rows, to_tx_row, token_balance_diff_from_diffs},
     jobs::ConsumedJob,
@@ -49,7 +49,6 @@ use tokio_postgres::binary_copy::BinaryCopyInWriter;
 use crate::{
     map_inner_instructions,
     metrics::{DatabaseIndexerMetrics, MultiDatabaseIndexerMetrics},
-    s3::S3FsClient,
 };
 
 const DEFAULT_CACHE_SIZE: usize = 5000;
@@ -2097,20 +2096,10 @@ impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB> I
                     futures.push(fut);
                 }
                 tokio::runtime::Runtime::new().unwrap().block_on(async move {
-                    let mut any_error = false;
                     for fut in futures {
                         if let Err(e) = fut.await {
                             error!("Error writing to S3: {}", e);
-                            any_error = true;
                         }
-                    }
-                    if !any_error {
-                        match infinisvm_core::wal::delete_slot(slot) {
-                            Ok(count) => info!("WAL cleanup succeeded for slot {} ({} files)", slot, count),
-                            Err(e) => warn!("WAL cleanup failed for slot {}: {}", slot, e),
-                        }
-                    } else {
-                        warn!("Skipping WAL cleanup for slot {} due to S3 upload errors", slot);
                     }
                 });
             });

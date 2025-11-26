@@ -3,11 +3,6 @@ use std::{
     fs::{self, File},
     io::{Read, Write},
     path::{Path, PathBuf},
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
-    time::Duration,
 };
 
 use infinisvm_db::persistence::DB_DIRECTORY;
@@ -209,107 +204,4 @@ fn parse_u64_stem(name: std::ffi::OsString) -> Option<u64> {
     let s = name.to_str()?;
     let stem = s.strip_suffix(".bin")?;
     stem.parse::<u64>().ok()
-}
-
-pub fn spawn(exit: Arc<AtomicBool>) {
-    std::thread::Builder::new()
-        .name("walDeleter".to_string())
-        .spawn(move || {
-            worker(exit);
-        })
-        .unwrap();
-}
-
-fn worker(exit: Arc<AtomicBool>) {
-    info!("walDeleter started");
-
-    const CHECK_INTERVAL_SECS: u64 = 60;
-
-    while !exit.load(Ordering::Relaxed) {
-        delete_old_batches();
-        std::thread::sleep(Duration::from_secs(CHECK_INTERVAL_SECS));
-    }
-
-    println!("walDeleter exited");
-}
-
-fn delete_old_batches() {
-    // remove all files under wal_root() older than 2 days, recursively
-    let root = wal_root();
-    if !root.exists() {
-        return;
-    }
-
-    let now = std::time::SystemTime::now();
-    let cutoff = Duration::from_secs(60 * 60 * 24 * 2);
-
-    let mut num_deleted = 0;
-    prune_dir_recursively(&root, now, cutoff, &mut num_deleted);
-    info!("Deleted {} old WAL files", num_deleted);
-}
-
-fn prune_dir_recursively(path: &Path, now: std::time::SystemTime, cutoff: Duration, num_deleted: &mut usize) {
-    let entries = match fs::read_dir(path) {
-        Ok(e) => e,
-        Err(e) => {
-            error!("Failed to read WAL dir {:?}: {}", path, e);
-            return;
-        }
-    };
-
-    for entry_result in entries {
-        let entry = match entry_result {
-            Ok(e) => e,
-            Err(e) => {
-                error!("Failed to read entry in {:?}: {}", path, e);
-                continue;
-            }
-        };
-
-        let entry_path = entry.path();
-        let file_type = match entry.file_type() {
-            Ok(t) => t,
-            Err(e) => {
-                error!("Failed to get type for {:?}: {}", entry_path, e);
-                continue;
-            }
-        };
-
-        if file_type.is_dir() {
-            prune_dir_recursively(&entry_path, now, cutoff, num_deleted);
-            continue;
-        }
-
-        if file_type.is_file() {
-            let metadata = match entry.metadata() {
-                Ok(m) => m,
-                Err(e) => {
-                    error!("Failed to get metadata for {:?}: {}", entry_path, e);
-                    continue;
-                }
-            };
-
-            let modified = match metadata.modified() {
-                Ok(m) => m,
-                Err(e) => {
-                    error!("Failed to read modified time for {:?}: {}", entry_path, e);
-                    continue;
-                }
-            };
-
-            match now.duration_since(modified) {
-                Ok(age) if age > cutoff => {
-                    if let Err(e) = fs::remove_file(&entry_path) {
-                        error!("Failed to delete old WAL file {:?}: {}", entry_path, e);
-                    } else {
-                        *num_deleted += 1;
-                    }
-                }
-                Ok(_) => {}
-                Err(_) => {
-                    // modified time is in the future; skip
-                }
-            }
-        }
-    }
 }

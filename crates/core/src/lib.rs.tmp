@@ -3,8 +3,10 @@ pub mod bank;
 mod blockhash_generator;
 pub mod committer;
 pub mod quic_tx_receiver;
+pub mod s3;
 pub mod ticker;
-pub mod wal;
+pub mod wal_uploader;
+pub mod wal_writer;
 pub mod worker;
 
 #[cfg(feature = "devnet")]

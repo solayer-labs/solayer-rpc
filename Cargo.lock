@@ -2574,6 +2574,7 @@ dependencies = [
  "crossbeam-channel",
  "dashmap",
  "eyre",
+ "futures-util",
  "hashbrown 0.14.5",
  "infinisvm-db",
  "infinisvm-logger",
@@ -2583,6 +2584,7 @@ dependencies = [
  "jsonrpsee",
  "metrics",
  "min-max-heap",
+ "object_store",
  "paste",
  "quinn",
  "rand 0.8.5",
@@ -2607,6 +2609,7 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
+ "zstd 0.13.3",
 ]
 
 [[package]]

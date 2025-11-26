@@ -1,10 +1,11 @@
-use eyre::Result;
-use futures_util::future;
-use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
 };
+
+use eyre::Result;
+use futures_util::future;
+use serde::{Deserialize, Serialize};
 use tokio::task;
 use walkdir::{DirEntry, WalkDir};
 use zstd::decode_all;
@@ -68,8 +69,8 @@ fn in_range(slot: u64, min_slot: Option<u64>, max_slot: Option<u64>) -> bool {
     true
 }
 
-/// Enumerate all slot archives located under the provided root directory, applying
-/// optional lower/upper slot bounds.
+/// Enumerate all slot archives located under the provided root directory,
+/// applying optional lower/upper slot bounds.
 pub fn enumerate_archives(
     root: &Path,
     min_slot: Option<u64>,
@@ -240,10 +241,8 @@ pub async fn load_slots(root: &Path, min_slot: u64, max_slot: u64) -> Result<Has
     let results = future::join_all(load_futures).await;
 
     // Insert successful loads into the HashMap
-    for result in results {
-        if let Some((slot, slot_data)) = result {
-            slots.insert(slot, slot_data);
-        }
+    for (slot, slot_data) in results.into_iter().flatten() {
+        slots.insert(slot, slot_data);
     }
 
     Ok(slots)
@@ -251,9 +250,10 @@ pub async fn load_slots(root: &Path, min_slot: u64, max_slot: u64) -> Result<Has
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use tempfile::TempDir;
     use zstd::stream::encode_all;
+
+    use super::*;
 
     fn create_slot(root: &Path, slot: u64, shard_counts: &[usize]) {
         let path = slot_directory(root, slot);

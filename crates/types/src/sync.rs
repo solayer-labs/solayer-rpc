@@ -779,15 +779,17 @@ pub mod grpc {
                                                 compression_ratio: u64,
                                             }
                                             bincode::deserialize::<LegacyCommitBatchNotification>(message_bytes).map(
-                                                |legacy| CommitBatchNotification::Batch(BatchData {
-                                                    slot: legacy.slot,
-                                                    timestamp: legacy.timestamp,
-                                                    batch_size: legacy.batch_size,
-                                                    compressed_transactions: legacy.compressed_transactions,
-                                                    compression_ratio: legacy.compression_ratio,
-                                                    job_id: 0,
-                                                    worker_id: legacy.worker_id,
-                                                }),
+                                                |legacy| {
+                                                    CommitBatchNotification::Batch(BatchData {
+                                                        slot: legacy.slot,
+                                                        timestamp: legacy.timestamp,
+                                                        batch_size: legacy.batch_size,
+                                                        compressed_transactions: legacy.compressed_transactions,
+                                                        compression_ratio: legacy.compression_ratio,
+                                                        job_id: 0,
+                                                        worker_id: legacy.worker_id,
+                                                    })
+                                                },
                                             )
                                         });
 

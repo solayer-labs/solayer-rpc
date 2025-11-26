@@ -83,7 +83,12 @@ pub async fn start_server(
         }
     });
 
-    tokio::spawn(start_http_server(http_addr, db_path.clone(), slots_path.clone(), sync_state.clone()));
+    tokio::spawn(start_http_server(
+        http_addr,
+        db_path.clone(),
+        slots_path.clone(),
+        sync_state.clone(),
+    ));
 
     Ok(sync_state)
 }

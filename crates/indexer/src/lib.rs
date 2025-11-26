@@ -1,7 +1,6 @@
 pub mod db;
 pub mod db_args;
 pub mod in_memory;
-pub mod s3;
 
 mod metrics;
 

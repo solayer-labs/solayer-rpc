@@ -16,7 +16,7 @@ use rand::Rng;
 use solana_hash::Hash;
 use solana_sha256_hasher::{hashv, Hasher};
 
-use crate::{bank::Bank, wal};
+use crate::{bank::Bank, wal_writer};
 
 pub type PerfSample = (u64, u64, u64, u64); // slot(sampled at), num_transactions, num_slots, sample_duration
 
@@ -194,7 +194,7 @@ impl Committer {
 
                         if let Some(ref broadcaster) = self.batch_broadcaster {
                             if !previous_batch.is_empty() {
-                                if let Err(e) = wal::persist_batch(&previous_batch) {
+                                if let Err(e) = wal_writer::persist_batch(&previous_batch) {
                                     warn!(
                                         "Failed to persist WAL for job before broadcast: {}. Will retry later.",
                                         e
@@ -272,7 +272,7 @@ impl Committer {
         );
 
         if let Some(ref broadcaster) = self.batch_broadcaster {
-            if let Err(e) = wal::persist_batch(&batch) {
+            if let Err(e) = wal_writer::persist_batch(&batch) {
                 warn!(
                     "Failed to persist WAL for job before broadcast: {}. Will retry later.",
                     e

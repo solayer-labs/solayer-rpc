@@ -1,14 +1,20 @@
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
 use axum::{
-    Router, extract::{Path, Query, State}, response::{IntoResponse, Response}, routing::get
+    extract::{Path, Query, State},
+    response::{IntoResponse, Response},
+    routing::get,
+    Router,
 };
 use infinisvm_logger::info;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tower_http::compression::CompressionLayer;
 
-use crate::{slots::{self, SlotData}, state::SyncState};
+use crate::{
+    slots::{self, SlotData},
+    state::SyncState,
+};
 
 #[derive(Clone)]
 pub struct AppState {
