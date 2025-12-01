@@ -17,7 +17,6 @@ use cdrs_tokio::{
     load_balancing::RoundRobinLoadBalancingStrategy,
     transport::TransportTcp,
 };
-use futures_util::pin_mut;
 use infinisvm_core::{indexer::Indexer, s3::S3FsClient};
 use infinisvm_jsonrpc::rpc_state::RpcIndexer;
 use infinisvm_logger::{debug, error, info, timer::ScopedTimer};
@@ -43,8 +42,6 @@ use solana_sdk::{
     transaction::VersionedTransaction,
 };
 use solana_transaction_status_client_types::{TransactionStatusMeta, TransactionTokenBalance};
-// Removed SortedVec usage to avoid O(n) per-insert cost under contention
-use tokio_postgres::binary_copy::BinaryCopyInWriter;
 
 use crate::{
     map_inner_instructions,
@@ -383,81 +380,6 @@ impl IndexerDB for ClickhouseIndexerDB {
 
     fn require_distributed() -> bool {
         true
-    }
-}
-
-#[derive(Clone)]
-pub struct PostgresIndexerDB {
-    client: Arc<bb8::Pool<bb8_postgres::PostgresConnectionManager<tokio_postgres::NoTls>>>,
-}
-
-impl PostgresIndexerDB {
-    pub async fn new(pg_url: &str) -> Self {
-        println!("Connecting to {pg_url}");
-        let manager =
-            bb8_postgres::PostgresConnectionManager::new_from_stringlike(pg_url, tokio_postgres::NoTls).unwrap();
-        let pool = bb8::Pool::builder().max_size(15).build(manager).await.unwrap();
-
-        Self { client: Arc::new(pool) }
-    }
-
-    async fn get_client(
-        &self,
-    ) -> bb8::PooledConnection<bb8_postgres::PostgresConnectionManager<tokio_postgres::NoTls>> {
-        self.client.get().await.unwrap()
-    }
-}
-
-#[async_trait]
-impl IndexerDB for PostgresIndexerDB {
-    type Error = tokio_postgres::Error;
-
-    async fn insert_native_block<T: RowTy>(
-        &self,
-        table_name: &str,
-        columns: &[&str],
-        block: Vec<T>,
-    ) -> Result<(), Self::Error> {
-        if block.is_empty() {
-            return Ok(());
-        }
-        let conn = self.get_client().await;
-        let sink = conn
-            .copy_in(&format!(
-                "COPY {} ({}) FROM STDIN BINARY",
-                table_name,
-                columns.join(",")
-            ))
-            .await?;
-        let writer = BinaryCopyInWriter::new(sink, &block[0].postgres_types());
-        pin_mut!(writer);
-        for row in block {
-            row.write_to_postgres(writer.as_mut()).await?;
-        }
-        writer.finish().await?;
-        Ok(())
-    }
-
-    async fn execute(&self, query: &str) -> Result<(), Self::Error> {
-        let conn = self.get_client().await;
-        conn.execute(query, &[]).await?;
-        Ok(())
-    }
-
-    async fn query_collect<T: RowTy>(&self, query: &str) -> Result<Vec<T>, Self::Error> {
-        let conn: bb8::PooledConnection<'_, bb8_postgres::PostgresConnectionManager<tokio_postgres::NoTls>> =
-            self.get_client().await;
-        let result = conn.query(query, &[]).await?;
-        Ok(result.into_iter().map(|row| T::from_postgres(row)).collect())
-    }
-
-    fn to_array_string(bytes: &[u8]) -> String {
-        let x = format!("'\\x{}'::bytea", hex::encode(bytes));
-        x
-    }
-
-    fn require_distributed() -> bool {
-        false
     }
 }
 

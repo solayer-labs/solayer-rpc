@@ -41,7 +41,7 @@ fn slot_for_entry(entry: &DirEntry) -> Option<u64> {
     entry
         .path()
         .components()
-        .last()
+        .next_back()
         .and_then(|component| component.as_os_str().to_str())
         .and_then(|s| s.parse::<u64>().ok())
 }

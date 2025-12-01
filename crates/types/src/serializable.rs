@@ -1,6 +1,3 @@
-use std::pin::Pin;
-
-use async_trait::async_trait;
 use cdrs_tokio::types::ByIndex;
 use klickhouse::Row;
 use serde::{Deserialize, Serialize};
@@ -14,7 +11,6 @@ use solana_sdk::{
 };
 use solana_svm::transaction_execution_result::ExecutedTransaction;
 use solana_transaction_context::TransactionReturnData;
-use tokio_postgres::binary_copy::BinaryCopyInWriter;
 
 use crate::convert::calculate_diff_successful_tx_for_processed_tx;
 
@@ -50,35 +46,7 @@ pub struct SignatureRow {
     pub seq_number: u64,
 }
 
-#[async_trait]
 impl RowTy for SignatureRow {
-    fn postgres_types(&self) -> Vec<tokio_postgres::types::Type> {
-        vec![
-            tokio_postgres::types::Type::BYTEA, // account
-            tokio_postgres::types::Type::BYTEA, // signature
-            tokio_postgres::types::Type::INT8,  // slot
-            tokio_postgres::types::Type::INT8,  // block_unix_timestamp
-            tokio_postgres::types::Type::INT8,  // seq_number
-        ]
-    }
-
-    async fn write_to_postgres(&self, writer: Pin<&mut BinaryCopyInWriter>) -> Result<(), tokio_postgres::Error> {
-        writer
-            .write(&[
-                &self.account.to_vec(),
-                &self.signature.to_vec(),
-                &(self.slot as i64),
-                &(self.block_unix_timestamp as i64),
-                &(self.seq_number as i64),
-            ])
-            .await?;
-        Ok(())
-    }
-
-    fn from_postgres(_: tokio_postgres::Row) -> Self {
-        unreachable!()
-    }
-
     fn into_query_values(self) -> Vec<String> {
         vec![
             format!("0x{}", hex::encode(self.account)),
@@ -248,39 +216,7 @@ impl Ord for TxRow {
     }
 }
 
-#[async_trait]
 impl RowTy for TxRow {
-    fn postgres_types(&self) -> Vec<tokio_postgres::types::Type> {
-        vec![
-            tokio_postgres::types::Type::BYTEA, // signature
-            tokio_postgres::types::Type::BYTEA, // transaction
-            tokio_postgres::types::Type::BYTEA, // result
-            tokio_postgres::types::Type::INT8,  // slot
-            tokio_postgres::types::Type::BYTEA, // pre_accounts
-            tokio_postgres::types::Type::INT8,  // block_unix_timestamp
-            tokio_postgres::types::Type::INT8,  // seq_number
-        ]
-    }
-
-    async fn write_to_postgres(&self, writer: Pin<&mut BinaryCopyInWriter>) -> Result<(), tokio_postgres::Error> {
-        writer
-            .write(&[
-                &self.signature.to_vec(),
-                &self.transaction.to_vec(),
-                &self.result.to_vec(),
-                &(self.slot as i64),
-                &self.pre_accounts.to_vec(),
-                &(self.block_unix_timestamp as i64),
-                &(self.seq_number as i64),
-            ])
-            .await?;
-        Ok(())
-    }
-
-    fn from_postgres(_: tokio_postgres::Row) -> Self {
-        unreachable!()
-    }
-
     fn into_query_values(self) -> Vec<String> {
         vec![
             format!("0x{}", hex::encode(self.signature)),
@@ -323,59 +259,7 @@ impl TxRowWithTimestamp {
     }
 }
 
-macro_rules! to_klickhouse_bytes {
-    ($row:expr, $col:expr) => {
-        klickhouse::Bytes::from($row.get::<_, &[u8]>($col).to_vec())
-    };
-}
-
-macro_rules! to_u64 {
-    ($row:expr, $col:expr) => {
-        $row.get::<_, i64>($col) as u64
-    };
-}
-
-#[async_trait]
 impl RowTy for TxRowWithTimestamp {
-    fn postgres_types(&self) -> Vec<tokio_postgres::types::Type> {
-        vec![
-            tokio_postgres::types::Type::BYTEA, // signature
-            tokio_postgres::types::Type::BYTEA, // transaction
-            tokio_postgres::types::Type::BYTEA, // result
-            tokio_postgres::types::Type::INT8,  // slot
-            tokio_postgres::types::Type::BYTEA, // pre_accounts
-            tokio_postgres::types::Type::INT8,  // block_unix_timestamp
-            tokio_postgres::types::Type::INT8,  // seq_number
-        ]
-    }
-
-    async fn write_to_postgres(&self, writer: Pin<&mut BinaryCopyInWriter>) -> Result<(), tokio_postgres::Error> {
-        writer
-            .write(&[
-                &self.signature.to_vec(),
-                &self.transaction.to_vec(),
-                &self.result.to_vec(),
-                &(self.slot as i64),
-                &self.pre_accounts.to_vec(),
-                &(self.block_unix_timestamp as i64),
-                &(self.seq_number as i64),
-            ])
-            .await?;
-        Ok(())
-    }
-
-    fn from_postgres(row: tokio_postgres::Row) -> Self {
-        Self {
-            signature: to_klickhouse_bytes!(row, 0),
-            transaction: to_klickhouse_bytes!(row, 1),
-            result: to_klickhouse_bytes!(row, 2),
-            slot: to_u64!(row, 3),
-            pre_accounts: to_klickhouse_bytes!(row, 4),
-            block_unix_timestamp: to_u64!(row, 5),
-            seq_number: to_u64!(row, 6),
-        }
-    }
-
     fn into_query_values(self) -> Vec<String> {
         vec![
             format!("0x{}", hex::encode(self.signature.to_vec())),
@@ -409,38 +293,7 @@ pub struct SlotRow {
     pub parent_blockhash: klickhouse::Bytes,
 }
 
-#[async_trait]
 impl RowTy for SlotRow {
-    fn postgres_types(&self) -> Vec<tokio_postgres::types::Type> {
-        vec![
-            tokio_postgres::types::Type::INT8,  // slot
-            tokio_postgres::types::Type::INT8,  // block_unix_timestamp
-            tokio_postgres::types::Type::BYTEA, // blockhash
-            tokio_postgres::types::Type::BYTEA, // parent_blockhash
-        ]
-    }
-
-    async fn write_to_postgres(&self, writer: Pin<&mut BinaryCopyInWriter>) -> Result<(), tokio_postgres::Error> {
-        writer
-            .write(&[
-                &(self.slot as i64),
-                &(self.block_unix_timestamp as i64),
-                &self.blockhash.to_vec(),
-                &self.parent_blockhash.to_vec(),
-            ])
-            .await?;
-        Ok(())
-    }
-
-    fn from_postgres(row: tokio_postgres::Row) -> Self {
-        Self {
-            slot: to_u64!(row, 0),
-            block_unix_timestamp: to_u64!(row, 1),
-            blockhash: to_klickhouse_bytes!(row, 2),
-            parent_blockhash: to_klickhouse_bytes!(row, 3),
-        }
-    }
-
     fn into_query_values(self) -> Vec<String> {
         vec![
             self.slot.to_string(),
@@ -466,24 +319,7 @@ pub struct AccountOwnerRow {
     pub owner: [u8; 32],
 }
 
-#[async_trait]
 impl RowTy for AccountOwnerRow {
-    fn postgres_types(&self) -> Vec<tokio_postgres::types::Type> {
-        vec![
-            tokio_postgres::types::Type::BYTEA, // account
-            tokio_postgres::types::Type::BYTEA, // owner
-        ]
-    }
-
-    async fn write_to_postgres(&self, writer: Pin<&mut BinaryCopyInWriter>) -> Result<(), tokio_postgres::Error> {
-        writer.write(&[&self.account.to_vec(), &self.owner.to_vec()]).await?;
-        Ok(())
-    }
-
-    fn from_postgres(_: tokio_postgres::Row) -> Self {
-        unreachable!()
-    }
-
     fn into_query_values(self) -> Vec<String> {
         vec![
             format!("0x{}", hex::encode(self.account)),
@@ -504,33 +340,7 @@ pub struct AccountMintRow {
     pub account_type: u8,
 }
 
-#[async_trait]
 impl RowTy for AccountMintRow {
-    fn postgres_types(&self) -> Vec<tokio_postgres::types::Type> {
-        vec![
-            tokio_postgres::types::Type::BYTEA, // account
-            tokio_postgres::types::Type::BYTEA, // owner
-            tokio_postgres::types::Type::BYTEA, // mint
-            tokio_postgres::types::Type::INT2,  // account_type
-        ]
-    }
-
-    async fn write_to_postgres(&self, writer: Pin<&mut BinaryCopyInWriter>) -> Result<(), tokio_postgres::Error> {
-        writer
-            .write(&[
-                &self.account.to_vec(),
-                &self.owner.to_vec(),
-                &self.mint.to_vec(),
-                &(self.account_type as i16),
-            ])
-            .await?;
-        Ok(())
-    }
-
-    fn from_postgres(_: tokio_postgres::Row) -> Self {
-        unreachable!()
-    }
-
     fn into_query_values(self) -> Vec<String> {
         vec![
             format!("0x{}", hex::encode(self.account)),
@@ -550,25 +360,7 @@ pub struct SingleAccountRow {
     pub account: klickhouse::Bytes,
 }
 
-#[async_trait]
 impl RowTy for SingleAccountRow {
-    fn postgres_types(&self) -> Vec<tokio_postgres::types::Type> {
-        vec![
-            tokio_postgres::types::Type::BYTEA, // account
-        ]
-    }
-
-    async fn write_to_postgres(&self, writer: Pin<&mut BinaryCopyInWriter>) -> Result<(), tokio_postgres::Error> {
-        writer.write(&[&self.account.to_vec()]).await?;
-        Ok(())
-    }
-
-    fn from_postgres(row: tokio_postgres::Row) -> Self {
-        Self {
-            account: to_klickhouse_bytes!(row, 0),
-        }
-    }
-
     fn into_query_values(self) -> Vec<String> {
         vec![format!("0x{}", hex::encode(self.account.to_vec()))]
     }
@@ -591,29 +383,7 @@ pub struct SingleSeqNumberRow {
     pub seq_number: u64,
 }
 
-#[async_trait]
 impl RowTy for SingleSignatureRow {
-    fn postgres_types(&self) -> Vec<tokio_postgres::types::Type> {
-        vec![
-            tokio_postgres::types::Type::BYTEA, // signature
-            tokio_postgres::types::Type::INT8,  // seq_number
-        ]
-    }
-
-    async fn write_to_postgres(&self, writer: Pin<&mut BinaryCopyInWriter>) -> Result<(), tokio_postgres::Error> {
-        writer
-            .write(&[&self.signature.to_vec(), &(self.seq_number as i64)])
-            .await?;
-        Ok(())
-    }
-
-    fn from_postgres(row: tokio_postgres::Row) -> Self {
-        Self {
-            signature: to_klickhouse_bytes!(row, 0),
-            seq_number: to_u64!(row, 1),
-        }
-    }
-
     fn into_query_values(self) -> Vec<String> {
         vec![
             format!("0x{}", hex::encode(self.signature.to_vec())),
@@ -629,23 +399,7 @@ impl RowTy for SingleSignatureRow {
     }
 }
 
-#[async_trait]
 impl RowTy for SingleSeqNumberRow {
-    fn postgres_types(&self) -> Vec<tokio_postgres::types::Type> {
-        vec![tokio_postgres::types::Type::INT8]
-    }
-
-    async fn write_to_postgres(&self, writer: Pin<&mut BinaryCopyInWriter>) -> Result<(), tokio_postgres::Error> {
-        writer.write(&[&(self.seq_number as i64)]).await?;
-        Ok(())
-    }
-
-    fn from_postgres(row: tokio_postgres::Row) -> Self {
-        Self {
-            seq_number: to_u64!(row, 0),
-        }
-    }
-
     fn into_query_values(self) -> Vec<String> {
         vec![self.seq_number.to_string()]
     }
@@ -755,11 +509,7 @@ impl TransactionExecutionDetailsSerializable {
     }
 }
 
-#[async_trait]
 pub trait RowTy: Row + Send + Sync + 'static {
-    fn postgres_types(&self) -> Vec<tokio_postgres::types::Type>;
-    async fn write_to_postgres(&self, writer: Pin<&mut BinaryCopyInWriter>) -> Result<(), tokio_postgres::Error>;
-    fn from_postgres(row: tokio_postgres::Row) -> Self;
     fn into_query_values(self) -> Vec<String>;
     fn try_from_row(row: &cassandra_protocol::types::rows::Row) -> Result<Self, cdrs_tokio::Error>;
 }
