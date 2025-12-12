@@ -152,7 +152,7 @@ async fn handle_batch_slots(State(state): State<Arc<AppState>>, Query(query): Qu
     if min_slot > max_slot {
         return (
             axum::http::StatusCode::BAD_REQUEST,
-            format!("min_slot ({min_slot}) must be <= max_slot ({max_slot})"),
+            format!("min_slot ({}) must be <= max_slot ({})", min_slot, max_slot),
         )
             .into_response();
     }
@@ -162,7 +162,7 @@ async fn handle_batch_slots(State(state): State<Arc<AppState>>, Query(query): Qu
     if max_slot - min_slot > slots::MAX_SLOT_RANGE as u64 {
         return (
             axum::http::StatusCode::BAD_REQUEST,
-            format!("Slot range is too large: {min_slot} - {max_slot}"),
+            format!("Slot range is too large: {} - {}", min_slot, max_slot),
         )
             .into_response();
     }
@@ -174,7 +174,7 @@ async fn handle_batch_slots(State(state): State<Arc<AppState>>, Query(query): Qu
             infinisvm_logger::error!("Failed to load batch slots: {}", e);
             (
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to load slots: {e}"),
+                format!("Failed to load slots: {}", e),
             )
                 .into_response()
         }

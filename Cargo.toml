@@ -77,6 +77,7 @@ infinisvm-logger = { path = "./crates/logger" }
 infinisvm-types = { path = "crates/types" }
 infinisvm-sync = { path = "crates/sync" }
 
+tokio-postgres = { version = "0.7.13" }
 
 spl-token = "=6.0.0"
 spl-token-2022 = "=4.0.0"

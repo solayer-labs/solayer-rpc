@@ -148,7 +148,11 @@ impl Indexer for InMemoryIndexer {
             {
                 // Handle account_ops create
                 for (owner, account) in account_ops_create {
-                    self.state.account_ops.entry(owner).or_default().insert(account);
+                    self.state
+                        .account_ops
+                        .entry(owner)
+                        .or_default()
+                        .insert(account);
                 }
 
                 // Handle account_ops delete
@@ -161,7 +165,11 @@ impl Indexer for InMemoryIndexer {
                 // Handle account_ops_mint create
                 for (owner, account, account_type, mint) in account_ops_mint_create {
                     let key = (owner, account_type, mint);
-                    self.state.account_ops_mint.entry(key).or_default().insert(account);
+                    self.state
+                        .account_ops_mint
+                        .entry(key)
+                        .or_default()
+                        .insert(account);
                 }
 
                 // Handle account_ops_mint delete
