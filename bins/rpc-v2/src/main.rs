@@ -12,23 +12,28 @@ use std::{
 
 use base64::Engine;
 use clap::Parser;
+use eyre::Context as _;
 use infinisvm_core::{bank::Bank, indexer::Indexer, s3::S3FsClient, subscription::SubscriptionProcessor};
 use infinisvm_indexer::{
     db::{MultiDatabaseIndexer, NoopIndexer},
     in_memory::InMemoryIndexer,
 };
 use infinisvm_jsonrpc::{rpc_impl::RpcServer, rpc_state::RpcIndexer};
-use infinisvm_logger::{error, info};
+use infinisvm_logger::{error, info, warn};
 use infinisvm_sync::{
     grpc::{client::SyncClient, server::InfiniSVMServiceImpl, TransactionBatchBroadcaster},
     http_client::HttpClient,
-    SyncState,
 };
-use infinisvm_types::sync::grpc::{CommitBatchNotification, RawSlot};
+use infinisvm_types::sync::CommitBatchNotification;
 use jsonrpsee::server::Server;
 use metrics_exporter_prometheus::PrometheusBuilder;
-use tokio::sync::{mpsc, Mutex, RwLock as TokioRwLock};
+use tokio::sync::{mpsc, Mutex};
 use tonic::transport::Server as TonicServer;
+
+use crate::cold_start::{
+    slots_sync_progress::{SlotsSyncProgress, SlotsSyncProgressRecorder},
+    StartSlot,
+};
 
 mod cold_start;
 mod memory;
@@ -75,10 +80,6 @@ struct Args {
     #[arg(long, default_value = "127.0.0.1:3002")]
     metric_addr: SocketAddr,
 
-    /// Number of threads to use
-    #[arg(short, long, default_value = "10")]
-    num_threads: u64,
-
     /// TPU server address
     #[arg(long, default_value = "127.0.0.1:5005", value_parser = parse_socket_addr)]
     tpu_host: SocketAddr,
@@ -96,22 +97,22 @@ struct Args {
     #[arg(long, default_value = "")]
     sequencer_rpc_server_addr: String,
 
-    #[arg(long, default_value = "/mnt/data/slots-internal")]
+    #[arg(long, default_value = "/mnt/data/slots-rpc")]
     pub local_slots_path: PathBuf,
 
     /// S3 region (optional) for storing slots
-    #[arg(long, default_value = "us-west-2")]
-    pub s3_region: Option<String>,
+    #[arg(long, default_value = "us-west-2", env = "S3_REGION")]
+    pub s3_region: String,
 
-    #[arg(long, default_value = "s3://solayer-devnet/")]
+    #[arg(long, default_value = "s3://solayer-devnet")]
     pub s3_path: String,
 
     /// S3 access key id (optional) for storing slots
-    #[arg(long)]
+    #[arg(long, env = "S3_ACCESS_KEY_ID")]
     pub s3_access_key_id: Option<String>,
 
     /// S3 secret key (optional) for storing slots
-    #[arg(long)]
+    #[arg(long, env = "S3_SECRET_KEY")]
     pub s3_secret_key: Option<String>,
 
     /// One or more Ed25519 server public keys (hex/base58/base64) for TLS
@@ -123,6 +124,10 @@ struct Args {
     /// certs.
     #[arg(long)]
     pub grpc_server_cert: Option<String>,
+
+    /// Starting point for slot backfill: 'latest', 'checkpoint', or slot number
+    #[arg(long, default_value = "latest")]
+    pub start_slot: StartSlot,
 }
 
 type BoxError = Box<dyn Error + Send + Sync>;
@@ -136,15 +141,6 @@ async fn create_indexer(args: &Args) -> (Arc<Mutex<dyn Indexer>>, Arc<dyn RpcInd
         let rpc_indexer = Arc::new(InMemoryIndexer::new());
         return (indexer, rpc_indexer);
     }
-
-    // Region will be determined from S3_REGION env var or default to us-west-2
-    let s3 = S3FsClient::new_with_credentials(
-        args.local_slots_path.clone(),
-        args.s3_access_key_id.clone(),
-        args.s3_secret_key.clone(),
-        args.s3_path.clone(),
-        args.s3_region.clone(),
-    );
 
     let rep_factor = args.cassandra_replication_factor.unwrap_or(1);
     let mut pools = Vec::with_capacity(hosts.len());
@@ -175,9 +171,10 @@ async fn create_indexer(args: &Args) -> (Arc<Mutex<dyn Indexer>>, Arc<dyn RpcInd
             info!("Connected to Cassandra: {}", host);
         }
     }
-
-    let cassandra_indexer = Arc::new(Mutex::new(MultiDatabaseIndexer::new(pools, Some(s3.clone()))));
-    let cassandra_indexer_rpc = Arc::new(MultiDatabaseIndexer::new(readonly_pools, Some(s3.clone())));
+    // Set S3 to None temporarily so that we don't read from S3 when serving
+    // getBlockWithTransactions
+    let cassandra_indexer = Arc::new(Mutex::new(MultiDatabaseIndexer::new(pools, None)));
+    let cassandra_indexer_rpc = Arc::new(MultiDatabaseIndexer::new(readonly_pools, None));
 
     (cassandra_indexer, cassandra_indexer_rpc)
 }
@@ -234,11 +231,8 @@ fn init_metrics(metric_addr: SocketAddr) -> Result<(), BoxError> {
 async fn setup_downstream_grpc(
     batch_broadcaster: Arc<TransactionBatchBroadcaster>,
     grpc_listen_addr: SocketAddr,
-) -> Result<Arc<TokioRwLock<SyncState>>, BoxError> {
-    let (sync_state_inner, latest_slot_receiver) = SyncState::new(RawSlot::default());
-    let sync_state = Arc::new(TokioRwLock::new(sync_state_inner));
-    let grpc_service_impl =
-        InfiniSVMServiceImpl::new(sync_state.clone(), latest_slot_receiver, batch_broadcaster).await;
+) -> Result<(), BoxError> {
+    let grpc_service_impl = InfiniSVMServiceImpl::new(batch_broadcaster).await;
     let grpc_service = grpc_service_impl.into_service();
 
     tokio::spawn(async move {
@@ -253,7 +247,7 @@ async fn setup_downstream_grpc(
         }
     });
 
-    Ok(sync_state)
+    Ok(())
 }
 
 fn prepare_grpc_client_config(args: &Args) -> Result<GrpcClientConfig, BoxError> {
@@ -306,146 +300,52 @@ fn prepare_grpc_client_config(args: &Args) -> Result<GrpcClientConfig, BoxError>
     })
 }
 
-async fn connect_grpc_clients(config: &GrpcClientConfig, num_threads: u64) -> Result<Vec<SyncClient>, BoxError> {
-    info!(
-        "Connecting to gRPC server at: {}:{} - {} threads",
-        config.host, config.port, num_threads
-    );
+async fn connect_grpc_clients(config: &GrpcClientConfig) -> Result<SyncClient, BoxError> {
+    info!("Connecting to gRPC server at: {}:{}", config.host, config.port);
 
-    let mut clients = Vec::new();
-
-    for i in 0..num_threads {
-        let scheme = if config.use_tls { "https" } else { "http" };
-        let client_addr = format!("{}://{}:{}", scheme, config.host, config.port + i as u16);
-        info!(
-            "Connecting gRPC client {} to {} (tls={})",
-            i, client_addr, config.use_tls
-        );
-        let client = if config.use_tls {
-            SyncClient::connect_with_tls(
-                &client_addr,
-                Default::default(),
-                if config.allowed_server_pubkeys.is_empty() {
-                    None
-                } else {
-                    Some(config.allowed_server_pubkeys.clone())
-                },
-                config.root_ca_pem.clone(),
-            )
-            .await?
-        } else {
-            SyncClient::connect(&client_addr).await?
-        };
-        info!("gRPC client {} connected", i);
-        clients.push(client);
-    }
-
-    info!("Successfully connected to gRPC server");
-    Ok(clients)
+    let scheme = if config.use_tls { "https" } else { "http" };
+    let client_addr = format!("{}://{}:{}", scheme, config.host, config.port);
+    info!("Connecting gRPC client to {} (tls={})", client_addr, config.use_tls);
+    let client = if config.use_tls {
+        SyncClient::connect_with_tls(
+            &client_addr,
+            Default::default(),
+            if config.allowed_server_pubkeys.is_empty() {
+                None
+            } else {
+                Some(config.allowed_server_pubkeys.clone())
+            },
+            config.root_ca_pem.clone(),
+        )
+        .await?
+    } else {
+        SyncClient::connect(&client_addr).await?
+    };
+    Ok(client)
 }
 
 async fn subscribe_and_forward_streams(
-    clients: &mut [SyncClient],
+    client: &mut SyncClient,
     batch_broadcaster: Arc<TransactionBatchBroadcaster>,
-    sync_state: Arc<TokioRwLock<SyncState>>,
-) -> Result<
-    (
-        Vec<mpsc::Receiver<Arc<CommitBatchNotification>>>,
-        Vec<mpsc::Receiver<RawSlot>>,
-    ),
-    BoxError,
-> {
-    let mut tx_receivers = Vec::new();
-    let mut slot_receivers = Vec::new();
-    for (i, client) in clients.iter_mut().enumerate() {
-        info!("Subscribing transactions stream on client {}", i);
-        let tx_receiver = client.subscribe_transactions().await?;
-        info!("Subscribed transactions stream on client {}", i);
-        tx_receivers.push(tx_receiver);
+) -> Result<mpsc::Receiver<Arc<CommitBatchNotification>>, BoxError> {
+    let mut tx_receiver = client.subscribe_commit_batch_notifications().await?;
 
-        info!("Subscribing slots stream on client {}", i);
-        let slot_receiver = client.subscribe_slots().await?;
-        info!("Subscribed slots stream on client {}", i);
-        slot_receivers.push(slot_receiver);
-    }
-
-    let tx_receivers = tx_receivers
-        .into_iter()
-        .enumerate()
-        .map(|(i, mut upstream_rx)| {
-            let (forward_tx, forward_rx) = mpsc::channel(1024);
-            let broadcaster_clone = batch_broadcaster.clone();
-            tokio::spawn(async move {
-                info!("Transaction forwarder {} started", i);
-                while let Some(batch) = upstream_rx.recv().await {
-                    let shared_batch = Arc::new(batch);
-                    if let Err(e) = broadcaster_clone.publish_notification(shared_batch.clone()) {
-                        error!("Forwarder {} failed to publish batch: {}", i, e);
-                    }
-                    if forward_tx.send(shared_batch).await.is_err() {
-                        break;
-                    }
-                }
-                info!("Transaction forwarder {} terminated", i);
-            });
-            forward_rx
-        })
-        .collect::<Vec<_>>();
-
-    let slot_receivers = slot_receivers
-        .into_iter()
-        .enumerate()
-        .map(|(i, mut upstream_rx)| {
-            let (forward_tx, forward_rx) = mpsc::channel(1024);
-            let sync_state_clone = sync_state.clone();
-            tokio::spawn(async move {
-                info!("Slot forwarder {} started", i);
-                while let Some(slot) = upstream_rx.recv().await {
-                    {
-                        let mut state = sync_state_clone.write().await;
-                        state.latest_slot = slot.clone();
-                        state.notify_new_slot(slot.clone());
-                    }
-                    // if forward_tx.send(slot).await.is_err() {
-                    //     break;
-                    // }
-                }
-                info!("Slot forwarder {} terminated", i);
-            });
-            forward_rx
-        })
-        .collect::<Vec<_>>();
-
-    Ok((tx_receivers, slot_receivers))
-}
-
-async fn create_refetch_pool(
-    config: &GrpcClientConfig,
-    num_threads: u64,
-) -> Result<Arc<Vec<tokio::sync::Mutex<SyncClient>>>, BoxError> {
-    let mut refetch_clients = Vec::new();
-    for i in 0..num_threads {
-        let scheme = if config.use_tls { "https" } else { "http" };
-        let client_addr = format!("{}://{}:{}", scheme, config.host, config.port + i as u16);
-        let client = if config.use_tls {
-            SyncClient::connect_with_tls(
-                &client_addr,
-                Default::default(),
-                if config.allowed_server_pubkeys.is_empty() {
-                    None
-                } else {
-                    Some(config.allowed_server_pubkeys.clone())
-                },
-                config.root_ca_pem.clone(),
-            )
-            .await?
-        } else {
-            SyncClient::connect(&client_addr).await?
-        };
-        refetch_clients.push(tokio::sync::Mutex::new(client));
-    }
-
-    Ok(Arc::new(refetch_clients))
+    let (forward_tx, forward_rx) = mpsc::channel(1024);
+    let broadcaster_clone = batch_broadcaster.clone();
+    tokio::spawn(async move {
+        info!("Transaction forwarder started");
+        while let Some(batch) = tx_receiver.recv().await {
+            let shared_batch = Arc::new(batch);
+            if let Err(e) = broadcaster_clone.publish_notification(shared_batch.clone()) {
+                error!("Failed to publish batch: {}", e);
+            }
+            if forward_tx.send(shared_batch).await.is_err() {
+                break;
+            }
+        }
+        info!("Transaction forwarder terminated");
+    });
+    Ok(forward_rx)
 }
 
 fn build_http_server_addr(args: &Args) -> String {
@@ -484,12 +384,11 @@ async fn do_main() -> Result<(), BoxError> {
     init_metrics(args.metric_addr)?;
 
     let batch_broadcaster = Arc::new(TransactionBatchBroadcaster::new());
-    let sync_state = setup_downstream_grpc(batch_broadcaster.clone(), args.grpc_listen_addr).await?;
+    setup_downstream_grpc(batch_broadcaster.clone(), args.grpc_listen_addr).await?;
 
     let grpc_config = prepare_grpc_client_config(&args)?;
-    let mut clients = connect_grpc_clients(&grpc_config, args.num_threads).await?;
-    let (tx_receivers, slot_receivers) =
-        subscribe_and_forward_streams(&mut clients, batch_broadcaster.clone(), sync_state.clone()).await?;
+    let mut client = connect_grpc_clients(&grpc_config).await?;
+    let tx_receiver = subscribe_and_forward_streams(&mut client, batch_broadcaster.clone()).await?;
 
     let http_client = Arc::new(HttpClient::new(build_http_server_addr(&args)));
 
@@ -506,21 +405,66 @@ async fn do_main() -> Result<(), BoxError> {
     let total_transaction_count = Arc::new(AtomicU64::new(0));
     let samples = Arc::new(RwLock::new((Instant::now(), VecDeque::new())));
 
-    let refetch_pool = create_refetch_pool(&grpc_config, args.num_threads).await?;
+    let refetch_client = {
+        let mut clients = Vec::new();
+        let client = Mutex::new(connect_grpc_clients(&grpc_config).await?);
+        clients.push(client);
+        Arc::new(clients)
+    };
 
-    info!(
-        "Launching cold_start with {} tx streams and {} slot streams",
-        tx_receivers.len(),
-        slot_receivers.len()
-    );
+    // Initialize slots sync progress recorder
+    let progress_recorder = match SlotsSyncProgress::open(std::path::PathBuf::from("/mnt/data")) {
+        Ok(progress) => {
+            info!("Initialized slots sync progress recorder");
+            Some(SlotsSyncProgressRecorder::new(progress))
+        }
+        Err(e) => {
+            panic!("Failed to initialize slots sync progress recorder: {e}");
+        }
+    };
+
+    let start_slot = args.start_slot.clone();
+    info!("Configured start_slot={}", start_slot);
+
+    let backfill_s3_client = if matches!(start_slot.clone(), StartSlot::Latest) {
+        None
+    } else if let (Some(s3_access_key_id), Some(s3_secret_key)) =
+        (args.s3_access_key_id.clone(), args.s3_secret_key.clone())
+    {
+        // Extract bucket name from S3 URI (e.g., "s3://solayer-internalnet" ->
+        // "solayer-internalnet")
+        let s3_bucket_name = if let Some((bucket, _)) = parse_s3_uri(&args.s3_path) {
+            bucket
+        } else {
+            // If not a URI, assume it's already just the bucket name
+            args.s3_path.clone()
+        };
+
+        Some(
+            S3FsClient::new_with_credentials(
+                args.local_slots_path.clone(),
+                s3_access_key_id,
+                s3_secret_key,
+                s3_bucket_name.clone(),
+                args.s3_region.clone(),
+            )
+            .context("Failed to create S3FsClient")?,
+        )
+    } else {
+        warn!("Backfill needed but S3 credentials are not configured");
+        None
+    };
+
     let (handles, db_chain) = cold_start::cold_start(
         http_client,
-        tx_receivers,
-        slot_receivers,
+        tx_receiver,
         indexer,
         bank.clone(),
         subscription_processor.clone(),
-        refetch_pool,
+        refetch_client,
+        progress_recorder,
+        backfill_s3_client,
+        start_slot,
     )
     .await?;
     {
@@ -585,4 +529,29 @@ async fn do_main() -> Result<(), BoxError> {
     }
 
     Ok(())
+}
+
+fn parse_s3_uri(uri: &str) -> Option<(String, Option<String>)> {
+    let trimmed = uri.trim();
+    if !trimmed.starts_with("s3://") {
+        return None;
+    }
+
+    let remainder = &trimmed[5..];
+    if remainder.is_empty() {
+        return None;
+    }
+
+    let mut parts = remainder.splitn(2, '/');
+    let bucket = parts.next()?.trim();
+    if bucket.is_empty() {
+        return None;
+    }
+
+    let prefix = parts
+        .next()
+        .map(|s| s.trim_matches('/').to_string())
+        .filter(|s| !s.is_empty());
+
+    Some((bucket.to_string(), prefix))
 }

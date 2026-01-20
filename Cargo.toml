@@ -1,6 +1,5 @@
 [workspace]
 members = [
-
     "bins/rpc-v2",
 
     # instead of using wildcard, list independently
@@ -9,13 +8,14 @@ members = [
     "crates/indexer",
     "crates/jsonrpc",
     "crates/logger",
+    "crates/retirement",
     "crates/types",
     "crates/sync",
 ]
 resolver = "2"
 
 [workspace.dependencies]
-clap = { version = "4.5.35", features = ["derive"] }
+clap = { version = "4.5.35", features = ["derive", "env"] }
 ctrlc = { version = "3.4.7", features = ["termination"] }
 tokio = { version = "1.36", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
@@ -54,7 +54,15 @@ solana-fee = { git = "ssh://git@github.com/solayer-labs/agave.git", rev = "6a7b6
 solana-sha256-hasher = { version = "=2.2.1" }
 
 axum = "0.8.3"
-
+futures-core = "0.3"
+http-body-util = "0.1"
+http-body = "1.0"
+hyper = { version = "1.6", features = ["full"] }
+# Enable HTTPS for bincode client
+hyper-rustls = { version = "0.27", features = ["http2", "webpki-roots"] }
+rustls-pemfile = "2.2"
+rustls = "0.23"
+tower = "0.4"
 klickhouse = { version = "0.13", features = ["default", "bb8"] }
 jsonrpsee = { version = "0.24.7", features = [
     "macros",
@@ -76,8 +84,7 @@ infinisvm-core = { path = "./crates/core" }
 infinisvm-logger = { path = "./crates/logger" }
 infinisvm-types = { path = "crates/types" }
 infinisvm-sync = { path = "crates/sync" }
-
-tokio-postgres = { version = "0.7.13" }
+infinisvm-retirement = { path = "./crates/retirement" }
 
 spl-token = "=6.0.0"
 spl-token-2022 = "=4.0.0"
@@ -90,9 +97,8 @@ tonic-build = "0.13.1"
 tokio-stream = "0.1.17"
 
 quinn = { version = "0.11.7" }
-rustls = { version = "0.23.0" }
 rcgen = { version = "0.13.0" }
-bytes = "1.10.0"
+bytes = { version = "1.10.0", features = ["serde"] }
 metrics-exporter-prometheus = { version = "0.16" }
 prometheus = "0.13.4"
 dashmap = { version = "6.1.0" }
@@ -108,7 +114,6 @@ tower-http = { version = "0.6.2", features = [
     "trace",
     "timeout",
 ] }
-hyper = "1.6.0"
 pyroscope = { version = "0.5.8", default-features = true }
 pyroscope_pprofrs = { version = "0.2.10" }
 

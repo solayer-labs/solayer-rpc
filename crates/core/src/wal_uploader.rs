@@ -5,10 +5,11 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
-use infinisvm_logger::{error, info, warn};
+use infinisvm_logger::{error, info, info_span, tracing, warn};
+use jsonrpsee::tracing::Instrument;
 
 use crate::s3::S3FsClient;
 
@@ -65,11 +66,8 @@ pub fn run_slot_uploader(config: SlotUploaderConfig, exit: Arc<AtomicBool>) {
         .build()
         .unwrap();
 
-    // Store the runtime handle for use in spawn_blocking
-    let rt_handle = rt.handle().clone();
-
     while !exit.load(Ordering::Relaxed) {
-        if let Err(e) = rt.block_on(upload_cycle(&config, exit.clone(), rt_handle.clone())) {
+        if let Err(e) = rt.block_on(upload_cycle(&config, exit.clone())) {
             error!("Error in upload cycle: {e:?}");
         }
 
@@ -84,28 +82,17 @@ pub fn run_slot_uploader(config: SlotUploaderConfig, exit: Arc<AtomicBool>) {
     info!("Slot uploader shutting down");
 }
 
-async fn upload_cycle(
-    config: &SlotUploaderConfig,
-    exit: Arc<AtomicBool>,
-    rt_handle: tokio::runtime::Handle,
-) -> eyre::Result<()> {
+async fn upload_cycle(config: &SlotUploaderConfig, exit: Arc<AtomicBool>) -> eyre::Result<()> {
     info!("Scanning filesystem for slots...");
-    let all_slots = discover_slots(&config.base_dir)?;
+    let all_slots = discover_slots(&config.base_dir).await?;
     info!("Discovered {} slots", all_slots.len());
 
-    if all_slots.is_empty() {
+    let Some(latest_slot) = all_slots.iter().max().copied() else {
         info!("No slots found, waiting for next scan");
         return Ok(());
-    }
-
-    let latest_slot = all_slots
-        .iter()
-        .max()
-        .copied()
-        .ok_or_else(|| eyre::eyre!("No latest slot found"))?;
+    };
 
     info!("Latest slot: {}", latest_slot);
-
     let cutoff = latest_slot.saturating_sub(config.slot_buffer_size);
     let slots_to_upload: Vec<u64> = all_slots.into_iter().filter(|&slot| slot < cutoff).collect::<Vec<_>>();
 
@@ -134,25 +121,12 @@ async fn upload_cycle(
         let s3_client = config.s3_client.clone();
         let base_dir = config.base_dir.clone();
 
-        // Spawn blocking task - put_object uses blocking locks that aren't Send
-        // We need to run it in spawn_blocking to avoid Send trait issues
-        // Use the runtime handle from the main thread to ensure channel stays connected
-        let handle = tokio::task::spawn_blocking({
-            let base_dir = base_dir.clone();
-            let s3_client = s3_client.clone();
-            let rt_handle_for_blocking = rt_handle.clone();
-            let permit = permit;
-            move || {
-                // Use the runtime handle from the main thread
-                // This ensures the oneshot channel in put_object works correctly
-                // and the uploader workers stay connected
-                let result = rt_handle_for_blocking.block_on(upload_slot(&base_dir, &s3_client, slot));
-                drop(permit);
-                result
-            }
-        });
-
-        handles.push(handle);
+        handles.push(tokio::task::spawn(async move {
+            let _p = permit;
+            upload_slot(&base_dir, &s3_client, slot)
+                .instrument(info_span!("upload_slot", slot))
+                .await
+        }));
     }
 
     // Wait for all uploads to complete
@@ -168,7 +142,7 @@ async fn upload_cycle(
     Ok(())
 }
 
-fn discover_slots(base_dir: &Path) -> eyre::Result<HashSet<u64>> {
+async fn discover_slots(base_dir: &Path) -> eyre::Result<HashSet<u64>> {
     let mut slots = HashSet::new();
 
     if !base_dir.exists() {
@@ -176,9 +150,9 @@ fn discover_slots(base_dir: &Path) -> eyre::Result<HashSet<u64>> {
         return Ok(slots);
     }
 
-    let entries = std::fs::read_dir(base_dir)?;
+    let mut read_dir = tokio::fs::read_dir(base_dir).await?;
 
-    for p256_entry in entries.flatten() {
+    while let Some(p256_entry) = read_dir.next_entry().await? {
         let p256_path = p256_entry.path();
         if !p256_path.is_dir() {
             continue;
@@ -193,7 +167,7 @@ fn discover_slots(base_dir: &Path) -> eyre::Result<HashSet<u64>> {
             continue;
         };
 
-        let p65535_entries = match std::fs::read_dir(&p256_path) {
+        let mut p65535_entries = match tokio::fs::read_dir(&p256_path).await {
             Ok(entries) => entries,
             Err(e) => {
                 warn!("Failed to read directory {:?}: {e}", p256_path);
@@ -201,7 +175,7 @@ fn discover_slots(base_dir: &Path) -> eyre::Result<HashSet<u64>> {
             }
         };
 
-        for p65535_entry in p65535_entries.flatten() {
+        while let Some(p65535_entry) = p65535_entries.next_entry().await? {
             let p65535_path = p65535_entry.path();
             if !p65535_path.is_dir() {
                 continue;
@@ -216,7 +190,7 @@ fn discover_slots(base_dir: &Path) -> eyre::Result<HashSet<u64>> {
                 continue;
             };
 
-            let slot_entries = match std::fs::read_dir(&p65535_path) {
+            let mut slot_entries = match tokio::fs::read_dir(&p65535_path).await {
                 Ok(entries) => entries,
                 Err(e) => {
                     warn!("Failed to read directory {:?}: {e}", p65535_path);
@@ -224,7 +198,7 @@ fn discover_slots(base_dir: &Path) -> eyre::Result<HashSet<u64>> {
                 }
             };
 
-            for slot_entry in slot_entries.flatten() {
+            while let Some(slot_entry) = slot_entries.next_entry().await? {
                 let slot_path = slot_entry.path();
                 if !slot_path.is_dir() {
                     continue;
@@ -250,23 +224,23 @@ fn discover_slots(base_dir: &Path) -> eyre::Result<HashSet<u64>> {
     Ok(slots)
 }
 
+#[tracing::instrument(skip_all, fields(slot))]
 async fn upload_slot(base_dir: &Path, s3_client: &S3FsClient, slot: u64) -> eyre::Result<()> {
     let slot_dir = slot_directory(base_dir, slot);
-
     if !slot_dir.exists() || !slot_dir.is_dir() {
         return Ok(());
     }
 
     // Find all files in the slot directory
-    let files = find_files_in_dir(&slot_dir)?;
-
+    let files = find_files_in_dir_async(slot_dir.clone()).await?;
     if files.is_empty() {
         return Ok(());
     }
 
-    info!("Slot {} started ({} files)", slot, files.len());
+    info!("Started ({} files)", files.len());
 
     let mut uploaded_count = 0;
+    let start = Instant::now();
 
     // Upload all files
     for file_path in &files {
@@ -276,45 +250,32 @@ async fn upload_slot(base_dir: &Path, s3_client: &S3FsClient, slot: u64) -> eyre
             .ok_or_else(|| eyre::eyre!("Invalid path encoding"))?
             .replace('\\', "/"); // Normalize path separators
 
-        // Read file data (blocking operation)
-        let data = tokio::task::spawn_blocking({
-            let file_path = file_path.clone();
-            move || std::fs::read(file_path)
-        })
-        .await??;
+        let data = tokio::fs::read(file_path).await?;
+        let start = Instant::now();
 
-        // Upload via S3FsClient
-        // put_object uses blocking locks, but they're all dropped before any await
-        // point so it's safe to call directly from async context
-        // Note: object_store will automatically retry on transport errors (this is
-        // expected)
-        if let Err(e) = s3_client.put_object(key.clone(), data).await {
+        if let Err(e) = s3_client.put_object(key.clone(), data.into()).await {
             error!("Failed to upload {}: {e:?}", key);
             return Err(e);
         }
+
+        info!(elapsed = ?start.elapsed(), %key, "Uploaded");
         uploaded_count += 1;
     }
 
-    info!("Slot {} finished: {} uploaded", slot, uploaded_count);
+    info!(elapsed = ?start.elapsed(), "Finished: {} uploaded", uploaded_count);
 
     // Remove the slot files and directory after successful upload
     for file_path in &files {
-        if let Err(e) = std::fs::remove_file(file_path) {
-            warn!("Failed to delete file {:?}: {e}", file_path);
+        if let Err(e) = tokio::fs::remove_file(file_path).await {
+            warn!("Failed to delete file {:?}: {e:#}", file_path);
         }
     }
 
-    if let Err(e) = std::fs::remove_dir(&slot_dir) {
-        if slot_dir.exists() {
-            if let Err(e2) = std::fs::remove_dir_all(&slot_dir) {
-                warn!("Failed to delete slot directory {:?}: {e2}", slot_dir);
-            }
-        } else {
-            warn!("Failed to delete slot directory {:?}: {e}", slot_dir);
-        }
+    if let Err(err) = tokio::fs::remove_dir_all(&slot_dir).await {
+        warn!("Failed to delete slot directory {:?}: {err:#}", slot_dir);
+    } else {
+        info!("Slot {} directory removed", slot);
     }
-
-    info!("Slot {} directory removed", slot);
 
     Ok(())
 }
@@ -326,7 +287,7 @@ fn slot_directory(base_dir: &Path, slot: u64) -> PathBuf {
         .join(slot.to_string())
 }
 
-fn find_files_in_dir(dir: &Path) -> eyre::Result<Vec<PathBuf>> {
+fn find_files_in_dir(dir: PathBuf) -> eyre::Result<Vec<PathBuf>> {
     let mut files = Vec::new();
 
     if !dir.exists() {
@@ -341,10 +302,14 @@ fn find_files_in_dir(dir: &Path) -> eyre::Result<Vec<PathBuf>> {
             files.push(path);
         } else if path.is_dir() {
             // Recursively find files in subdirectories
-            let sub_files = find_files_in_dir(&path)?;
+            let sub_files = find_files_in_dir(path)?;
             files.extend(sub_files);
         }
     }
 
     Ok(files)
+}
+
+async fn find_files_in_dir_async(dir: PathBuf) -> eyre::Result<Vec<PathBuf>> {
+    tokio::task::spawn_blocking(|| find_files_in_dir(dir)).await?
 }

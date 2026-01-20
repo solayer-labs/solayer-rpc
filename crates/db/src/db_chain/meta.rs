@@ -2,28 +2,28 @@ use crate::persistence::DBFile;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DBMeta {
-    pub job_id: u64,
+    pub shred_index: usize,
     pub slot: DBFile,
 }
 
 impl DBMeta {
     pub fn from_ckpt(slot: u64) -> Self {
         Self {
-            job_id: 0,
+            shred_index: 0,
             slot: DBFile::Checkpoint(slot),
         }
     }
 
-    pub fn from_shred(slot: u64, job_id: u64) -> Self {
+    pub fn from_shred(slot: u64, shred_index: usize) -> Self {
         Self {
-            job_id,
-            slot: DBFile::Shred(slot, job_id),
+            shred_index,
+            slot: DBFile::Shred(slot, shred_index),
         }
     }
 
     pub fn from_account(slot: u64) -> Self {
         Self {
-            job_id: 0,
+            shred_index: 0,
             slot: DBFile::Account(slot),
         }
     }
@@ -31,7 +31,7 @@ impl DBMeta {
     pub fn from_db_file(db_file: DBFile) -> Self {
         match db_file {
             DBFile::Checkpoint(slot) => Self::from_ckpt(slot),
-            DBFile::Shred(slot, job_id) => Self::from_shred(slot, job_id),
+            DBFile::Shred(slot, shred_index) => Self::from_shred(slot, shred_index),
             DBFile::Account(slot) => Self::from_account(slot),
         }
     }
@@ -49,7 +49,11 @@ impl DBMeta {
 
 impl Ord for DBMeta {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        (self.slot.slot(), self.kind_rank(), self.job_id).cmp(&(other.slot.slot(), other.kind_rank(), other.job_id))
+        (self.slot.slot(), self.kind_rank(), self.shred_index).cmp(&(
+            other.slot.slot(),
+            other.kind_rank(),
+            other.shred_index,
+        ))
     }
 }
 

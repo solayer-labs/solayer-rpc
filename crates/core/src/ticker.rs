@@ -18,11 +18,15 @@ impl Ticker {
     }
 
     pub fn run_loop(&mut self, exit: Arc<AtomicBool>) {
-        let crossbeam_ticker = crossbeam_channel::tick(Duration::from_millis(400));
+        let period = Duration::from_millis(400);
         while !exit.load(Ordering::Relaxed) {
-            if crossbeam_ticker.recv().is_ok() {
-                self.bank.write().unwrap().tick();
+            crossbeam_channel::after(period).recv().ok();
+
+            if exit.load(Ordering::Relaxed) {
+                break;
             }
+
+            self.bank.write().unwrap().tick();
         }
     }
 }

@@ -1,9 +1,10 @@
-pub mod codec;
 pub mod convert;
-pub mod jobs;
 pub mod serializable;
 pub mod sync;
-pub mod tid;
+pub mod consumed_job;
+pub mod core_batch_shred;
+pub mod transaction_id;
+pub mod transaction_batch_id;
 
 use serde::{Deserialize, Serialize};
 use solana_sdk::{signature::Signature, transaction::VersionedTransaction};
@@ -21,7 +22,6 @@ pub struct TransactionWithMetadata {
     pub metadata: TransactionStatusMeta,
     pub slot: u64,
     pub unix_timestamp_in_millis: u64,
-    pub seq_number: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

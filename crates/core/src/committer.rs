@@ -1,72 +1,30 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::VecDeque,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, RwLock,
     },
-    time::Instant,
+    time::{Instant, SystemTime},
 };
 
 use crossbeam_channel::Receiver;
 use infinisvm_logger::{info, warn};
-use infinisvm_sync::{grpc::TransactionBatchBroadcaster, types::SerializableBatch};
-use infinisvm_types::jobs::ConsumedJob;
+use infinisvm_sync::grpc::TransactionBatchBroadcaster;
+use infinisvm_types::sync::SyncFinalization;
 use metrics::gauge;
-use rand::Rng;
-use solana_hash::Hash;
-use solana_sha256_hasher::{hashv, Hasher};
+use rand::seq::SliceRandom;
 
-use crate::{bank::Bank, wal_writer};
+use crate::wal_writer::WalWriter;
+use infinisvm_types::core_batch_shred::CoreBatchShred;
 
 pub type PerfSample = (u64, u64, u64, u64); // slot(sampled at), num_transactions, num_slots, sample_duration
 
+#[derive(Debug)]
 pub enum CommitEvent {
-    Batch(Vec<ConsumedJob>),
-    Flush,
-    Finalize { slot: u64 },
-}
-
-struct SlotHashAccumulator {
-    hasher: Hasher,
-}
-
-impl SlotHashAccumulator {
-    fn new(slot: u64) -> Self {
-        let mut hasher = Hasher::default();
-        let slot_bytes = slot.to_le_bytes();
-        hasher.hash(&slot_bytes);
-        Self { hasher }
-    }
-
-    fn absorb_jobs(&mut self, jobs: &[ConsumedJob]) {
-        if jobs.is_empty() {
-            return;
-        }
-
-        let serializable = SerializableBatch::from_consumed_jobs(jobs);
-        let job_id_bytes = (serializable.job_id as u64).to_le_bytes();
-        let timestamp_bytes = serializable.timestamp.to_le_bytes();
-        let tx_count_bytes = (serializable.transactions.len() as u64).to_le_bytes();
-
-        self.hasher.hash(&job_id_bytes);
-        self.hasher.hash(&timestamp_bytes);
-        self.hasher.hash(&tx_count_bytes);
-
-        for tx in &serializable.transactions {
-            self.hasher.hash(tx.signature.as_slice());
-            self.hasher.hash(tx.transaction.as_slice());
-            self.hasher.hash(tx.result.as_slice());
-            self.hasher.hash(tx.pre_accounts.as_slice());
-
-            self.hasher.hash(&tx.slot.to_le_bytes());
-            self.hasher.hash(&tx.block_unix_timestamp.to_le_bytes());
-            self.hasher.hash(&tx.seq_number.to_le_bytes());
-        }
-    }
-
-    fn finalize(self) -> Hash {
-        self.hasher.result()
-    }
+    #[allow(private_interfaces)]
+    Batch(CoreBatchShred),
+    Flush(SyncFinalization), // in case no tx and no batch, we still need to flush
+    Finalize(SyncFinalization),
 }
 
 pub struct Committer {
@@ -74,10 +32,10 @@ pub struct Committer {
 
     // gRPC batch broadcaster
     batch_broadcaster: Option<Vec<Arc<TransactionBatchBroadcaster>>>,
-    batch_buffer: Vec<ConsumedJob>,
-    pending_finalizations: VecDeque<u64>,
-    slot_hash_accumulators: HashMap<u64, SlotHashAccumulator>,
-    bank: Arc<RwLock<Bank>>,
+    pending_finalizations: VecDeque<SyncFinalization>,
+
+    // wal
+    wal_writer: WalWriter,
 
     // sampling things
     samples: Arc<RwLock<(Instant, VecDeque<PerfSample>)>>, // slot(sampled at), num_transactions, num_slots
@@ -92,15 +50,12 @@ impl Committer {
         commit_receiver: Receiver<CommitEvent>,
         samples: Arc<RwLock<(Instant, VecDeque<PerfSample>)>>,
         total_transaction_count: Arc<AtomicU64>,
-        bank: Arc<RwLock<Bank>>,
     ) -> Self {
         Self {
             commit_receiver,
             batch_broadcaster: None,
-            batch_buffer: Vec::new(),
             pending_finalizations: VecDeque::new(),
-            slot_hash_accumulators: HashMap::new(),
-            bank,
+            wal_writer: WalWriter::new(),
             samples,
             tx_count: Arc::new(RwLock::new((0, Instant::now()))),
             total_transaction_count,
@@ -139,189 +94,108 @@ impl Committer {
         let mut num_transactions = 0;
         while !exit.load(Ordering::Relaxed) {
             match self.commit_receiver.recv() {
-                Ok(CommitEvent::Batch(commit_batch)) => {
-                    if commit_batch.is_empty() {
-                        continue;
-                    }
+                Ok(event) => {
+                    let now = SystemTime::now()
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs_f64();
+                    gauge!("committer_last_event_ts").set(now);
+                    match event {
+                        CommitEvent::Batch(commit_batch) => {
+                            info!("commit batch {:?}", commit_batch.shred_id);
+                            if commit_batch.is_empty() {
+                                continue;
+                            }
 
-                    self.record_batch_for_hash(&commit_batch);
+                            let num_txs = commit_batch.len();
+                            let slot = commit_batch.slot();
 
-                    let num_txs = commit_batch.len();
-                    let first_job = commit_batch.first().expect("non-empty batch has first job");
-                    let slot = first_job.slot;
+                            if last_slot < slot {
+                                let slot_diff = if last_slot == 0 { 1 } else { slot - last_slot };
+                                last_slot = slot;
+                                num_slots += slot_diff;
+                            }
+                            num_transactions += num_txs as u64;
 
-                    if last_slot < slot {
-                        let slot_diff = if last_slot == 0 { 1 } else { slot - last_slot };
-                        last_slot = slot;
-                        num_slots += slot_diff;
-                    }
-                    num_transactions += num_txs as u64;
+                            let (sample_duration, should_rotate_samples) = {
+                                let samples_read = self.samples.read().unwrap();
+                                let duration = samples_read.0.elapsed().as_secs();
+                                if duration > 60 {
+                                    gauge!("commit_receiver_length").set(self.commit_receiver.len() as f64);
+                                }
+                                (duration, duration > 60)
+                            };
 
-                    let (sample_duration, should_rotate_samples) = {
-                        let samples_read = self.samples.read().unwrap();
-                        let duration = samples_read.0.elapsed().as_secs();
-                        if duration > 60 {
-                            gauge!("commit_receiver_length").set(self.commit_receiver.len() as f64);
-                        }
-                        (duration, duration > 60)
-                    };
+                            if should_rotate_samples {
+                                let mut samples = self.samples.write().unwrap();
+                                samples.0 = Instant::now();
+                                samples
+                                    .1
+                                    .push_back((slot, num_transactions, num_slots, sample_duration));
+                                num_slots = 0;
+                                num_transactions = 0;
 
-                    if should_rotate_samples {
-                        let mut samples = self.samples.write().unwrap();
-                        samples.0 = Instant::now();
-                        samples
-                            .1
-                            .push_back((slot, num_transactions, num_slots, sample_duration));
-                        num_slots = 0;
-                        num_transactions = 0;
+                                if samples.1.len() > 720 {
+                                    samples.1.pop_front();
+                                }
+                            }
 
-                        if samples.1.len() > 720 {
-                            samples.1.pop_front();
-                        }
-                    }
+                            self.tx_count.write().unwrap().0 += num_txs;
+                            self.total_transaction_count
+                                .fetch_add(num_txs as u64, std::sync::atomic::Ordering::Relaxed);
 
-                    self.tx_count.write().unwrap().0 += num_txs;
-                    self.total_transaction_count
-                        .fetch_add(num_txs as u64, std::sync::atomic::Ordering::Relaxed);
+                            let sync_batch = commit_batch.into_sync_batch_shred();
+                            if !sync_batch.effects.is_empty() {
+                                self.wal_writer
+                                    .cache_slot_transactions(sync_batch.shred_id.clone(), sync_batch.effects.clone());
+                            }
 
-                    let same_job = self.batch_buffer.last().map(|job| job.job_id) == Some(first_job.job_id);
-
-                    if same_job {
-                        self.batch_buffer.extend(commit_batch);
-                    } else {
-                        let previous_batch = std::mem::take(&mut self.batch_buffer);
-                        self.batch_buffer = commit_batch;
-
-                        if let Some(ref broadcaster) = self.batch_broadcaster {
-                            if !previous_batch.is_empty() {
-                                if let Err(e) = wal_writer::persist_batch(&previous_batch) {
-                                    warn!(
-                                        "Failed to persist WAL for job before broadcast: {}. Will retry later.",
-                                        e
-                                    );
-                                    let mut restored = previous_batch;
-                                    restored.extend(std::mem::take(&mut self.batch_buffer));
-                                    self.batch_buffer = restored;
-                                } else {
-                                    let slot = previous_batch[0].slot;
-                                    let idx = slot as usize % broadcaster.len();
-                                    if let Err(e) = broadcaster[idx].broadcast_batch(previous_batch) {
-                                        warn!("Failed to broadcast commit batch: {}", e);
-                                    }
+                            // broadcast batch
+                            if let Some(ref broadcasters) = self.batch_broadcaster {
+                                // pick one broadcaster randomly
+                                let broadcaster = broadcasters.choose(&mut rand::thread_rng()).unwrap();
+                                if let Err(e) = broadcaster.broadcast_batch(sync_batch) {
+                                    warn!("Failed to broadcast batch: {e}");
                                 }
                             }
                         }
+                        CommitEvent::Flush(finalization) => {
+                            info!("flush finalization {:?}", finalization);
+                            // in case no tx and no batch. this is optimistic finalization
+                            self.pending_finalizations.push_back(finalization);
+                            self.process_pending_finalizations();
+                        }
+                        CommitEvent::Finalize(finalization) => {
+                            info!("finalize finalization {:?}", finalization);
+                            self.pending_finalizations.push_back(finalization);
+                            self.process_pending_finalizations();
+                        }
                     }
-
-                    self.process_pending_finalizations();
-                }
-                Ok(CommitEvent::Flush) => {
-                    if self.flush_pending_batch() {
-                        self.process_pending_finalizations();
-                    }
-                }
-                Ok(CommitEvent::Finalize { slot }) => {
-                    self.pending_finalizations.push_back(slot);
-                    self.process_pending_finalizations();
                 }
                 Err(_) => break,
             }
         }
     }
 
-    fn record_batch_for_hash(&mut self, jobs: &[ConsumedJob]) {
-        if jobs.is_empty() {
-            return;
-        }
-
-        let slot = jobs[0].slot;
-        let accumulator = self
-            .slot_hash_accumulators
-            .entry(slot)
-            .or_insert_with(|| SlotHashAccumulator::new(slot));
-        accumulator.absorb_jobs(jobs);
-    }
-
-    fn finalize_slot_hash(&mut self, slot: u64) {
-        let hash = self
-            .slot_hash_accumulators
-            .remove(&slot)
-            .map(SlotHashAccumulator::finalize)
-            .unwrap_or_else(|| {
-                let slot_bytes = slot.to_le_bytes();
-                hashv(&[&slot_bytes])
-            });
-
-        if let Ok(mut bank) = self.bank.write() {
-            bank.set_slot_blockhash(slot, hash);
-        } else {
-            warn!("Failed to acquire bank lock when recording blockhash for slot {slot}");
-        }
-    }
-
-    fn flush_pending_batch(&mut self) -> bool {
-        if self.batch_buffer.is_empty() {
-            return true;
-        }
-
-        let batch = std::mem::take(&mut self.batch_buffer);
-        info!(
-            "Broadcasting batch of size {} with job_id {}",
-            batch.len(),
-            batch[0].job_id
-        );
-
-        if let Some(ref broadcaster) = self.batch_broadcaster {
-            if let Err(e) = wal_writer::persist_batch(&batch) {
-                warn!(
-                    "Failed to persist WAL for job before broadcast: {}. Will retry later.",
-                    e
-                );
-                self.batch_buffer = batch;
-                return false;
-            } else {
-                let slot = batch[0].slot;
-                let idx = slot as usize % broadcaster.len();
-                if let Err(e) = broadcaster[idx].broadcast_batch(batch) {
-                    warn!("Failed to broadcast commit batch: {}", e);
-                }
-            }
-        }
-
-        true
-    }
-
     fn process_pending_finalizations(&mut self) {
-        while let Some(slot) = self.pending_finalizations.front().copied() {
-            if !self.flush_pending_batch() {
-                break;
+        while let Some(finalization) = self.pending_finalizations.pop_front() {
+            let shreds = self.wal_writer.take_slot_transactions(finalization.slot);
+            if let Err(err) = WalWriter::persist_slot(self.wal_writer.slots_path(), finalization.clone(), shreds) {
+                panic!("Failed to persist WAL for finalized slot {finalization:?}: {err}");
             }
 
-            let _ = self.pending_finalizations.pop_front();
-            let (mut job_ids, hash, parent_hash) = {
-                let bank = self.bank.read().unwrap();
-                // Get all slot data from raw_slot
-                let raw_slot = bank.get_raw_slot(slot);
-                let job_ids = raw_slot.as_ref().map(|rs| rs.job_ids.clone()).unwrap_or_default();
-                let hash = raw_slot.as_ref().map(|rs| rs.hash).unwrap_or_default();
-                let parent_hash = raw_slot.as_ref().map(|rs| rs.parent_hash).unwrap_or_default();
-                (job_ids, hash, parent_hash)
-            };
-            job_ids.sort_unstable();
-            job_ids.dedup();
-
-            self.bank.write().unwrap().mark_slot_range_finalized(slot);
-            self.broadcast_finalization(slot, job_ids, hash, parent_hash);
-            // self.finalize_slot_hash(slot);
+            self.broadcast_finalization(finalization);
         }
     }
 
-    fn broadcast_finalization(&self, slot: u64, job_ids: Vec<u64>, hash: Hash, parent_hash: Hash) {
-        info!("Broadcasting finalization for slot {slot}");
-        if let Some(ref broadcaster) = self.batch_broadcaster {
-            let random_index = rand::thread_rng().gen_range(0..broadcaster.len());
-            if let Err(e) = broadcaster[random_index].broadcast_finalization(slot, job_ids.clone(), hash, parent_hash) {
-                warn!("Failed to broadcast block finalization for slot {}: {}", slot, e);
+    fn broadcast_finalization(&self, finalization: SyncFinalization) {
+        let slot = finalization.slot;
+        info!("Broadcasting finalization for slot {}", slot);
+        if let Some(ref broadcasters) = self.batch_broadcaster {
+            for broadcaster in broadcasters {
+                if let Err(e) = broadcaster.broadcast_finalization(finalization.clone()) {
+                    warn!("Failed to broadcast block finalization for slot {}: {}", slot, e);
+                }
             }
         }
     }

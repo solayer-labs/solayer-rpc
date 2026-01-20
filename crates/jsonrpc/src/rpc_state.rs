@@ -13,10 +13,10 @@ use infinisvm_db::Database;
 use infinisvm_logger::{error, tracing};
 use infinisvm_types::{BlockWithTransactions, SignatureFilters, TransactionWithMetadata};
 use jsonrpsee::{core::RpcResult, types::ErrorCode};
-use solana_account_decoder::{UiAccountEncoding, UiDataSliceConfig};
+use solana_account_decoder::{UiAccount, UiAccountData, UiAccountEncoding, UiDataSliceConfig};
 use solana_hash::Hash;
 use solana_sdk::{
-    account::AccountSharedData,
+    account::{AccountSharedData, ReadableAccount},
     clock::Slot,
     instruction::AccountMeta,
     message::{v0::LoadedAddresses, SimpleAddressLoader},
@@ -29,7 +29,10 @@ use solana_sdk::{
 use solana_svm::transaction_processing_result::ProcessedTransaction;
 
 use crate::{
-    rpc_impl::{RpcFilterType, RpcKeyedAccount, RpcResponse, RpcResponseContext, RpcTokenAccountsFilter},
+    rpc_impl::{
+        get_account_data_encoding_and_slice, invalid_params_error, RpcAccountInfoConfig, RpcFilterType,
+        RpcKeyedAccount, RpcResponse, RpcResponseContext, RpcTokenAccountsFilter,
+    },
     ws_helper::WebSocketMiddleware,
 };
 
@@ -146,11 +149,13 @@ impl TxService {
 }
 
 pub const RECENT_BLOCKHASHES_HISTORY_SIZE: usize = 1024;
+pub const MAX_PROGRAM_ACCOUNTS_QUERY_LIMIT: usize = 10_000;
 
 #[async_trait]
 pub trait RpcIndexer: Indexer + Send + Sync {
     // rpc stuff
     async fn find_accounts_owned_by(&self, _: &Pubkey, limit: usize, offset: usize) -> Vec<Pubkey>;
+    async fn find_accounts_by_program(&self, _: &Pubkey, limit: usize, offset: usize) -> Vec<Pubkey>;
 
     async fn find_token_accounts_owned_by(
         &self,
@@ -325,13 +330,81 @@ impl RpcServerState {
 
     pub async fn get_program_accounts(
         &self,
-        _: &Pubkey,
-        _: Vec<RpcFilterType>,
-        _: Option<UiAccountEncoding>,
-        _: Option<UiDataSliceConfig>,
+        program_id: &Pubkey,
+        filters: Vec<RpcFilterType>,
+        encoding: Option<UiAccountEncoding>,
+        data_slice_config: Option<UiDataSliceConfig>,
+        sort_results: bool,
     ) -> RpcResult<(Slot, Vec<RpcKeyedAccount>)> {
-        // todo: implement
-        Err(ErrorCode::InternalError.into())
+        for filter in &filters {
+            if let Err(e) = filter.valid() {
+                return Err(invalid_params_error(format!("invalid filter: {e}")));
+            }
+        }
+
+        let slot = self.get_current_slot()?;
+
+        let program_accounts = self
+            .indexer
+            .find_accounts_by_program(program_id, MAX_PROGRAM_ACCOUNTS_QUERY_LIMIT, 0)
+            .await;
+
+        let account_config = Some(RpcAccountInfoConfig {
+            encoding,
+            data_slice: data_slice_config,
+            commitment: None,
+            min_context_slot: None,
+        });
+
+        let db_guard = self.db.read().map_err(|e| {
+            error!("get_program_accounts error: {:?}", e);
+            ErrorCode::InternalError
+        })?;
+
+        let mut keyed_accounts = Vec::new();
+
+        for pubkey in program_accounts {
+            let account = match db_guard.get_account(pubkey) {
+                Ok(Some(account)) => account,
+                Ok(None) => continue,
+                Err(e) => {
+                    error!("get_program_accounts get_account error: {:?}", e);
+                    return Err(ErrorCode::InternalError.into());
+                }
+            };
+
+            if !filters.iter().all(|filter| filter.allows(&account)) {
+                continue;
+            }
+
+            if let Some(data_slice) = account_config.as_ref().and_then(|cfg| cfg.data_slice) {
+                if data_slice.offset.saturating_add(data_slice.length) > account.data().len() {
+                    return Err(invalid_params_error("dataSlice out of range"));
+                }
+            }
+
+            let (encoded_sliced_data, data_encoding) = get_account_data_encoding_and_slice(&account_config, &account)?;
+
+            keyed_accounts.push(RpcKeyedAccount {
+                pubkey: pubkey.to_string(),
+                account: UiAccount {
+                    lamports: account.lamports(),
+                    data: UiAccountData::Binary(encoded_sliced_data, data_encoding),
+                    owner: account.owner().to_string(),
+                    executable: account.executable(),
+                    rent_epoch: account.rent_epoch(),
+                    space: Some(account.data().len() as u64),
+                },
+            });
+        }
+
+        drop(db_guard);
+
+        if sort_results {
+            keyed_accounts.sort_by(|a, b| a.pubkey.cmp(&b.pubkey));
+        }
+
+        Ok((slot, keyed_accounts))
     }
 
     pub async fn get_token_accounts_by_owner(

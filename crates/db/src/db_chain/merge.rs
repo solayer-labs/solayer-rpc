@@ -8,7 +8,7 @@ use super::{chain::DBChain, meta::DBMeta};
 use crate::{persistence::DBFile, MergeableDB};
 
 impl<T: MergeableDB> DBChain<T> {
-    pub fn merge(&mut self, slot_plan: HashMap<u64, Vec<u64>>) -> eyre::Result<Option<u64>> {
+    pub fn merge(&mut self, slot_plan: HashMap<u64, usize>) -> eyre::Result<Option<u64>> {
         let start_time = Instant::now();
         counter!("db_chain_merge_total", "event" => "attempt").increment(1);
         if self.dbs.is_empty() {
@@ -50,7 +50,7 @@ impl<T: MergeableDB> DBChain<T> {
             // Log a compact snapshot of the plan around the head
             let mut keys: Vec<u64> = slot_plan.keys().copied().collect();
             keys.sort_unstable();
-            let head_sample: Vec<(u64, usize)> = keys.into_iter().take(5).map(|k| (k, slot_plan[&k].len())).collect();
+            let head_sample: Vec<(u64, usize)> = keys.into_iter().take(5).map(|k| (k, slot_plan[&k])).collect();
             info!(
                 "Merge aborted: no confirmed slot; {}. slot_plan_head={:?}",
                 self.summary(),
@@ -99,7 +99,7 @@ impl<T: MergeableDB> DBChain<T> {
             0,
             (
                 DBMeta {
-                    job_id: 0,
+                    shred_index: 0,
                     slot: DBFile::Checkpoint(last_confirmed_slot),
                 },
                 db0,

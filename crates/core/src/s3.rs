@@ -1,21 +1,23 @@
 use std::{
     error::Error as StdError,
-    fmt,
     path::PathBuf,
-    sync::{Arc, Mutex, OnceLock, RwLock},
-    thread,
+    sync::{Arc, OnceLock},
 };
 
 use bytes::Bytes;
-use crossbeam_channel::{unbounded, Receiver, Sender};
+use eyre::{bail, Context as _, ContextCompat as _};
 use futures_util::StreamExt;
 use hashbrown::HashMap;
+use infinisvm_logger::warn;
 use object_store::{
     aws::{AmazonS3, AmazonS3Builder},
     path::Path,
     ObjectStore,
 };
-use tokio::{runtime::Runtime, sync::oneshot};
+use tokio::sync::{
+    mpsc::{self, UnboundedReceiver, UnboundedSender},
+    oneshot, Mutex, RwLock,
+};
 use zstd::stream::{decode_all, encode_all};
 
 #[derive(Clone)]
@@ -26,97 +28,75 @@ pub struct S3FsClient {
 struct S3FsClientInner {
     local_tmp_path: PathBuf,
     lock: RwLock<HashMap<String, Arc<RwLock<()>>>>,
-    access_key_id: Option<String>,
-    secret_key: Option<String>,
-    s3_client: Mutex<Option<AmazonS3>>,
-    s3_path: String,
-    region: Option<String>,
-    uploader: Uploader,
-}
-
-#[derive(Debug)]
-struct Uploader {
-    sender: OnceLock<Sender<UploadTask>>,
-    worker_count: usize,
+    s3_client: AmazonS3,
+    task_tx: OnceLock<UnboundedSender<UploadTask>>,
 }
 
 #[derive(Debug)]
 struct UploadTask {
     key: String,
     local_path: PathBuf,
+    data: Bytes,
     completion: oneshot::Sender<eyre::Result<()>>,
 }
 
 pub const REGION: &str = "auto";
 const DEFAULT_UPLOAD_THREADS: usize = 8;
 
-impl S3FsClient {
-    pub fn new(local_tmp_path: PathBuf, s3_bucket_name: String) -> Self {
-        Self::new_with_credentials(local_tmp_path, None, None, s3_bucket_name, None)
-    }
+struct S3Config {
+    s3_path: String,
+    access_key_id: String,
+    secret_key: String,
+    region: String,
+    endpoint: Option<String>,
+}
 
+impl S3FsClient {
     pub fn new_with_credentials(
         local_tmp_path: PathBuf,
-        access_key_id: Option<String>,
-        secret_key: Option<String>,
+        access_key_id: String,
+        secret_key: String,
         s3_path: String,
-        region: Option<String>,
-    ) -> Self {
-        Self {
+        region: String,
+    ) -> eyre::Result<Self> {
+        Ok(Self {
             inner: Arc::new(S3FsClientInner::new(
                 local_tmp_path,
                 access_key_id,
                 secret_key,
                 s3_path,
                 region,
-            )),
-        }
-    }
-
-    fn maybe_s3(&self) -> eyre::Result<Option<AmazonS3>> {
-        self.inner.ensure_client()
-    }
-
-    fn get_s3(&self) -> eyre::Result<AmazonS3> {
-        self.maybe_s3()?
-            .ok_or_else(|| eyre::eyre!("Missing S3 access key id: provide via CLI or S3_ACCESS_KEY_ID env"))
-    }
-
-    fn maybe_uploader_sender(&self) -> eyre::Result<Option<Sender<UploadTask>>> {
-        let client = match self.maybe_s3()? {
-            Some(client) => client,
-            None => return Ok(None),
-        };
-        Ok(Some(self.inner.uploader.sender(client)))
+            )?),
+        })
     }
 
     pub async fn list_dir(&self, key: String) -> eyre::Result<Vec<String>> {
         let local_path = self.inner.local_tmp_path.join(key.clone());
-        if local_path.exists() && local_path.is_dir() {
-            let mut files = Vec::new();
-            for entry in std::fs::read_dir(local_path)? {
-                let entry = entry?;
-                let path = entry.path();
-                if path.is_file() {
+
+        if let Ok(meta) = tokio::fs::metadata(&local_path).await {
+            if meta.is_dir() {
+                let mut files = Vec::new();
+                let mut read_dir = tokio::fs::read_dir(local_path).await?;
+
+                while let Some(entry) = read_dir.next_entry().await? {
+                    let path = entry.path();
+                    if !path.is_file() {
+                        continue;
+                    }
+
                     if let Some(name) = path.file_name() {
                         if let Some(name_str) = name.to_str() {
                             files.push(name_str.to_string());
                         }
                     }
                 }
+
+                return Ok(files);
             }
-            return Ok(files);
         }
 
         let mut files = Vec::new();
-        let s3 = match self.get_s3() {
-            Ok(s3) => s3,
-            Err(e) => {
-                eprintln!("S3 disabled for list_dir: {e}");
-                return Ok(files);
-            }
-        };
-        let mut stream = s3.list(Some(&Path::from(key))).fuse();
+        let mut stream = self.inner.s3_client.list(Some(&Path::from(key))).fuse();
         while let Some(meta) = stream.next().await {
             let meta = meta?;
             if let Some(name) = meta.location.filename() {
@@ -126,179 +106,138 @@ impl S3FsClient {
         Ok(files)
     }
 
-    pub async fn get_object(&self, key: String) -> eyre::Result<Vec<u8>> {
+    pub async fn get_object(&self, key: String) -> eyre::Result<Bytes> {
         let local_path = self.inner.local_tmp_path.join(key.clone());
 
-        let should_wait = {
-            let locker = self.inner.lock.read().unwrap();
-            locker.contains_key(&key)
-        };
-
-        if should_wait {
-            let locker = self.inner.lock.read().unwrap();
+        {
+            let locker = self.inner.lock.read().await;
             if let Some(lock) = locker.get(&key) {
-                let _guard = lock.read().unwrap();
+                let _guard = lock.read().await;
                 drop(_guard);
             }
         }
 
-        if local_path.exists() {
-            let compressed = std::fs::read(local_path)?;
-            return Ok(decode_all(&compressed[..])?);
-        }
+        let compressed = match tokio::fs::read(&local_path).await {
+            Ok(data) => Some(data.into()),
+            Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
+                warn!(%key, ?local_path, "Error reading local cached object: {err:#}");
+                None
+            }
+            _ => {
+                // File not found
+                None
+            }
+        };
 
-        let s3 = self.get_s3()?;
-        let object = s3.get(&Path::from(key)).await?;
-        let compressed = object.bytes().await?.to_vec();
-        Ok(decode_all(&compressed[..])?)
+        let compressed = match compressed {
+            Some(compressed) => compressed,
+            None => self.inner.s3_client.get(&Path::from(key)).await?.bytes().await?,
+        };
+
+        Ok(decode_all(&compressed[..])?.into())
     }
 
-    pub async fn put_object(&self, key: String, data: Vec<u8>) -> eyre::Result<()> {
-        let mut locker = self.inner.lock.write().unwrap();
+    pub async fn put_object(&self, key: String, data: Bytes) -> eyre::Result<()> {
+        let mut locker = self.inner.lock.write().await;
         let lock = Arc::new(RwLock::new(()));
         locker.insert(key.clone(), lock.clone());
-        let write_guard = lock.write().unwrap();
+        let write_guard = lock.write().await;
 
-        let compressed = encode_all(&data[..], 0)?;
+        let compressed: Bytes = encode_all(&data[..], 0)?.into();
 
         let local_path = self.inner.local_tmp_path.join(key.clone());
-        if let Some(parent) = local_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&local_path, &compressed)?;
+        let parent = local_path.parent().context("Error getting parent directory")?;
+        tokio::fs::create_dir_all(parent)
+            .await
+            .context("Error creating parent directory")?;
+        tokio::fs::write(&local_path, &compressed)
+            .await
+            .context("Error writing file")?;
 
         drop(write_guard);
         locker.remove(&key);
         drop(locker);
 
-        if let Some(sender) = self.maybe_uploader_sender()? {
-            let (tx, rx) = oneshot::channel();
-            sender
-                .send(UploadTask {
-                    key: key.clone(),
-                    local_path: local_path.clone(),
-                    completion: tx,
-                })
-                .map_err(|e| eyre::eyre!("Failed to enqueue S3 upload for {}: {}", key, e))?;
+        let sender = self.inner.sender();
+        let (tx, rx) = oneshot::channel();
 
-            rx.await
-                .map_err(|_| eyre::eyre!("S3 upload worker dropped for {}", key))??;
-        }
+        sender
+            .send(UploadTask {
+                key: key.clone(),
+                local_path: local_path.clone(),
+                data: compressed,
+                completion: tx,
+            })
+            .context("Error enqueuing S3 upload")?;
 
-        Ok(())
-    }
-}
-
-impl fmt::Debug for S3FsClient {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("S3FsClient")
-            .field("local_tmp_path", &self.inner.local_tmp_path)
-            .field("has_access_key", &self.inner.access_key_id.is_some())
-            .field("has_secret_key", &self.inner.secret_key.is_some())
-            .finish()
+        rx.await.context("S3 upload worker dropped")?
     }
 }
 
 impl S3FsClientInner {
     fn new(
         local_tmp_path: PathBuf,
-        access_key_id: Option<String>,
-        secret_key: Option<String>,
+        access_key_id: String,
+        secret_key: String,
         s3_path: String,
-        region: Option<String>,
-    ) -> Self {
-        Self {
+        region: String,
+    ) -> eyre::Result<Self> {
+        let config = Self::build_config(access_key_id, secret_key, s3_path, region)?;
+        let client = Self::create_client(&config)?;
+
+        Ok(Self {
             local_tmp_path,
+            s3_client: client,
             lock: RwLock::new(HashMap::new()),
-            access_key_id,
-            secret_key,
-            s3_client: Mutex::new(None),
-            s3_path,
-            region,
-            uploader: Uploader::new(resolved_worker_count()),
-        }
+            task_tx: OnceLock::new(),
+        })
     }
 
-    fn ensure_client(&self) -> eyre::Result<Option<AmazonS3>> {
-        {
-            let guard = self.s3_client.lock().unwrap();
-            if let Some(client) = guard.as_ref() {
-                return Ok(Some(client.clone()));
-            }
-        }
+    fn build_config(
+        access_key_id: String,
+        secret_key: String,
+        s3_path: String,
+        region: String,
+    ) -> eyre::Result<S3Config> {
+        let endpoint = std::env::var("S3_ENDPOINT").ok();
 
-        let access_key_id = self
-            .access_key_id
-            .as_ref()
-            .cloned()
-            .or_else(|| std::env::var("S3_ACCESS_KEY_ID").ok());
-        let secret_key = self
-            .secret_key
-            .as_ref()
-            .cloned()
-            .or_else(|| std::env::var("S3_SECRET_KEY").ok());
+        Ok(S3Config {
+            access_key_id,
+            secret_key,
+            s3_path,
+            region,
+            endpoint,
+        })
+    }
 
-        let Some(access_key_id) = access_key_id else {
-            return Ok(None);
-        };
-        let Some(secret_key) = secret_key else {
-            return Ok(None);
-        };
-
-        // Determine region: use provided region, then env var, then default to
-        // us-west-2
-        let region = self
-            .region
-            .clone()
-            .or_else(|| std::env::var("S3_REGION").ok())
-            .unwrap_or_else(|| "us-west-2".to_string());
-
+    fn create_client(config: &S3Config) -> eyre::Result<AmazonS3> {
         let mut builder = AmazonS3Builder::new()
-            .with_region(region.clone())
-            .with_access_key_id(access_key_id)
-            .with_secret_access_key(secret_key)
-            .with_bucket_name(self.s3_path.clone());
+            .with_region(&config.region)
+            .with_access_key_id(&config.access_key_id)
+            .with_secret_access_key(&config.secret_key)
+            .with_bucket_name(&config.s3_path);
 
         // Only set endpoint if explicitly provided via environment variable
         // The object_store library constructs the endpoint automatically for standard
         // AWS regions
-        if let Ok(endpoint) = std::env::var("S3_ENDPOINT") {
+        if let Some(endpoint) = &config.endpoint {
             builder = builder.with_endpoint(endpoint);
         }
 
-        let s3 = builder
-            .build()
-            .map_err(|e| eyre::eyre!("Failed to create S3 client: {}", e))?;
-
-        let mut guard = self.s3_client.lock().unwrap();
-        if let Some(existing) = guard.as_ref() {
-            return Ok(Some(existing.clone()));
-        }
-        *guard = Some(s3.clone());
-        Ok(Some(s3))
-    }
-}
-
-impl Uploader {
-    fn new(worker_count: usize) -> Self {
-        Self {
-            sender: OnceLock::new(),
-            worker_count: worker_count.max(1),
-        }
+        builder.build().context("Failed to create S3 client")
     }
 
-    fn sender(&self, client: AmazonS3) -> Sender<UploadTask> {
-        self.sender
+    pub fn sender(&self) -> UnboundedSender<UploadTask> {
+        self.task_tx
             .get_or_init(move || {
-                let (tx, rx) = unbounded::<UploadTask>();
-                for idx in 0..self.worker_count {
+                let (tx, rx) = mpsc::unbounded_channel();
+                let rx = Arc::new(Mutex::new(rx));
+                for _ in 0..resolved_worker_count() {
                     let worker_rx = rx.clone();
-                    let worker_client = client.clone();
-                    thread::Builder::new()
-                        .name(format!("s3-upload-{idx}"))
-                        .spawn(move || run_upload_worker(worker_rx, worker_client))
-                        .expect("failed to spawn s3 upload worker");
+                    let worker_client = self.s3_client.clone();
+                    tokio::spawn(run_upload_worker(worker_rx, worker_client));
                 }
+
                 tx
             })
             .clone()
@@ -313,48 +252,46 @@ fn resolved_worker_count() -> usize {
         .unwrap_or(DEFAULT_UPLOAD_THREADS)
 }
 
-fn run_upload_worker(rx: Receiver<UploadTask>, client: AmazonS3) {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("failed to build s3 upload runtime");
+async fn run_upload_worker(rx: Arc<Mutex<UnboundedReceiver<UploadTask>>>, client: AmazonS3) {
+    loop {
+        let task = {
+            let mut rx = rx.lock().await;
+            match rx.recv().await {
+                Some(task) => task,
+                None => {
+                    // channel closed
+                    break;
+                }
+            }
+        };
 
-    for task in rx.iter() {
         let UploadTask {
             key,
             local_path,
+            data,
             completion,
         } = task;
-        let result = process_upload(&runtime, &client, key, local_path);
+        let result = process_upload(&client, key, local_path, data).await;
         let _ = completion.send(result);
     }
 }
 
-fn process_upload(runtime: &Runtime, client: &AmazonS3, key: String, local_path: PathBuf) -> eyre::Result<()> {
-    let data = std::fs::read(&local_path)
-        .map_err(|e| eyre::eyre!("Failed to read {} for upload: {}", local_path.display(), e))?;
+async fn process_upload(client: &AmazonS3, key: String, local_path: PathBuf, data: Bytes) -> eyre::Result<()> {
     let location = Path::from(key.clone());
-    let location_repr = location.to_string();
 
-    runtime.block_on(async {
-        client.put(&location, Bytes::from(data).into()).await.map_err(|e| {
-            // Log detailed error information for debugging
-            let error_msg = format!("Failed to upload {location_repr} to S3: {e:?}");
-            if let Some(source) = e.source() {
-                eyre::eyre!("{} (source: {})", error_msg, source)
-            } else {
-                eyre::eyre!("{}", error_msg)
-            }
-        })
+    client.put(&location, data.into()).await.map_err(|e| {
+        // Log detailed error information for debugging
+        let error_msg = format!("Failed to upload {location} to S3: {e:?}");
+        if let Some(source) = e.source() {
+            eyre::eyre!("{} (source: {})", error_msg, source)
+        } else {
+            eyre::eyre!("{}", error_msg)
+        }
     })?;
 
-    if let Err(err) = std::fs::remove_file(&local_path) {
+    if let Err(err) = tokio::fs::remove_file(&local_path).await {
         if err.kind() != std::io::ErrorKind::NotFound {
-            return Err(eyre::eyre!(
-                "Failed to remove {} after upload: {}",
-                local_path.display(),
-                err
-            ));
+            bail!("Failed to remove {} after upload: {err:#}", local_path.display());
         }
     }
 

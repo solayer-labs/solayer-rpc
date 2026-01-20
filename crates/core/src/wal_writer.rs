@@ -1,207 +1,269 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     fs::{self, File},
-    io::{Read, Write},
+    io::{self, Write},
     path::{Path, PathBuf},
 };
 
-use infinisvm_db::persistence::DB_DIRECTORY;
+use eyre::Result as EyreResult;
 use infinisvm_logger::{error, info};
-use infinisvm_types::serializable::TransactionExecutionDetailsSerializable;
+use infinisvm_sync::slots::{enumerate_archives_in_order, slot_directory};
+use infinisvm_types::sync::{JobEffects, ShredId, ShredIndex, SyncFinalization};
 use solana_pubkey::Pubkey;
 use solana_sdk::account::AccountSharedData;
 
 use crate::bank::Bank;
 
-/// Directory under the DB root where WAL files are stored.
-/// Layout: <DB_DIRECTORY>/wal/<slot>/<job_id>.bin
-fn wal_root() -> PathBuf {
-    if let Ok(root) = std::env::var("INFINISVM_DB_PATH") {
-        PathBuf::from(root).join("wal")
-    } else {
-        PathBuf::from(DB_DIRECTORY).join("wal")
+const DEFAULT_WAL_PATH: &str = "/mnt/data/slots";
+
+pub struct WalWriter {
+    slot_transactions: HashMap<u64, SlotTransactions>,
+    slots_path: PathBuf,
+}
+
+impl Default for WalWriter {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
-fn wal_slot_dir(slot: u64) -> PathBuf {
-    wal_root().join(format!("{slot:018}"))
-}
-
-fn wal_job_file(slot: u64, job_id: u64) -> PathBuf {
-    wal_slot_dir(slot).join(format!("{job_id:018}.bin"))
-}
-
-/// Persist a completed job batch as a WAL record.
-/// The file contains a bincode-serialized `SerializableBatch` (uncompressed)
-/// for simplicity.
-pub fn persist_batch(batch: &[infinisvm_types::jobs::ConsumedJob]) -> std::io::Result<()> {
-    // Filter to only successfully processed transactions to avoid panics
-    let filtered: Vec<_> = batch
-        .iter()
-        .filter(|j| j.processed_transaction.is_ok())
-        .cloned()
-        .collect();
-
-    if filtered.is_empty() {
-        return Ok(());
+impl WalWriter {
+    pub fn new() -> Self {
+        Self {
+            slot_transactions: HashMap::new(),
+            slots_path: resolve_slots_path(),
+        }
     }
 
-    // All jobs in the batch must share the same job_id and slot
-    let slot = filtered[0].slot;
-    let job_id = filtered[0].job_id as u64;
+    pub fn cache_slot_transactions(&mut self, shred_id: ShredId, effects: Vec<JobEffects>) {
+        if effects.is_empty() {
+            return;
+        }
 
-    // Build SerializableBatch without compression
-    let serializable = infinisvm_sync::types::SerializableBatch::from_consumed_jobs(&filtered);
-    let bytes = bincode::serialize(&serializable).map_err(|e| std::io::Error::other(format!("serialize WAL: {e}")))?;
-
-    // Ensure directory exists
-    let slot_dir = wal_slot_dir(slot);
-    fs::create_dir_all(&slot_dir)?;
-
-    // Write to .wip then rename to .bin atomically
-    let final_path = wal_job_file(slot, job_id);
-    let tmp_path = final_path.with_extension("wip");
-    {
-        let mut file = File::create(&tmp_path)?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
+        let buffer = self.slot_transactions.entry(shred_id.slot).or_default();
+        buffer.append(shred_id.index, effects);
     }
-    fs::rename(&tmp_path, &final_path)?;
+
+    pub fn slots_path(&self) -> PathBuf {
+        self.slots_path.clone()
+    }
+
+    pub fn take_slot_transactions(&mut self, slot: u64) -> Vec<(ShredIndex, Vec<JobEffects>)> {
+        self.slot_transactions
+            .remove(&slot)
+            .map(SlotTransactions::into_ordered)
+            .unwrap_or_default()
+    }
+
+    pub fn persist_slot(
+        slots_path: PathBuf,
+        slot_metadata: SyncFinalization,
+        shreds: Vec<(ShredIndex, Vec<JobEffects>)>,
+    ) -> EyreResult<()> {
+        let slot = slot_metadata.slot;
+        let slot_dir = slot_directory(&slots_path, slot);
+
+        info!("Persisting slot {} to {}", slot, slot_dir.display());
+
+        if slot_dir.exists() {
+            if let Err(err) = fs::remove_dir_all(&slot_dir) {
+                error!("Failed to clear existing slot directory {:?}: {}", slot_dir, err);
+            }
+        }
+        fs::create_dir_all(&slot_dir)?;
+
+        if !shreds.is_empty() {
+            let mut shreds = shreds;
+            shreds.sort_by_key(|(index, _)| *index);
+            write_shred_files(&slot_dir, &shreds)?;
+        }
+
+        write_info_file(&slot_dir, &slot_metadata)?;
+        info!("Finished persisting slot {} to {}", slot, slot_dir.display());
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct SlotTransactions {
+    shreds: BTreeMap<ShredIndex, Vec<JobEffects>>,
+}
+
+impl SlotTransactions {
+    fn append(&mut self, shred_index: ShredIndex, effects: Vec<JobEffects>) {
+        if effects.is_empty() {
+            return;
+        }
+
+        if self.shreds.contains_key(&shred_index) {
+            panic!("duplicate shred index {shred_index} detected while caching WAL");
+        }
+
+        self.shreds.insert(shred_index, effects);
+    }
+
+    fn into_ordered(self) -> Vec<(ShredIndex, Vec<JobEffects>)> {
+        self.shreds.into_iter().collect()
+    }
+}
+
+fn write_info_file(slot_dir: &Path, slot_metadata: &SyncFinalization) -> EyreResult<()> {
+    let serialized = bincode::serialize(&slot_metadata)?;
+    write_bytes_atomic(&slot_dir.join("info"), &serialized)?;
     Ok(())
 }
 
-/// Replay WAL entries from `from_slot` (inclusive) into the Bank.
-/// Returns number of WAL files applied.
-pub fn replay(bank: &mut Bank, from_slot: u64) -> eyre::Result<usize> {
-    let root = wal_root();
-    if !root.exists() {
-        info!("No WAL directory at {:?}; nothing to replay", root);
+fn write_shred_files(slot_dir: &Path, shreds: &[(ShredIndex, Vec<JobEffects>)]) -> EyreResult<()> {
+    for (shred_index, effects) in shreds {
+        if effects.is_empty() {
+            continue;
+        }
+
+        let serialized = bincode::serialize(effects)?;
+        write_bytes_atomic(&slot_dir.join(shred_index.to_string()), &serialized)?;
+    }
+    Ok(())
+}
+
+fn write_bytes_atomic(path: &Path, data: &[u8]) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let tmp_path = path.with_extension("wip");
+    {
+        let mut file = File::create(&tmp_path)?;
+        file.write_all(data)?;
+        file.sync_all()?;
+    }
+
+    fs::rename(&tmp_path, path)?;
+    Ok(())
+}
+
+pub fn replay(bank: &mut Bank, from_slot: u64) -> EyreResult<usize> {
+    let slots_path = resolve_slots_path();
+    if !slots_path.exists() {
+        info!("No WAL directory at {:?}; nothing to replay", slots_path);
         return Ok(0);
     }
 
-    let mut applied = 0usize;
+    info!("Replaying WAL from slot {}", from_slot);
 
-    // Read slot directories and sort ascending
-    let mut slots: Vec<u64> = Vec::new();
-    for entry in fs::read_dir(&root)? {
-        let entry = entry?;
-        if entry.file_type()?.is_dir() {
-            if let Some(slot) = parse_u64_name(entry.file_name()) {
-                if slot >= from_slot {
-                    slots.push(slot);
-                }
-            }
-        }
+    let archives = enumerate_archives_in_order(&slots_path, Some(from_slot), None)?;
+    if archives.is_empty() {
+        return Ok(0);
     }
-    slots.sort_unstable();
 
-    for slot in slots {
-        let dir = wal_slot_dir(slot);
-        // Collect job files and sort by job_id
-        let mut jobs: Vec<u64> = Vec::new();
-        for entry in fs::read_dir(&dir)? {
-            let entry = entry?;
-            if entry.file_type()?.is_file() {
-                let name = entry.file_name();
-                if let Some(job_id) = parse_u64_stem(name) {
-                    jobs.push(job_id);
-                }
-            }
+    info!(
+        "Replay till slot {} ({} archives)",
+        archives.last().unwrap().slot,
+        archives.len()
+    );
+
+    let mut applied = 0usize;
+    for archive in archives {
+        let slot = archive.slot;
+        if slot < from_slot {
+            continue;
         }
-        jobs.sort_unstable();
 
-        for job_id in jobs {
-            let path = wal_job_file(slot, job_id);
-            if let Err(err) = apply_wal_file(bank, &path) {
-                error!("Failed to apply WAL {:?}: {:#}", path, err);
-                // Do not delete; try again on next startup
-            } else {
+        match load_slot_archive(&slots_path, slot)? {
+            Some((slot_metadata, job_effects)) => {
+                apply_job_effects(bank, job_effects)?;
+                bank.set_slot_blockhash(slot_metadata.slot, slot_metadata.hash);
                 applied += 1;
             }
+            None => continue,
         }
     }
+
+    info!(
+        "Finished replaying WAL from slot {} with {} applied",
+        from_slot, applied
+    );
 
     Ok(applied)
 }
 
-/// Delete all WAL files for a given `slot` after successful external
-/// persistence. Returns the number of files deleted. Best-effort: continues on
-/// individual file errors.
-pub fn delete_slot(slot: u64) -> std::io::Result<usize> {
-    let dir = wal_slot_dir(slot);
-    if !dir.exists() {
-        return Ok(0);
-    }
-
-    let mut deleted = 0usize;
-    let mut maybe_empty = true;
-
-    for entry in fs::read_dir(&dir)? {
-        let entry = entry?;
-        if entry.file_type()?.is_file() {
-            let name = entry.file_name();
-            // Only delete finalized .bin files; leave any .wip files alone.
-            if let Some(stem) = name.to_str() {
-                if stem.ends_with(".bin") {
-                    if fs::remove_file(entry.path()).is_ok() {
-                        deleted += 1;
-                    }
-                } else {
-                    maybe_empty = false; // other files remain
-                }
-            } else {
-                maybe_empty = false;
-            }
-        } else {
-            maybe_empty = false;
-        }
-    }
-
-    // Try to remove the slot directory if empty
-    if maybe_empty {
-        let _ = fs::remove_dir(&dir);
-    }
-
-    Ok(deleted)
+fn resolve_slots_path() -> PathBuf {
+    PathBuf::from(std::env::var("INFINISVM_WAL_PATH").unwrap_or_else(|_| DEFAULT_WAL_PATH.to_string()))
 }
 
-fn apply_wal_file(bank: &mut Bank, path: &Path) -> eyre::Result<()> {
-    let mut file = File::open(path)?;
-    let mut buf = Vec::new();
-    file.read_to_end(&mut buf)?;
+fn load_slot_archive(slots_path: &Path, slot: u64) -> EyreResult<Option<(SyncFinalization, Vec<JobEffects>)>> {
+    let slot_dir = slot_directory(slots_path, slot);
+    if !slot_dir.exists() {
+        return Ok(None);
+    }
 
-    let batch: infinisvm_sync::types::SerializableBatch = bincode::deserialize(&buf)?;
+    let info_path = slot_dir.join("info");
+    if !info_path.is_file() {
+        info!(
+            "Skipping WAL replay for slot {} because info file is missing at {:?}",
+            slot, info_path
+        );
+        return Ok(None);
+    }
 
-    // Aggregate account changes across all transactions (last writer wins)
+    let info_bytes = fs::read(&info_path)?;
+    let slot_metadata = deserialize_slot_metadata(slot, &info_bytes)?;
+
+    let mut shard_files: Vec<(usize, PathBuf)> = Vec::new();
+    for entry in fs::read_dir(&slot_dir)? {
+        let entry = entry?;
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else { continue };
+        if name == "info" {
+            continue;
+        }
+        if let Ok(idx) = name.parse::<ShredIndex>() {
+            shard_files.push((idx, entry.path()));
+        }
+    }
+    shard_files.sort_by_key(|(idx, _)| *idx);
+
+    let mut effects = Vec::new();
+    for (_, shard_path) in shard_files {
+        let shard_bytes = fs::read(&shard_path)?;
+        let mut shard_effects: Vec<JobEffects> = bincode::deserialize(&shard_bytes)?;
+        effects.append(&mut shard_effects);
+    }
+
+    Ok(Some((slot_metadata, effects)))
+}
+
+fn deserialize_slot_metadata(expected_slot: u64, info_bytes: &[u8]) -> EyreResult<SyncFinalization> {
+    let slot_metadata = bincode::deserialize::<SyncFinalization>(info_bytes)?;
+    if slot_metadata.slot != expected_slot {
+        panic!(
+            "slot mismatch while replaying WAL: expected {}, found {}",
+            expected_slot, slot_metadata.slot
+        );
+    }
+
+    Ok(slot_metadata)
+}
+
+fn apply_job_effects(bank: &mut Bank, effects: Vec<JobEffects>) -> EyreResult<()> {
+    if effects.is_empty() {
+        return Ok(());
+    }
+
     let mut changes: HashMap<Pubkey, AccountSharedData> = HashMap::new();
-
-    for tx in batch.transactions.into_iter() {
-        let result: TransactionExecutionDetailsSerializable = tx.get_result()?;
-        let pre_accounts: Vec<(Pubkey, Option<AccountSharedData>)> = tx.get_pre_accounts()?;
-
-        for ((pubkey, maybe_pre), diffs) in pre_accounts.into_iter().zip(result.diffs.into_iter()) {
+    for effect in effects {
+        let diff = effect.job_effect_diff;
+        for ((pubkey, maybe_pre), diffs) in diff.pre_accounts.into_iter().zip(diff.diffs.into_iter()) {
             let mut account = maybe_pre.unwrap_or_default();
-            for diff in diffs {
-                diff.apply_to_account(&mut account);
+            for delta in diffs {
+                delta.apply_to_account(&mut account);
             }
             changes.insert(pubkey, account);
         }
     }
 
     if !changes.is_empty() {
-        let items: Vec<(Pubkey, AccountSharedData)> = changes.into_iter().collect();
-        bank.commit_changes(items);
+        bank.commit_changes(changes.into_iter().collect());
     }
 
     Ok(())
-}
-
-fn parse_u64_name(name: std::ffi::OsString) -> Option<u64> {
-    name.to_str()?.parse::<u64>().ok()
-}
-
-fn parse_u64_stem(name: std::ffi::OsString) -> Option<u64> {
-    let s = name.to_str()?;
-    let stem = s.strip_suffix(".bin")?;
-    stem.parse::<u64>().ok()
 }

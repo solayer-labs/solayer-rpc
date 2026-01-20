@@ -13,9 +13,12 @@ CREATE TABLE IF NOT EXISTS indexer_dev.tx (
     result               blob,
     pre_accounts         blob,
     block_unix_timestamp bigint,
-    seq_number           bigint,
+    ordering             decimal,
     PRIMARY KEY (signature)
 ) WITH compression = {'sstable_compression': ''};
+
+CREATE INDEX tx_by_slot ON indexer_dev.tx (slot);
+
 
 CREATE TABLE IF NOT EXISTS indexer_dev.account_ops (
   owner   blob,
@@ -31,6 +34,12 @@ CREATE TABLE IF NOT EXISTS indexer_dev.account_ops_mint (
   PRIMARY KEY (owner, account, account_type)
 );
 
+CREATE TABLE IF NOT EXISTS indexer_dev.program_accounts (
+  program_id blob,
+  account blob,
+  PRIMARY KEY (program_id, account)
+);
+
 CREATE TABLE IF NOT EXISTS indexer_dev.slots (
     slot                 bigint,
     block_unix_timestamp bigint,
@@ -42,9 +51,9 @@ CREATE TABLE IF NOT EXISTS indexer_dev.slots (
 
 CREATE TABLE IF NOT EXISTS indexer_dev.signatures (
     account blob,
-    seq_number bigint,
+    ordering decimal,
     signature blob,
     slot bigint,
     block_unix_timestamp bigint,
-    PRIMARY KEY  (account, seq_number)
+    PRIMARY KEY  (account, ordering)
 );

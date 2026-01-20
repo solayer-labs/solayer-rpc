@@ -15,7 +15,6 @@ use dashmap::DashMap;
 use hashbrown::HashMap;
 use infinisvm_db::{merger, persistence::PersistedInMemoryDB, Database, SlotHashTimestamp};
 use infinisvm_logger::{info, warn};
-use infinisvm_types::jobs::ConsumedJob;
 use metrics::gauge;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use solana_bpf_loader_program::syscalls::{
@@ -56,9 +55,10 @@ use solana_svm::{
 };
 use solana_svm_transaction::svm_message::SVMMessage;
 
+use infinisvm_types::consumed_job::ConsumedJob;
 use crate::{
-    blockhash_generator::DummyRpcBlockhashGenerator, committer::CommitEvent, fork_graph::EmptyForkGraph,
-    metrics::BankMetrics, subscription::Notifier, wal_writer, SCHEDULER_WORKER_COUNT,
+    blockhash_generator::DummyRpcBlockhashGenerator, fork_graph::EmptyForkGraph, metrics::BankMetrics,
+    subscription::Notifier, wal_writer, SCHEDULER_WORKER_COUNT,
 };
 
 pub fn get_feature_set() -> FeatureSet {
@@ -176,10 +176,6 @@ pub enum TransactionStatus {
     Executed(Option<TransactionError>, u64),
 }
 
-pub use infinisvm_types::sync::RawSlot;
-
-const JOB_ID_RETENTION_SLOTS: u64 = 512;
-
 pub struct Bank {
     db: Arc<RwLock<dyn Database>>,
     status_cache: Arc<DashMap<Signature, TransactionStatus>>,
@@ -193,16 +189,12 @@ pub struct Bank {
     slot_hash_timestamp: SlotHashTimestamp,
     hash_generator: DummyRpcBlockhashGenerator,
 
-    raw_slot_sender: Option<Sender<RawSlot>>,
-    commit_sender: Option<Sender<CommitEvent>>,
-
     transaction_processor: TransactionBatchProcessor<EmptyForkGraph>,
     _feature_set: Arc<FeatureSet>,
     _fork_graph: Arc<RwLock<EmptyForkGraph>>,
     fee_structure: FeeStructure,
 
     subscription_processor: Option<Arc<dyn Notifier>>,
-    slot_job_ids: BTreeMap<u64, RawSlot>,
     metrics: BankMetrics,
 }
 
@@ -217,11 +209,6 @@ impl Bank {
 
     pub fn add_subscriber(&mut self, subscriber: Arc<dyn Notifier>) {
         self.subscription_processor = Some(subscriber);
-    }
-
-    pub fn shutdown_streams(&mut self) {
-        // Drop outbound slot publishers so downstream listeners can exit cleanly.
-        self.raw_slot_sender.take();
     }
 
     pub fn new_slave(exit: Arc<AtomicBool>) -> Self {
@@ -322,7 +309,7 @@ impl Bank {
             prev.push_back(hash);
         }
 
-        let mut bank = Self {
+        let bank = Self {
             db: Arc::new(RwLock::new(pdb)),
             // 350000 tps, expire every 150 slots
             // we need to store 21000000 txs
@@ -331,8 +318,6 @@ impl Bank {
             slot_blockhashes,
             slot_hash_timestamp: (slot, hash, timestamp),
             hash_generator,
-            raw_slot_sender: None,
-            commit_sender: None,
 
             blockhash_pruner_sender,
             status_cache,
@@ -345,21 +330,8 @@ impl Bank {
                 compute_fee_bins: vec![FeeBin { limit: 1400000, fee: 0 }],
             },
             subscription_processor: None,
-            slot_job_ids: BTreeMap::new(),
             metrics: BankMetrics::default(),
         };
-
-        bank.slot_job_ids.insert(
-            slot,
-            RawSlot {
-                slot,
-                hash,
-                parent_hash: hash,
-                timestamp,
-                job_ids: Vec::new(),
-                is_finalized: false,
-            },
-        );
 
         bank.blockhash_signature_map
             .insert(hash, HashSet::with_capacity(200_000));
@@ -381,7 +353,7 @@ impl Bank {
 
     // instead of using TransactionProcessingEnvironment that introduces a lifetime,
     // store the fields separately
-    pub fn get_transaction_processing_environment(&self) -> TransactionProcessingEnvironment {
+    pub fn get_transaction_processing_environment(&self) -> TransactionProcessingEnvironment<'_> {
         TransactionProcessingEnvironment {
             blockhash: self.current_blockhash(),
             epoch_total_stake: 0,
@@ -396,12 +368,38 @@ impl Bank {
         self.slot_hash_timestamp
     }
 
-    pub fn get_latest_slot(&self) -> RawSlot {
-        let largest_slot = match self.slot_job_ids.keys().max() {
-            Some(slot) => slot,
-            None => return RawSlot::default(),
-        };
-        self.slot_job_ids.get(largest_slot).cloned().unwrap_or_default()
+    pub fn parent_blockhash_of_slot(&self, slot: u64) -> Option<Hash> {
+        let parent_slot = slot.checked_sub(1)?;
+
+        match self.slot_blockhashes.get(&parent_slot).copied() {
+            Some(hash) => Some(hash),
+            None => {
+                if self.metrics.note_parent_blockhash_missing(slot) {
+                    let oldest_slot = self.slot_blockhashes.keys().next().copied();
+                    let newest_slot = self.slot_blockhashes.keys().next_back().copied();
+                    warn!(
+                        slot,
+                        parent_slot,
+                        ?oldest_slot,
+                        ?newest_slot,
+                        slot_blockhashes_len = self.slot_blockhashes.len(),
+                        "parent blockhash not found in slot_blockhashes"
+                    );
+                }
+                None
+            }
+        }
+    }
+
+    pub fn get_latest_slot_hash_timestamp_parent(&self) -> (u64, Hash, u64, Hash) {
+        let slot = self.slot_hash_timestamp.0;
+        let parent_hash = self.parent_blockhash_of_slot(slot).unwrap_or_default();
+        (
+            slot,
+            self.slot_hash_timestamp.1,
+            self.slot_hash_timestamp.2,
+            parent_hash,
+        )
     }
 
     pub fn write_status_cache(&self, signature: &Signature, status: TransactionStatus) {
@@ -542,75 +540,8 @@ impl Bank {
         }
     }
 
-    pub fn register_job_id(&mut self, slot: u64, job_id: u64) {
-        self.slot_job_ids
-            .get_mut(&slot)
-            .unwrap_or_else(|| panic!("slot {slot} not found during register_job_id"))
-            .add_job_id(job_id);
-    }
-
-    pub fn get_raw_slot(&self, slot: u64) -> Option<RawSlot> {
-        self.slot_job_ids.get(&slot).cloned()
-    }
-
-    fn prune_slot_history(&mut self, current_slot: u64) {
-        let min_slot = current_slot.saturating_sub(JOB_ID_RETENTION_SLOTS);
-        self.slot_job_ids.retain(|s, _| *s >= min_slot);
-    }
-
-    fn send_raw_slot(&mut self, slot: u64) {
-        if let Some(raw_slot_sender) = self.raw_slot_sender.as_ref() {
-            let raw_slot = self
-                .slot_job_ids
-                .get(&slot)
-                .unwrap_or_else(|| panic!("slot {slot} not found during send_raw_slot"));
-
-            if let Err(err) = raw_slot_sender.send(raw_slot.clone()) {
-                warn!("Failed to publish raw slot {} to subscribers: {}", slot, err);
-            }
-        }
-    }
-
-    pub fn mark_slot_range_finalized(&mut self, slot: u64) {
-        info!("Marking slot {slot} as finalized");
-        // mark all slots <= slot as finalized
-        for (s, raw_slot) in self.slot_job_ids.iter_mut() {
-            if *s <= slot {
-                raw_slot.is_finalized = true;
-            }
-        }
-
-        match self.slot_job_ids.get(&slot) {
-            Some(raw_slot) => info!(
-                "mark_slot_range_finalized: slot ({slot}) {:?} finalized",
-                raw_slot.job_ids
-            ),
-            None => info!("mark_slot_range_finalized: slot ({slot}) not found"),
-        }
-    }
-
     pub fn tick(&mut self) {
         let slot = self.slot_hash_timestamp.0;
-        let parent_hash = self.last_blockhash().unwrap_or_default();
-
-        // mark slot - 2 as finalized
-        // assume slot - 2 is always executed
-        // todo: wal
-        let finalized_slot = slot.saturating_sub(2);
-        if let Some(raw_slot) = self.slot_job_ids.get_mut(&finalized_slot) {
-            if !raw_slot.is_finalized {
-                info!("slot ({}) {:?} finalized", finalized_slot, raw_slot.job_ids);
-                raw_slot.is_finalized = true;
-                // Send finalization event to committer for empty slots
-                if let Some(ref commit_sender) = self.commit_sender {
-                    if let Err(e) = commit_sender.send(CommitEvent::Finalize { slot: finalized_slot }) {
-                        warn!("Failed to send finalization event for slot {}: {}", finalized_slot, e);
-                    }
-                }
-            }
-        }
-
-        self.prune_slot_history(slot);
 
         let unix_timestamp = std::time::UNIX_EPOCH.elapsed().unwrap().as_secs();
         let next_slot = self.slot_hash_timestamp.0 + 1;
@@ -626,7 +557,7 @@ impl Bank {
             false,
         );
 
-        self.post_tick(slot, unix_timestamp, true, parent_hash);
+        self.post_tick(slot, unix_timestamp, true);
     }
 
     pub fn commit_blockhash_to_signatures(&mut self, blockhash_to_signatures: HashMap<Hash, Vec<Signature>>) {
@@ -638,13 +569,13 @@ impl Bank {
         }
     }
 
-    pub fn tick_as_slave(&mut self, slot_data: &RawSlot) {
+    pub fn tick_as_slave(&mut self, slot: u64, hash: Hash, timestamp: u64) {
         // Advance to the provided slot/hash/timestamp from the sequencer
-        self.slot_hash_timestamp = (slot_data.slot, slot_data.hash, slot_data.timestamp);
-        self.set_slot_blockhash(slot_data.slot, slot_data.hash);
+        self.slot_hash_timestamp = (slot, hash, timestamp);
+        self.set_slot_blockhash(slot, hash);
         // Update blockhash window and Clock/sysvars for the current slot (not the
         // previous)
-        self.post_tick(slot_data.slot, slot_data.timestamp, true, slot_data.parent_hash);
+        self.post_tick(slot, timestamp, true);
     }
 
     pub fn commit_changes(&mut self, db_changes: Vec<(Pubkey, AccountSharedData)>) {
@@ -654,7 +585,7 @@ impl Bank {
 
     /// Set the status of the bank after tick moved forward, pass in previous
     /// slot and timestamp
-    fn post_tick(&mut self, slot: u64, unix_timestamp: u64, update_sysvar: bool, parent_hash: Hash) {
+    fn post_tick(&mut self, slot: u64, unix_timestamp: u64, update_sysvar: bool) {
         let clock = Clock {
             slot,
             epoch: 0,
@@ -692,17 +623,6 @@ impl Bank {
         // todo: SysvarS1otHashes111111111111111111111111111
 
         info!("new slot: {:?}", self.slot_hash_timestamp);
-
-        let new_raw_slot = RawSlot {
-            slot: self.slot_hash_timestamp.0,
-            hash: self.slot_hash_timestamp.1,
-            parent_hash,
-            timestamp: self.slot_hash_timestamp.2,
-            job_ids: Vec::new(),
-            is_finalized: false,
-        };
-        self.slot_job_ids.insert(self.slot_hash_timestamp.0, new_raw_slot);
-        self.send_raw_slot(self.slot_hash_timestamp.0);
 
         self.metrics.report();
     }
@@ -892,7 +812,7 @@ impl Bank {
         self.db.write().unwrap().write_account(*program_id, account);
     }
 
-    pub fn commit_transactions(&mut self, consumed_jobs: &[ConsumedJob], worker_id: usize) {
+    pub(crate) fn commit_transactions(&mut self, consumed_jobs: &[ConsumedJob], worker_id: usize) {
         let mut total_fees = 0;
         let mut accounts_changed = HashMap::with_capacity(consumed_jobs.len() * 64);
 

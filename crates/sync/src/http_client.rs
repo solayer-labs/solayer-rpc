@@ -531,7 +531,7 @@ impl Downloader {
             match task.await {
                 Ok(Ok((file, result))) => {
                     completed += 1;
-                    if completed % 100 == 0 || completed == total {
+                    if completed.is_multiple_of(100) || completed == total {
                         infinisvm_logger::info!("bulk_download progress: {}/{} files completed", completed, total);
                     }
                     if file.slot() > self.last_slot {
@@ -572,21 +572,71 @@ impl Downloader {
         loop {
             interval.tick().await;
             info!("Polling for new files since slot {}", self.last_slot);
-            let snapshots = http_client.get_snapshots().await.expect("Failed to get snapshots");
+            let snapshots = match http_client.get_snapshots().await {
+                Ok(snapshots) => snapshots,
+                Err(e) => {
+                    warn!("Failed to get snapshots: {}", e);
+                    continue;
+                }
+            };
             let files = snapshots.since_slot(self.last_slot);
             if files.is_empty() {
                 info!("No new files found in this tick");
             } else {
                 info!("Found {} new files since slot {}", files.len(), self.last_slot);
             }
-            let results = self
-                .bulk_download(http_client, files, parser)
-                .await
-                .expect("Failed to bulk download files");
+            // Retry up to 5 times with exponential backoff
+            let mut results = None;
+            const MAX_RETRIES: u32 = 20;
+            const INITIAL_BACKOFF_MS: u64 = 1000; // Start with 1 second
+            const BACKOFF_MULTIPLIER: f64 = 2.0;
+
+            for attempt in 1..=MAX_RETRIES {
+                match self.bulk_download(http_client, files.clone(), parser).await {
+                    Ok(res) => {
+                        results = Some(res);
+                        break;
+                    }
+                    Err(e) => {
+                        if attempt < MAX_RETRIES {
+                            let backoff_ms =
+                                (INITIAL_BACKOFF_MS as f64 * BACKOFF_MULTIPLIER.powi(attempt as i32 - 1)) as u64;
+                            warn!(
+                                "Bulk download failed (attempt {}/{}): {}, retrying in {}ms",
+                                attempt, MAX_RETRIES, e, backoff_ms
+                            );
+                            sleep(Duration::from_millis(backoff_ms)).await;
+                        } else {
+                            error!("Bulk download failed after {} attempts: {}", MAX_RETRIES, e);
+                        }
+                    }
+                }
+            }
+
+            let Some(results) = results else {
+                let skipped_to = files.iter().map(|file| file.slot()).max().unwrap_or(self.last_slot);
+                if skipped_to > self.last_slot {
+                    warn!(
+                        "Skipping {} files after bulk download failure; advancing last_slot from {} to {}",
+                        files.len(),
+                        self.last_slot,
+                        skipped_to
+                    );
+                    self.last_slot = skipped_to;
+                } else {
+                    warn!("Skipping bulk download failure; last_slot remains {}", self.last_slot);
+                }
+                continue;
+            };
             info!("Download complete: {} files", results.len());
             for (file, result) in results {
+                let file_display = file.to_string();
                 if let Err(e) = sender.send((file, result)).await {
-                    panic!("Failed to enqueue downloaded file to DB-chain updater: {e}");
+                    error!(
+                        "Failed to enqueue downloaded file {} to DB-chain updater: {}",
+                        file_display, e
+                    );
+                    break;
                 }
             }
         }

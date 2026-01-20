@@ -147,71 +147,10 @@ impl<T: MergeableDB> DBChain<T> {
         );
     }
 
-    pub fn contains_shred(&self, slot: u64, job_id: u64) -> bool {
-        self.dbs
-            .iter()
-            .any(|(meta, _)| matches!(meta.slot, DBFile::Shred(s, j) if s == slot && j == job_id))
-    }
-
-    pub fn find_shred_slot(&self, job_id: u64) -> Option<u64> {
-        self.dbs.iter().find_map(|(meta, _)| match meta.slot {
-            DBFile::Shred(slot, j) if j == job_id => Some(slot),
-            _ => None,
-        })
-    }
-
-    pub fn relocate_shred(&mut self, from_slot: u64, job_id: u64, to_slot: u64) -> bool {
-        if from_slot == to_slot {
-            return self.contains_shred(to_slot, job_id);
-        }
-
-        let from_idx = self
-            .dbs
-            .iter()
-            .position(|(meta, _)| matches!(meta.slot, DBFile::Shred(slot, j) if slot == from_slot && j == job_id));
-
-        let Some(from_idx) = from_idx else {
-            warn!(
-                "relocate_shred: missing source shard slot={} job_id={}",
-                from_slot, job_id
-            );
-            return false;
-        };
-
-        let (_, db) = self.dbs.remove(from_idx);
-
-        if let Some(existing_idx) = self
-            .dbs
-            .iter()
-            .position(|(meta, _)| matches!(meta.slot, DBFile::Shred(slot, j) if slot == to_slot && j == job_id))
-        {
-            info!(
-                "relocate_shred: removing existing destination shard slot={} job_id={} before relocation",
-                to_slot, job_id
-            );
-            self.dbs.remove(existing_idx);
-        }
-
-        let meta = DBMeta::from_shred(to_slot, job_id);
-        let insert_pos = self.dbs.partition_point(|(m, _)| m < &meta);
-        self.dbs.insert(insert_pos, (meta, db));
-        info!(
-            "relocate_shred: moved job_id={} from slot {} to slot {}; summary: {}",
-            job_id,
-            from_slot,
-            to_slot,
-            self.summary()
-        );
-        true
-    }
-
-    pub(crate) fn last_confirmed_slot(&self, slot_plan: &HashMap<u64, Vec<u64>>) -> Option<u64> {
+    pub(crate) fn last_confirmed_slot(&self, slot_plan: &HashMap<u64, usize>) -> Option<u64> {
         debug!("Computing last_confirmed_slot; chain: {}", self.summary());
         // expected jobs per slot from the remote plan
-        let mut slot_plan_to_fill = slot_plan
-            .iter()
-            .map(|(s, p)| (*s, p.len()))
-            .collect::<HashMap<u64, usize>>();
+        let mut slot_plan_to_fill = slot_plan.iter().map(|(s, p)| (*s, *p)).collect::<HashMap<u64, usize>>();
         let mut last_confirmed_slot = None;
 
         // Find the last checkpoint; do not treat Account files as baselines
@@ -301,13 +240,13 @@ impl<T: MergeableDB> DBChain<T> {
                     last_confirmed_slot = Some(slot);
                 }
                 Some(remaining) => {
-                    let expected = slot_plan.get(&slot).map(|v| v.len()).unwrap_or(0);
+                    let expected = slot_plan.get(&slot).copied().unwrap_or(0);
                     let present = present_counts.get(&slot).copied().unwrap_or(0);
                     blocking_slot = Some((slot, expected, present, *remaining, false));
                     break;
                 }
                 None => {
-                    let expected = slot_plan.get(&slot).map(|v| v.len()).unwrap_or(0);
+                    let expected = slot_plan.get(&slot).copied().unwrap_or(0);
                     let present = present_counts.get(&slot).copied().unwrap_or(0);
                     blocking_slot = Some((slot, expected, present, usize::MAX, true));
                     break;
@@ -316,21 +255,21 @@ impl<T: MergeableDB> DBChain<T> {
         }
 
         if let Some((slot, expected, present, remaining, missing_plan)) = blocking_slot {
-            let mut local_job_ids: Vec<u64> = self
+            let mut local_shred_indices: Vec<usize> = self
                 .dbs
                 .iter()
                 .filter_map(|(meta, _)| {
-                    (meta.slot.slot() == slot && matches!(meta.slot, DBFile::Shred(_, _))).then_some(meta.job_id)
+                    (meta.slot.slot() == slot && matches!(meta.slot, DBFile::Shred(_, _))).then_some(meta.shred_index)
                 })
                 .collect();
-            local_job_ids.sort_unstable();
+            local_shred_indices.sort_unstable();
             let present_display = if present == usize::MAX {
                 "account_segment".to_string()
             } else {
                 present.to_string()
             };
             info!(
-                "Merge checkpoint stall at slot {}: expected_jobs={} present_jobs={} remaining_jobs={} missing_in_plan={} local_job_ids={:?}",
+                "Merge checkpoint stall at slot {}: expected_jobs={} present_jobs={} remaining_jobs={} missing_in_plan={} local_shred_indices={:?}",
                 slot,
                 expected,
                 present_display,
@@ -340,29 +279,20 @@ impl<T: MergeableDB> DBChain<T> {
                     remaining.to_string()
                 },
                 missing_plan,
-                local_job_ids
+                local_shred_indices
             );
 
             // Provide additional, focused diagnostics on what is actually missing
             // (cap samples to keep logs bounded)
-            let expected_ids_sample: Vec<u64> = slot_plan
-                .get(&slot)
-                .map(|v| v.iter().copied().take(10).collect())
-                .unwrap_or_default();
-            let present_set: HashSet<u64> = local_job_ids.iter().copied().collect();
-            let missing_ids_sample: Vec<u64> = slot_plan
-                .get(&slot)
-                .map(|v| {
-                    v.iter()
-                        .copied()
-                        .filter(|id| !present_set.contains(id))
-                        .take(10)
-                        .collect()
-                })
-                .unwrap_or_default();
+            let current_slot_max_id = slot_plan.get(&slot).copied().unwrap_or(0);
+            let expected_shred_indices_sample: Vec<usize> = (0..current_slot_max_id).collect();
+            let present_set: HashSet<usize> = local_shred_indices.iter().copied().collect();
+            let missing_shred_indices_sample: Vec<usize> = (0..current_slot_max_id)
+                .filter(|shred_index| !present_set.contains(shred_index))
+                .collect();
             info!(
-                "Blocking slot {} details: expected_ids_sample={:?} missing_ids_sample={:?}",
-                slot, expected_ids_sample, missing_ids_sample
+                "Blocking slot {} details: expected_shred_indices_sample={:?} missing_shred_indices_sample={:?}",
+                slot, expected_shred_indices_sample, missing_shred_indices_sample
             );
         }
 
@@ -373,7 +303,7 @@ impl<T: MergeableDB> DBChain<T> {
             for k in keys {
                 let rem = *slot_plan_to_fill.get(&k).unwrap_or(&usize::MAX);
                 if rem != 0 {
-                    let expected = slot_plan.get(&k).map(|v| v.len()).unwrap_or(0);
+                    let expected = slot_plan.get(&k).copied().unwrap_or(0);
                     let present = present_counts.get(&k).copied().unwrap_or(0);
                     info!(
                         "No confirmed slot yet; earliest incomplete slot {} expected_jobs={} present_jobs={} remaining_jobs={}",

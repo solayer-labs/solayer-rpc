@@ -1,5 +1,4 @@
 use std::{
-    fmt,
     sync::{
         atomic::{AtomicU32, AtomicU64, Ordering},
         Arc, Arc as StdArc,
@@ -9,10 +8,7 @@ use std::{
 
 use base64::Engine;
 use infinisvm_logger::{debug, error, info, warn};
-use infinisvm_types::sync::{
-    grpc::infini_svm_service_client::InfiniSvmServiceClient, CommitBatchNotification, GetLatestSlotRequest,
-    GetTransactionBatchRequest, RawSlot, StartReceivingSlotsRequest, TransactionBatchRequest,
-};
+use infinisvm_types::sync::{CommitBatchNotification, ShredId, SyncBatchShred, SyncFinalization};
 use metrics::counter;
 use tokio::{
     net::TcpStream,
@@ -21,87 +17,11 @@ use tokio::{
 };
 use tokio_rustls::{rustls as rustls_conn, TlsConnector};
 use tokio_stream::StreamExt;
-use tonic::{
-    transport::{Certificate, Channel, ClientTlsConfig, Endpoint},
-    Code, Request, Status,
+use tonic::{Code, Request, Status};
+
+use crate::grpc::service::{
+    GetBatchShredRequest, GetBlockFinalizerRequest, InfiniSvmServiceClient, SubscribeTransactionBatchRequest,
 };
-
-// Custom Ed25519 server certificate verifier (trust on raw public key)
-#[derive(Debug)]
-struct Ed25519ServerCertVerifier {
-    allowed_pubkeys: Vec<[u8; 32]>,
-}
-
-impl Ed25519ServerCertVerifier {
-    fn new(allowed_pubkeys: Vec<[u8; 32]>) -> Self {
-        Self { allowed_pubkeys }
-    }
-}
-
-impl rustls::client::danger::ServerCertVerifier for Ed25519ServerCertVerifier {
-    fn verify_server_cert(
-        &self,
-        end_entity: &rustls::pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
-        _ocsp: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        if let Some(pk) = extract_ed25519_spki_pubkey(end_entity.as_ref()) {
-            if self.allowed_pubkeys.contains(&pk) {
-                return Ok(rustls::client::danger::ServerCertVerified::assertion());
-            }
-        }
-        Err(rustls::Error::InvalidCertificate(rustls::CertificateError::Other(
-            rustls::OtherError(StdArc::new(StaticError("untrusted ed25519 public key"))),
-        )))
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &rustls::pki_types::CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        use ed25519_dalek::{PublicKey, Signature, Verifier};
-        if dss.scheme != rustls::SignatureScheme::ED25519 {
-            return Err(rustls::Error::PeerIncompatible(
-                rustls::PeerIncompatible::NoSignatureSchemesInCommon,
-            ));
-        }
-        let Some(pk_bytes) = extract_ed25519_spki_pubkey(cert.as_ref()) else {
-            return Err(rustls::Error::InvalidCertificate(rustls::CertificateError::BadEncoding));
-        };
-        let Ok(vk) = PublicKey::from_bytes(&pk_bytes) else {
-            return Err(rustls::Error::InvalidCertificate(rustls::CertificateError::BadEncoding));
-        };
-        let sig_bytes = dss.signature();
-        let Ok(sig) = Signature::from_bytes(sig_bytes) else {
-            return Err(rustls::Error::InvalidCertificate(
-                rustls::CertificateError::BadSignature,
-            ));
-        };
-        vk.verify(message, &sig)
-            .map_err(|_| rustls::Error::InvalidCertificate(rustls::CertificateError::BadSignature))?;
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        // We don't support TLS 1.2 signatures in this verifier (only TLS 1.3 + Ed25519)
-        Err(rustls::Error::PeerIncompatible(
-            rustls::PeerIncompatible::NoSignatureSchemesInCommon,
-        ))
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        vec![rustls::SignatureScheme::ED25519]
-    }
-}
 
 #[derive(Debug)]
 struct AcceptAllServerCertVerifierConn;
@@ -136,34 +56,6 @@ impl rustls_conn::client::danger::ServerCertVerifier for AcceptAllServerCertVeri
         vec![rustls_conn::SignatureScheme::ED25519]
     }
 }
-
-// Helper that attempts to set a custom certificate verifier on a
-// ClientTlsConfig if the tonic version exposes the "dangerous" API. If not
-// available, returns the input unchanged.
-fn set_custom_verifier_if_supported(
-    cfg: ClientTlsConfig,
-    verifier: StdArc<dyn rustls::client::danger::ServerCertVerifier>,
-) -> ClientTlsConfig {
-    // The specific API shape has changed across tonic versions. We attempt the
-    // common form via a small shim that compiles when the method exists.
-    #[allow(unused_variables)]
-    fn try_set(
-        cfg: ClientTlsConfig,
-        _verifier: StdArc<dyn rustls::client::danger::ServerCertVerifier>,
-    ) -> ClientTlsConfig {
-        cfg
-    }
-    try_set(cfg, verifier)
-}
-
-#[derive(Debug)]
-struct StaticError(&'static str);
-impl fmt::Display for StaticError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.0)
-    }
-}
-impl std::error::Error for StaticError {}
 
 // Minimal DER scan to extract the Ed25519 SPKI public key (32 bytes) from an
 // X.509 cert
@@ -328,7 +220,7 @@ impl CircuitBreaker {
 
 /// Enhanced gRPC client with retry and circuit breaker functionality
 pub struct SyncClient {
-    client: InfiniSvmServiceClient<Channel>,
+    client: InfiniSvmServiceClient,
     retry_config: RetryConfig,
     circuit_breaker: Arc<CircuitBreaker>,
     connection_url: String,
@@ -398,7 +290,7 @@ impl SyncClient {
         circuit_breaker: &CircuitBreaker,
         allowed_server_pubkeys: &Option<Vec<[u8; 32]>>,
         root_ca_pem: &Option<Vec<u8>>,
-    ) -> Result<InfiniSvmServiceClient<Channel>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<InfiniSvmServiceClient, Box<dyn std::error::Error + Send + Sync>> {
         let mut attempt = 0;
         let mut last_error: Option<String> = None;
 
@@ -463,7 +355,7 @@ impl SyncClient {
         addr: &str,
         allowed_server_pubkeys: &Option<Vec<[u8; 32]>>,
         root_ca_pem: &Option<Vec<u8>>,
-    ) -> Result<InfiniSvmServiceClient<Channel>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<InfiniSvmServiceClient, Box<dyn std::error::Error + Send + Sync>> {
         // Ensure rustls provider is installed
         let _ = rustls::crypto::ring::default_provider().install_default();
 
@@ -474,7 +366,6 @@ impl SyncClient {
             if root_ca_pem.as_ref().is_some() { "yes" } else { "no" }
         );
 
-        let mut endpoint = Endpoint::from_shared(addr.to_string())?;
         let uri: http::Uri = addr.parse()?;
         let host = uri.host().unwrap_or("localhost").to_string();
         // Track pinned end-entity cert if we probed it for pubkey pinning
@@ -528,42 +419,6 @@ impl SyncClient {
                     return Err("server cert missing ed25519 spki".into());
                 }
             }
-
-            // Build tonic TLS config; add our custom verifier if supported
-            let mut tls = ClientTlsConfig::new().domain_name(host.clone());
-            #[allow(unused_must_use)]
-            {
-                tls = set_custom_verifier_if_supported(tls, StdArc::new(Ed25519ServerCertVerifier::new(keys.clone())));
-            }
-            if let Some(ca) = root_ca_pem {
-                tls = tls.ca_certificate(Certificate::from_pem(ca.clone()));
-            }
-            if let Some(der) = pinned_end_entity.as_ref() {
-                // Encode DER to PEM
-                let pem = {
-                    let b64 = base64::engine::general_purpose::STANDARD.encode(der);
-                    let mut s = String::new();
-                    s.push_str("-----BEGIN CERTIFICATE-----\n");
-                    for chunk in b64.as_bytes().chunks(64) {
-                        s.push_str(std::str::from_utf8(chunk).unwrap());
-                        s.push('\n');
-                    }
-                    s.push_str("-----END CERTIFICATE-----\n");
-                    s
-                };
-                tls = tls.ca_certificate(Certificate::from_pem(pem));
-            }
-            info!(
-                "using TLS for tonic endpoint with domain {} (pubkey pinning mode)",
-                host
-            );
-            endpoint = endpoint.tls_config(tls)?;
-        } else if let Some(ca) = root_ca_pem {
-            let tls = ClientTlsConfig::new()
-                .domain_name(host.clone())
-                .ca_certificate(Certificate::from_pem(ca.clone()));
-            info!("using TLS for tonic endpoint with provided CA, domain {}", host);
-            endpoint = endpoint.tls_config(tls)?;
         }
 
         let base_uri = format!(
@@ -574,7 +429,6 @@ impl SyncClient {
         );
         // Build a lazy tonic Channel to satisfy the type parameter, but do not
         // perform an eager handshake here. All actual RPCs use the HTTPS Hyper client.
-        let ch = endpoint.connect_lazy();
 
         // Provide TLS CA/pinned cert to the bincode HTTP client so it can do HTTPS
         let ca_pem_for_bincode: Option<Vec<u8>> = if let Some(ca) = root_ca_pem {
@@ -596,7 +450,7 @@ impl SyncClient {
             }
         };
 
-        Ok(InfiniSvmServiceClient::new(ch, base_uri, ca_pem_for_bincode))
+        Ok(InfiniSvmServiceClient::new(base_uri, ca_pem_for_bincode))
     }
 
     /// Calculate exponential backoff with jitter
@@ -632,7 +486,7 @@ impl SyncClient {
     async fn execute_with_retry<T>(
         &mut self,
         operation_name: &str,
-        operation: impl Fn(&mut InfiniSvmServiceClient<Channel>) -> futures_util::future::BoxFuture<'_, Result<T, Status>>,
+        operation: impl Fn(&mut InfiniSvmServiceClient) -> futures_util::future::BoxFuture<'_, Result<T, Status>>,
     ) -> Result<T, Box<dyn std::error::Error + Send + Sync>> {
         let mut attempt = 0;
         let mut last_error: Option<String> = None;
@@ -689,109 +543,33 @@ impl SyncClient {
         Err(error_msg.into())
     }
 
-    pub async fn get_latest_slot(&mut self) -> Result<RawSlot, Box<dyn std::error::Error + Send + Sync>> {
-        let result = self
-            .execute_with_retry("get_latest_slot", |client| {
-                Box::pin(async move {
-                    let request = Request::new(GetLatestSlotRequest {});
-                    client.get_latest_slot(request).await
-                })
-            })
-            .await?;
-
-        Ok(result.into_inner())
-    }
-
-    pub async fn get_transaction_batch(
-        &mut self,
-        slot: u64,
-        job_id: u64,
-    ) -> Result<CommitBatchNotification, Box<dyn std::error::Error + Send + Sync>> {
-        let result = self
-            .execute_with_retry("get_transaction_batch", |client| {
-                Box::pin(async move {
-                    let request = Request::new(GetTransactionBatchRequest { slot, job_id });
-                    client.get_transaction_batch(request).await
-                })
-            })
-            .await?;
-        Ok(result.into_inner())
-    }
-
     // Single RPC without the generic retry wrapper; returns tonic::Status for
     // precise error handling
-    pub async fn get_transaction_batch_status(
+    pub async fn get_batch_shred(
+        &mut self,
+        shred_id: ShredId,
+    ) -> Result<SyncBatchShred, Box<dyn std::error::Error + Send + Sync>> {
+        let request = Request::new(GetBatchShredRequest { shred_id });
+        let result = self.client.get_batch_shred(request).await?;
+        Ok(result.into_inner())
+    }
+
+    pub async fn get_block_finalizer(
         &mut self,
         slot: u64,
-        job_id: u64,
-    ) -> Result<CommitBatchNotification, tonic::Status> {
-        let request = Request::new(GetTransactionBatchRequest { slot, job_id });
-        let resp = self.client.get_transaction_batch(request).await?;
-        Ok(resp.into_inner())
+    ) -> Result<SyncFinalization, Box<dyn std::error::Error + Send + Sync>> {
+        let request = Request::new(GetBlockFinalizerRequest { slot });
+        let result = self.client.get_block_finalizer(request).await?;
+        Ok(result.into_inner())
     }
 
-    pub async fn subscribe_slots(
-        &mut self,
-    ) -> Result<mpsc::Receiver<RawSlot>, Box<dyn std::error::Error + Send + Sync>> {
-        let stream = self
-            .execute_with_retry("subscribe_slots", |client| {
-                Box::pin(async move {
-                    let request = Request::new(StartReceivingSlotsRequest {});
-                    client.start_receiving_slots(request).await
-                })
-            })
-            .await?
-            .into_inner();
-
-        let (tx, rx) = mpsc::channel(128);
-        let retry_config = self.retry_config.clone();
-        let circuit_breaker = Arc::clone(&self.circuit_breaker);
-        let connection_url = self.connection_url.clone();
-        let retry_config_for_task = retry_config.clone();
-        let circuit_breaker_for_task = Arc::clone(&circuit_breaker);
-
-        // Function to resubscribe the slot stream on failure
-        let allowed_keys_outer = self.allowed_server_pubkeys.clone();
-        let make_new_stream = move || {
-            let allowed = allowed_keys_outer.clone();
-            let connection_url = connection_url.clone();
-            async move {
-                match SyncClient::connect_once(&connection_url, &allowed, &None).await {
-                    Ok(client) => {
-                        let mut client = client.max_decoding_message_size(1024 * 1024 * 1024);
-                        let request = Request::new(StartReceivingSlotsRequest {});
-                        match client.start_receiving_slots(request).await {
-                            Ok(resp) => Ok(resp.into_inner()),
-                            Err(e) => Err(e.to_string()),
-                        }
-                    }
-                    Err(e) => Err(e.to_string()),
-                }
-            }
-        };
-
-        tokio::spawn(async move {
-            Self::handle_stream(
-                stream,
-                tx,
-                "slot_data",
-                retry_config_for_task,
-                circuit_breaker_for_task,
-                make_new_stream,
-            )
-            .await;
-        });
-
-        Ok(rx)
-    }
-
-    pub async fn subscribe_transactions(
+    pub async fn subscribe_commit_batch_notifications(
         &mut self,
     ) -> Result<mpsc::Receiver<CommitBatchNotification>, Box<dyn std::error::Error + Send + Sync>> {
         let stream = self
             .execute_with_retry("subscribe_transactions", |client| {
                 Box::pin(async move {
-                    let request = Request::new(TransactionBatchRequest {});
+                    let request = Request::new(SubscribeTransactionBatchRequest {});
                     client.subscribe_transaction_batches(request).await
                 })
             })
@@ -814,7 +592,7 @@ impl SyncClient {
                 match SyncClient::connect_once(&connection_url, &allowed, &None).await {
                     Ok(client) => {
                         let mut client = client.max_decoding_message_size(1024 * 1024 * 1024);
-                        let request = Request::new(TransactionBatchRequest {});
+                        let request = Request::new(SubscribeTransactionBatchRequest {});
                         match client.subscribe_transaction_batches(request).await {
                             Ok(resp) => Ok(resp.into_inner()),
                             Err(e) => Err(e.to_string()),

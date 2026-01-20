@@ -37,8 +37,8 @@ use solana_sdk::{
 use solana_svm::transaction_processing_result::ProcessedTransaction;
 use solana_transaction_status::{
     map_inner_instructions, Encodable, EncodedTransactionWithStatusMeta, TransactionDetails, TransactionStatusMeta,
-    TransactionWithStatusMeta, UiConfirmedBlock, UiInnerInstructions, UiReturnDataEncoding, UiTransactionEncoding,
-    UiTransactionReturnData, VersionedTransactionWithStatusMeta,
+    TransactionTokenBalance, TransactionWithStatusMeta, UiConfirmedBlock, UiInnerInstructions, UiReturnDataEncoding,
+    UiTransactionEncoding, UiTransactionReturnData, VersionedTransactionWithStatusMeta,
 };
 use spl_token_2022::{extension::StateWithExtensions, state::Mint};
 use thiserror::Error;
@@ -46,7 +46,10 @@ use tracing::error;
 
 use crate::rpc_state::{RpcBank, RpcServerState};
 
-pub const MAX_TOKEN_ACCOUNTS_QUERY_LIMIT: usize = 1 << 32;
+// Cassandra LIMIT clause uses Int32, max value is 2,147,483,647
+// TODO: Consider increasing this limit in the future if needed (currently set
+// to 10,000 for safety)
+pub const MAX_TOKEN_ACCOUNTS_QUERY_LIMIT: usize = 10_000;
 
 pub fn deserialize_checked(input: &[u8]) -> Option<VersionedTransaction> {
     match limited_deserialize::<VersionedTransaction>(input) {
@@ -78,6 +81,60 @@ pub fn sigverify(versioned_transaction: &VersionedTransaction) -> bool {
     };
 
     verified
+}
+
+impl RpcServerState {
+    fn patch_token_balance_decimals(&self, metadata: &mut TransactionStatusMeta) {
+        if metadata.pre_token_balances.is_none() && metadata.post_token_balances.is_none() {
+            return;
+        }
+
+        let Ok(db_reader) = self.db.read() else {
+            return;
+        };
+
+        let mut mint_decimals_cache: HashMap<Pubkey, u8> = HashMap::new();
+        let mut fix_balances = |balances: &mut Option<Vec<TransactionTokenBalance>>| {
+            if let Some(balances) = balances {
+                for balance in balances.iter_mut() {
+                    let mint_pubkey = match balance.mint.parse::<Pubkey>() {
+                        Ok(mint) => mint,
+                        Err(_) => continue,
+                    };
+                    let decimals = *mint_decimals_cache.entry(mint_pubkey).or_insert_with(|| {
+                        let data = db_reader
+                            .get_account(mint_pubkey)
+                            .ok()
+                            .flatten()
+                            .map(|account| account.data().to_vec());
+                        data.and_then(|bytes| {
+                            StateWithExtensions::<Mint>::unpack(&bytes)
+                                .ok()
+                                .map(|mint| mint.base.decimals)
+                        })
+                        .unwrap_or(balance.ui_token_amount.decimals)
+                    });
+                    balance.ui_token_amount.decimals = decimals;
+
+                    if let Ok(amount) = balance.ui_token_amount.amount.parse::<u128>() {
+                        let divisor = 10f64.powi(decimals as i32);
+                        let ui_amount = amount as f64 / divisor;
+                        balance.ui_token_amount.ui_amount = Some(ui_amount);
+                        balance.ui_token_amount.ui_amount_string = ui_amount.to_string();
+                    }
+                }
+            }
+        };
+
+        fix_balances(&mut metadata.pre_token_balances);
+        fix_balances(&mut metadata.post_token_balances);
+    }
+
+    fn patch_block_token_decimals(&self, block: &mut BlockWithTransactions) {
+        for tx in block.transactions.iter_mut() {
+            self.patch_token_balance_decimals(&mut tx.metadata);
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -747,7 +804,7 @@ impl Memcmp {
             bytes: MemcmpEncodedBytes::Base58(bs58::encode(bytes).into_string()),
         }
     }
-    pub fn bytes(&self) -> Option<Cow<Vec<u8>>> {
+    pub fn bytes(&self) -> Option<Cow<'_, Vec<u8>>> {
         use MemcmpEncodedBytes::*;
         match &self.bytes {
             Binary(bytes) | Base58(bytes) => bs58::decode(bytes).into_vec().ok().map(Cow::Owned),
@@ -772,25 +829,22 @@ impl Memcmp {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OptionalContext<T> {
-    Context(Response<T>),
+    Context(RpcResponse<T>),
     NoContext(T),
 }
 
-impl<T> OptionalContext<T> {
-    pub fn parse_value(self) -> T {
+impl<T: Serialize> Serialize for OptionalContext<T> {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
         match self {
-            Self::Context(response) => response.value,
-            Self::NoContext(value) => value,
+            Self::Context(response) => response.serialize(serializer),
+            Self::NoContext(value) => value.serialize(serializer),
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Response<T> {
-    pub context: RpcResponseContext,
-    pub value: T,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -800,7 +854,6 @@ pub struct RpcProgramAccountsConfig {
     #[serde(flatten)]
     pub account_config: RpcAccountInfoConfig,
     pub with_context: Option<bool>,
-    // TODO: This functionality is currently not implemented.
     pub sort_results: Option<bool>,
 }
 
@@ -1698,7 +1751,8 @@ impl RpcServer for RpcServerState {
             return Ok(None);
         }
 
-        let block_data = block_data.unwrap();
+        let mut block_data = block_data.unwrap();
+        self.patch_block_token_decimals(&mut block_data);
 
         let ui_confirmed_block = to_ui_block(config, block_data)?;
         Ok(Some(ui_confirmed_block))
@@ -2200,14 +2254,15 @@ impl RpcServer for RpcServerState {
         counter!("rpc", "method" => "getProgramAccounts").increment(1);
         let program_id = verify_pubkey(&program_id_str)?;
 
-        let (config, filters, with_context) = if let Some(config) = config {
+        let (config, filters, with_context, sort_results) = if let Some(config) = config {
             (
                 Some(config.account_config),
                 config.filters.unwrap_or_default(),
                 config.with_context.unwrap_or_default(),
+                config.sort_results.unwrap_or(true),
             )
         } else {
-            (None, vec![], false)
+            (None, vec![], false, true)
         };
 
         let RpcAccountInfoConfig {
@@ -2218,11 +2273,11 @@ impl RpcServer for RpcServerState {
         } = config.unwrap_or_default();
 
         let (request_slot, program_accounts) = self
-            .get_program_accounts(&program_id, filters, encoding, data_slice_config)
+            .get_program_accounts(&program_id, filters, encoding, data_slice_config, sort_results)
             .await?;
 
         Ok(match with_context {
-            true => OptionalContext::Context(Response {
+            true => OptionalContext::Context(RpcResponse {
                 context: RpcResponseContext { slot: request_slot },
                 value: program_accounts,
             }),
@@ -2451,13 +2506,19 @@ impl RpcServer for RpcServerState {
             RpcTokenAccountsFilter::Mint(mint) => {
                 let mint = verify_pubkey(&mint)?;
                 self.indexer
-                    .find_token_accounts_owned_by(&owner_pubkey, None, Some(mint), 10, 0)
+                    .find_token_accounts_owned_by(&owner_pubkey, None, Some(mint), MAX_TOKEN_ACCOUNTS_QUERY_LIMIT, 0)
                     .await
             }
             RpcTokenAccountsFilter::ProgramId(program_id) => {
                 let program_id = verify_pubkey(&program_id)?;
                 self.indexer
-                    .find_token_accounts_owned_by(&owner_pubkey, Some(program_id), None, 10, 0)
+                    .find_token_accounts_owned_by(
+                        &owner_pubkey,
+                        Some(program_id),
+                        None,
+                        MAX_TOKEN_ACCOUNTS_QUERY_LIMIT,
+                        0,
+                    )
                     .await
             }
         };
@@ -2470,10 +2531,15 @@ impl RpcServer for RpcServerState {
         let mut parsed_token_accounts = vec![];
 
         for pubkey in token_accounts {
-            let account = db_reader
-                .get_account(pubkey)
-                .expect("Failed to get account")
-                .unwrap_or_default();
+            let account = match db_reader.get_account(pubkey) {
+                Ok(Some(account)) => account,
+                Ok(None) => continue, // Skip accounts that don't exist
+                Err(e) => {
+                    error!("get_token_accounts_by_owner get_account error: {:?}", e);
+                    continue; // Skip accounts that error
+                }
+            };
+
             let (encoded_sliced_data, encoding) = get_account_data_encoding_and_slice(&config, &account)?;
             parsed_token_accounts.push(RpcKeyedAccount {
                 pubkey: pubkey.to_string(),
@@ -2508,7 +2574,8 @@ impl RpcServer for RpcServerState {
             .await
             .map_err(|_| ErrorCode::InvalidParams)?;
 
-        if let Some(transaction) = transaction {
+        if let Some(mut transaction) = transaction {
+            self.patch_token_balance_decimals(&mut transaction.metadata);
             let encoded_transaction_with_status_meta =
                 to_encoded_confirmed_transaction_with_status_meta(transaction, config)
                     .map_err(|_| ErrorCode::InvalidParams)?;
@@ -2569,7 +2636,8 @@ impl RpcServer for RpcServerState {
 
         for signature in signatures {
             let tx = self.indexer.get_transaction_with_metadata(&signature).await;
-            if let Ok(Some(tx)) = tx {
+            if let Ok(Some(mut tx)) = tx {
+                self.patch_token_balance_decimals(&mut tx.metadata);
                 results.push(RpcConfirmedTransactionStatusWithSignature {
                     signature: signature.to_string(),
                     slot: tx.slot,
@@ -2751,7 +2819,31 @@ impl RpcServer for RpcServerState {
 
     fn get_transaction_count(&self) -> RpcResult<u64> {
         counter!("rpc", "method" => "getTransactionCount").increment(1);
-        Ok(self.total_transaction_count.load(Ordering::Relaxed))
+        // forward if enabled
+        if let Some(forward_to) = &self.forward_to {
+            let client = reqwest::blocking::Client::new();
+            let result = client
+                .post(forward_to)
+                .json(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "getTransactionCount",
+                    "params": [],
+                    "id": 1,
+                }))
+                .send()
+                .map_err(|e| RpcCustomError::ForwardingError(e.to_string()))?;
+
+            let result_json = result
+                .json::<serde_json::Value>()
+                .map_err(|e| RpcCustomError::ForwardingError(e.to_string()))?;
+
+            result_json
+                .get("result")
+                .and_then(|v| v.as_u64())
+                .ok_or_else(|| RpcCustomError::ForwardingError("Failed to parse response".to_string()).into())
+        } else {
+            Ok(self.total_transaction_count.load(Ordering::Relaxed))
+        }
     }
 
     fn get_recent_performance_samples(&self, limit: u64) -> RpcResult<Vec<RpcPerfSample>> {
@@ -2858,24 +2950,6 @@ impl RpcServer for RpcServerState {
         }
         Ok(())
     }
-
-    // async fn program_subscribe(
-    //     &self,
-    //     pending: PendingSubscriptionSink,
-    //     pubkey_str: String,
-    //     config: Option<RpcProgramAccountsConfig>,
-    // ) -> SubscriptionResult {
-    //     todo!("not implemented")
-    // }
-
-    // async fn logs_subscribe(
-    //     &self,
-    //     pending: PendingSubscriptionSink,
-    //     filter: RpcTransactionLogsFilter,
-    //     config: Option<RpcTransactionLogsConfig>,
-    // ) -> SubscriptionResult {
-    //     todo!("logs_subscribe not implemented")
-    // }
 
     async fn signature_subscribe(
         &self,
@@ -2992,7 +3066,8 @@ impl RpcServer for RpcServerState {
                     .register_block_by_pubkey_subscription(pubkey)
                     .await
                     .unwrap();
-                while let Ok(block) = receiver.recv().await {
+                while let Ok(mut block) = receiver.recv().await {
+                    self.patch_block_token_decimals(&mut block);
                     let data = self.wrap_with_rpc_context(convert_block_to_rpc_block(config.clone(), block)?)?;
                     middleware.track_message_data(&pending.connection_id(), get_size(&data))?;
                     let notif = SubscriptionMessage::from_json(&data)?;
@@ -3005,7 +3080,8 @@ impl RpcServer for RpcServerState {
             }
             RpcBlockSubscribeFilter::All => {
                 let mut receiver = self.subscription_processor.register_all_blocks_subscription().unwrap();
-                while let Ok(block) = receiver.recv().await {
+                while let Ok(mut block) = receiver.recv().await {
+                    self.patch_block_token_decimals(&mut block);
                     let data = self.wrap_with_rpc_context(convert_block_to_rpc_block(config.clone(), block)?)?;
                     middleware.track_message_data(&pending.connection_id(), get_size(&data))?;
                     let notif = SubscriptionMessage::from_json(&data)?;

@@ -2,95 +2,99 @@ pub mod grpc;
 pub mod http;
 pub mod http_client;
 pub mod slots;
-pub mod state;
-pub mod types;
 
-use std::{net::SocketAddr, path::Path, sync::Arc};
+use std::{net::SocketAddr, path::Path, sync::Arc, time::SystemTime};
 
 // Re-export commonly used types and functions
 pub use grpc::client::SyncClient;
 pub use http::start_http_server;
 use infinisvm_logger::{error, info};
-use infinisvm_types::sync::{grpc::infini_svm_service_server::InfiniSvmServiceServer, RawSlot};
+use metrics::{counter, gauge};
 use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair};
-pub use state::SyncState;
-use tokio::sync::RwLock;
 use tonic::transport::{Identity, Server, ServerTlsConfig};
 
-use crate::grpc::{server::InfiniSVMServiceImpl, TransactionBatchBroadcaster};
+use crate::grpc::{server::InfiniSVMServiceImpl, service::InfiniSvmServiceServer, TransactionBatchBroadcaster};
 
 pub async fn start_server(
     grpc_addr: SocketAddr,
     http_addr: SocketAddr,
     db_path: String,
     slots_path: String,
-    latest_slot: RawSlot,
     broadcaster: Arc<TransactionBatchBroadcaster>,
     // If provided, enables TLS for gRPC using a self-signed Ed25519 certificate generated
     // from the given private key material. The value can be either a file path to a PEM-encoded
     // Ed25519 PKCS#8 private key, or the PEM contents themselves.
     grpc_tls_ed25519_key: Option<String>,
-) -> eyre::Result<Arc<RwLock<SyncState>>> {
-    let (sync_state, latest_slot_receiver) = SyncState::new(latest_slot);
-    let sync_state = Arc::new(RwLock::new(sync_state));
-
-    let service = InfiniSVMServiceImpl::new(sync_state.clone(), latest_slot_receiver, broadcaster).await;
+) -> eyre::Result<()> {
+    let service = InfiniSVMServiceImpl::new(broadcaster).await;
 
     info!("InfiniSVM gRPC Server listening on {}", grpc_addr);
+    let grpc_port_label = grpc_addr.port().to_string();
+    let start_ts = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64();
+    gauge!("grpc_server_last_start_ts", "port" => grpc_port_label.clone()).set(start_ts);
+    gauge!("grpc_server_up", "port" => grpc_port_label.clone()).set(1.0);
 
     // Enable gRPC server with bincode message types
     // Note: This uses tonic's default protobuf transport but with bincode message
     // structs For full bincode transport, additional codec implementation would
     // be needed
     let grpc_service = InfiniSvmServiceServer::new(service);
-    tokio::spawn(async move {
-        // Tune gRPC server for lower latency and better h2 performance
-        let mut server = Server::builder().tcp_nodelay(true);
+    tokio::spawn({
+        let grpc_port_label = grpc_port_label.clone();
+        async move {
+            // Tune gRPC server for lower latency and better h2 performance
+            let mut server = Server::builder().tcp_nodelay(true);
 
-        // If TLS is enabled, generate a self-signed Ed25519 certificate from the
-        // provided key and configure tonic's server with it.
-        if let Some(key_or_path) = grpc_tls_ed25519_key {
-            // Install ring provider for rustls 0.23 if not already installed
-            let _ = rustls::crypto::ring::default_provider().install_default();
+            // If TLS is enabled, generate a self-signed Ed25519 certificate from the
+            // provided key and configure tonic's server with it.
+            if let Some(key_or_path) = grpc_tls_ed25519_key {
+                // Install ring provider for rustls 0.23 if not already installed
+                let _ = rustls::crypto::ring::default_provider().install_default();
 
-            match load_identity_from_key_or_bundle(&key_or_path, grpc_addr) {
-                Ok(identity) => {
-                    server = server
-                        .tls_config(ServerTlsConfig::new().identity(identity))
-                        .expect("failed to apply TLS config");
-                    info!("gRPC TLS enabled with Ed25519 self-signed certificate");
-                }
-                Err(e) => {
-                    error!("Failed to initialize gRPC TLS: {}", e);
+                match load_identity_from_key_or_bundle(&key_or_path, grpc_addr) {
+                    Ok(identity) => {
+                        server = server
+                            .tls_config(ServerTlsConfig::new().identity(identity))
+                            .expect("failed to apply TLS config");
+                        info!("gRPC TLS enabled with Ed25519 self-signed certificate");
+                    }
+                    Err(e) => {
+                        error!("Failed to initialize gRPC TLS: {}", e);
+                    }
                 }
             }
-        }
 
-        // These methods may not exist on all tonic versions; keep them grouped
-        // to simplify potential future adjustments.
-        #[allow(unused_mut)]
-        let mut server = server;
-        #[cfg(any())]
-        {
-            server = server
-                .http2_keepalive_interval(std::time::Duration::from_secs(10))
-                .http2_keepalive_timeout(std::time::Duration::from_secs(30))
-                .http2_adaptive_window(true);
-        }
+            // These methods may not exist on all tonic versions; keep them grouped
+            // to simplify potential future adjustments.
+            #[allow(unused_mut)]
+            let mut server = server;
+            #[cfg(any())]
+            {
+                server = server
+                    .http2_keepalive_interval(std::time::Duration::from_secs(10))
+                    .http2_keepalive_timeout(std::time::Duration::from_secs(30))
+                    .http2_adaptive_window(true);
+            }
 
-        if let Err(e) = server.add_service(grpc_service).serve(grpc_addr).await {
-            error!("gRPC server failed: {}", e);
+            if let Err(e) = server.add_service(grpc_service).serve(grpc_addr).await {
+                error!("gRPC server failed: {}", e);
+                counter!("grpc_server_failures_total", "port" => grpc_port_label.clone()).increment(1);
+                gauge!("grpc_server_up", "port" => grpc_port_label.clone()).set(0.0);
+                let error_ts = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs_f64();
+                gauge!("grpc_server_last_error_ts", "port" => grpc_port_label.clone()).set(error_ts);
+            }
         }
     });
 
-    tokio::spawn(start_http_server(
-        http_addr,
-        db_path.clone(),
-        slots_path.clone(),
-        sync_state.clone(),
-    ));
+    tokio::spawn(start_http_server(http_addr, db_path.clone(), slots_path.clone()));
 
-    Ok(sync_state)
+    Ok(())
 }
 
 /// Load an Identity from an Ed25519 key (PEM or path) by generating a

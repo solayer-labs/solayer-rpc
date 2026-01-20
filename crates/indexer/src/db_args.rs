@@ -10,12 +10,12 @@ pub struct DbArgs {
     #[clap(long, default_value = "/mnt/data/slots")]
     pub s3_path: PathBuf,
 
-    #[clap(long)]
+    #[clap(long, env = "S3_ACCESS_KEY_ID")]
     pub s3_access_key_id: Option<String>,
 
-    #[clap(long)]
+    #[clap(long, env = "S3_SECRET_KEY")]
     pub s3_secret_key: Option<String>,
 
-    #[clap(long, default_value = "us-east-1")]
+    #[clap(long, default_value = "us-west-2", env = "S3_REGION")]
     pub s3_region: String,
 }

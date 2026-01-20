@@ -84,10 +84,6 @@ pub fn configure_s3_upload(config: Option<S3UploadConfig>) {
     *guard = config.map(Arc::new);
 }
 
-pub(crate) fn current_s3_upload_config() -> Option<Arc<S3UploadConfig>> {
-    s3_config_lock().read().unwrap().clone()
-}
-
 pub fn spawn(exit: Arc<AtomicBool>) {
     std::thread::Builder::new()
         .name("dbMerger".to_string())

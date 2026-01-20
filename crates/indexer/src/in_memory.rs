@@ -4,16 +4,14 @@ use async_trait::async_trait;
 use infinisvm_core::indexer::Indexer;
 use infinisvm_jsonrpc::rpc_state::RpcIndexer;
 use infinisvm_types::{
-    convert::{to_signature_rows, to_tx_row},
-    jobs::ConsumedJob,
+    convert::{to_signature_rows, to_tx_row, JobEffectAccountDiffOps, TxOrdering},
     serializable::{SignatureRow, TxRow},
+    sync::{JobEffects, ShredId},
     BlockWithTransactions, SignatureFilters, TransactionWithMetadata,
 };
 use solana_hash::Hash;
 use solana_sdk::{clock::Slot, pubkey::Pubkey, signature::Signature};
 use spl_token;
-
-use crate::to_transaction_with_metadata;
 
 #[derive(Default)]
 struct BlockMetadata {
@@ -25,12 +23,9 @@ struct BlockMetadata {
 }
 
 pub struct IndexState {
-    // Keep existing block storage
-    block: VecDeque<(BlockMetadata, Vec<ConsumedJob>)>,
-
-    // HashMap-based indices for fast lookups
+    block: VecDeque<(BlockMetadata, Vec<JobEffects>)>,
     tx_by_signature: HashMap<Signature, TxRow>,
-    signatures_by_account: HashMap<Pubkey, Vec<SignatureRow>>, // account -> sorted by seq_number
+    signatures_by_account: HashMap<Pubkey, Vec<SignatureRow>>, // account -> sorted by ordering
     account_ops: HashMap<Pubkey, HashSet<Pubkey>>,             // owner -> accounts
     account_ops_mint: HashMap<(Pubkey, u8, Pubkey), HashSet<Pubkey>>, // (owner, account_type, mint) -> accounts
 }
@@ -110,23 +105,28 @@ impl Indexer for InMemoryIndexer {
         }
     }
 
-    fn index_transactions(&mut self, batch: Vec<ConsumedJob>, _block_unix_timestamp: u64) {
+    fn index_transactions(&mut self, batch: Vec<JobEffects>, block_unix_timestamp: u64, shred_id: ShredId) {
         if batch.is_empty() {
             return;
         }
 
-        let slot = batch[0].slot;
+        let slot = shred_id.slot;
 
         // Process each transaction and index it
-        for job in &batch {
+        for (kth, job) in batch.iter().enumerate() {
             // Skip failed transactions
-            if job.processed_transaction.is_err() {
+            if job.execution_result.is_err() {
                 continue;
             }
 
             // Extract signature rows and transaction row
-            let signature_rows = to_signature_rows(job);
-            let (tx_row, account_delta) = to_tx_row(job);
+            let ordering = TxOrdering::from_shred_id(&shred_id, kth as u64);
+            let sanitized_tx = match job.sanitized_tx() {
+                Ok(sanitized_tx) => sanitized_tx,
+                Err(_) => continue,
+            };
+            let signature_rows = to_signature_rows(&sanitized_tx, slot, block_unix_timestamp, ordering.clone());
+            let (tx_row, account_delta) = to_tx_row(job.clone(), &sanitized_tx, slot, block_unix_timestamp, ordering);
 
             // Store transaction by signature
             let signature = Signature::try_from(tx_row.signature.as_ref()).expect("Invalid signature bytes");
@@ -143,46 +143,40 @@ impl Indexer for InMemoryIndexer {
             }
 
             // Process account operations if available
-            if let Some((account_ops_create, account_ops_delete, account_ops_mint_create, account_ops_mint_delete)) =
-                account_delta
-            {
-                // Handle account_ops create
-                for (owner, account) in account_ops_create {
-                    self.state
-                        .account_ops
-                        .entry(owner)
-                        .or_default()
-                        .insert(account);
-                }
+            // Handle account_ops create
+            let JobEffectAccountDiffOps {
+                account_ops_create,
+                account_ops_delete,
+                account_ops_mint_create,
+                account_ops_mint_delete,
+            } = account_delta;
+            for (owner, account) in account_ops_create {
+                self.state.account_ops.entry(owner).or_default().insert(account);
+            }
 
-                // Handle account_ops delete
-                for (owner, account) in account_ops_delete {
-                    if let Some(accounts) = self.state.account_ops.get_mut(&owner) {
+            // Handle account_ops delete
+            for (owner, account) in account_ops_delete {
+                if let Some(accounts) = self.state.account_ops.get_mut(&owner) {
+                    accounts.remove(&account);
+                }
+            }
+
+            // Handle account_ops_mint create
+            for (owner, account, account_type, mint) in account_ops_mint_create {
+                let key = (owner, account_type, mint);
+                self.state.account_ops_mint.entry(key).or_default().insert(account);
+            }
+
+            // Handle account_ops_mint delete
+            for (owner, account) in account_ops_mint_delete {
+                // Need to find and remove from all matching entries
+                // Since we don't have account_type and mint in delete, we need to iterate
+                self.state.account_ops_mint.retain(|(o, _, _), accounts| {
+                    if *o == owner {
                         accounts.remove(&account);
                     }
-                }
-
-                // Handle account_ops_mint create
-                for (owner, account, account_type, mint) in account_ops_mint_create {
-                    let key = (owner, account_type, mint);
-                    self.state
-                        .account_ops_mint
-                        .entry(key)
-                        .or_default()
-                        .insert(account);
-                }
-
-                // Handle account_ops_mint delete
-                for (owner, account) in account_ops_mint_delete {
-                    // Need to find and remove from all matching entries
-                    // Since we don't have account_type and mint in delete, we need to iterate
-                    self.state.account_ops_mint.retain(|(o, _, _), accounts| {
-                        if *o == owner {
-                            accounts.remove(&account);
-                        }
-                        !accounts.is_empty()
-                    });
-                }
+                    !accounts.is_empty()
+                });
             }
         }
 
@@ -214,6 +208,11 @@ impl RpcIndexer for InMemoryIndexer {
             .get(owner)
             .map(|accounts| accounts.iter().skip(offset).take(limit).copied().collect())
             .unwrap_or_default()
+    }
+
+    async fn find_accounts_by_program(&self, _program_id: &Pubkey, _limit: usize, _offset: usize) -> Vec<Pubkey> {
+        // Program account indexing not implemented for in-memory indexer
+        vec![]
     }
 
     async fn find_token_accounts_owned_by(
@@ -294,6 +293,9 @@ impl RpcIndexer for InMemoryIndexer {
         offset: u64,
         limit: u64,
     ) -> eyre::Result<Option<BlockWithTransactions>> {
+        todo!("@zach: rewrite");
+
+        /*
         let block = self.state.block.iter().find(|(metadata, _)| metadata.slot == slot);
         if let Some((metadata, inner)) = block {
             let transactions = inner
@@ -309,7 +311,7 @@ impl RpcIndexer for InMemoryIndexer {
                     ),
                     slot: job.slot,
                     unix_timestamp_in_millis: 0,
-                    seq_number: job.job_id as u64,
+                    // ordering stored in SignatureRow.ordering
                 })
                 .collect();
 
@@ -333,6 +335,7 @@ impl RpcIndexer for InMemoryIndexer {
         } else {
             Ok(None)
         }
+        */
     }
 
     async fn find_signatures_of_account(
@@ -349,8 +352,9 @@ impl RpcIndexer for InMemoryIndexer {
             .unwrap_or(&[]);
 
         // Create a sorted vector of references
-        let mut sorted_indices: Vec<usize> = (0..signatures.len()).collect();
-        sorted_indices.sort_by_key(|&i| signatures[i].seq_number);
+        let sorted_indices: Vec<usize> = (0..signatures.len()).collect();
+
+        todo!("@zach: sort by ordering");
 
         // Apply filters
         let filtered: Vec<Signature> = sorted_indices
@@ -407,15 +411,13 @@ impl RpcIndexer for InMemoryIndexer {
         &self,
         signature: &Signature,
     ) -> eyre::Result<Option<TransactionWithMetadata>> {
+        todo!("rewrite");
+
+        /*
         // First try to find in blocks (for backward compatibility and full metadata)
         for (_, block) in self.state.block.iter() {
             for job in block.iter() {
-                let ConsumedJob {
-                    sanitized_transaction,
-                    slot,
-                    processed_transaction,
-                    ..
-                } = job;
+                let (sanitized_transaction, slot, processed_transaction) = !("use a smaller struct");
                 if let Ok(processed_transaction) = processed_transaction {
                     if sanitized_transaction.signature() == signature {
                         return Ok(Some(TransactionWithMetadata {
@@ -423,12 +425,13 @@ impl RpcIndexer for InMemoryIndexer {
                             metadata: to_transaction_with_metadata(processed_transaction, sanitized_transaction),
                             slot: *slot,
                             unix_timestamp_in_millis: 0,
-                            seq_number: job.job_id as u64,
+                            // ordering already attached
                         }));
                     }
                 }
             }
         }
         Ok(None)
+        */
     }
 }

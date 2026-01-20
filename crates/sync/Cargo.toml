@@ -1,6 +1,6 @@
 [package]
 name = "infinisvm-sync"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 
 [dependencies]
@@ -10,6 +10,7 @@ crossbeam-channel = { workspace = true }
 infinisvm-types = { workspace = true }
 infinisvm-logger = { workspace = true }
 infinisvm-db = { workspace = true }
+dashmap = { workspace = true }
 
 tokio = { workspace = true, features = ["full"] }
 tokio-stream = { workspace = true }
@@ -41,6 +42,21 @@ hex = { workspace = true }
 rcgen = "0.13.0"
 tempfile = "3.10"
 walkdir = "2.5.0"
+solana-hash = { workspace = true }
+solana-transaction-context = { workspace = true }
+bytes = { workspace = true }
+futures-core = { workspace = true }
+http-body = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { version = "0.1.10", features = [
+    "client",
+    "http1",
+    "http2",
+    "tokio",
+] }
+hyper-rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
 
 [dev-dependencies]
 # Testing dependencies for retry functionality

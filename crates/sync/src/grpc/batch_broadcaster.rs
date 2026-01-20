@@ -1,17 +1,13 @@
 use std::{
     sync::{atomic::AtomicUsize, Arc},
     thread,
-    time::Instant,
 };
 
 use crossbeam_channel::{unbounded, Receiver, Sender};
-use infinisvm_logger::{debug, info};
-use infinisvm_types::{jobs::ConsumedJob, sync::CommitBatchNotification};
+use infinisvm_logger::info;
+use infinisvm_types::sync::{CommitBatchNotification, SyncBatchShred, SyncFinalization};
 use tokio::sync::broadcast;
 
-use crate::types::SerializableBatch;
-
-const COMPRESSION_LEVEL: i32 = 3; // Balance between speed and compression ratio
 const BROADCASTER_THREADS: usize = 4; // Number of threads for broadcasting
 
 pub struct TransactionBatchBroadcaster {
@@ -27,10 +23,7 @@ pub struct TransactionBatchBroadcaster {
 
 impl TransactionBatchBroadcaster {
     pub fn new() -> Self {
-        // Channel from committer to broadcaster threads (after serialization)
         let (notification_sender, notification_receiver) = unbounded::<Arc<CommitBatchNotification>>();
-
-        // Final broadcast channel to subscribers
         let (notification_broadcast, _) = broadcast::channel::<Arc<CommitBatchNotification>>(512);
 
         let broadcast_counter = Arc::new(AtomicUsize::new(0));
@@ -66,110 +59,16 @@ impl TransactionBatchBroadcaster {
 
     // This method does serialization inline but sends to broadcast threads
     // non-blocking
-    pub fn broadcast_batch(&self, batch: Vec<ConsumedJob>) -> Result<(), String> {
-        // Serialize and compress in the calling thread (committer thread)
-        let start_time = Instant::now();
-
-        let original_len = batch.len();
-        if original_len == 0 {
-            // Shouldn't happen in normal operation (committer guards this),
-            // but avoid propagating a misleading 0/0 notification.
-            return Err("broadcast_batch called with empty batch".to_string());
-        }
-
-        let meta = batch.first().map(|j| (j.slot, j.job_id, j.timestamp));
-
-        // Only successful txs are included in the broadcast payload today.
-        // Log what we are dropping to aid debugging follower slot-plan mismatches.
-        let filtered: Vec<ConsumedJob> = batch
-            .into_iter()
-            .filter(|job| job.processed_transaction.is_ok())
-            .collect();
-        let success_len = filtered.len();
-        if let Some((slot, job_id, timestamp)) = meta {
-            if success_len == 0 && original_len > 0 {
-                // All transactions failed. Preserve the real (slot, job_id) metadata
-                // and broadcast an empty payload so receivers can mark presence
-                // and refetch against the correct cache key.
-                infinisvm_logger::warn!(
-                    "Broadcaster: all txs failed for slot={} job_id={} (orig_len={}); sending empty payload with preserved metadata",
-                    slot,
-                    job_id,
-                    original_len
-                );
-                metrics::counter!("broadcast_batches_all_failed_total").increment(1);
-
-                let notification =
-                    infinisvm_types::sync::CommitBatchNotification::Batch(infinisvm_types::sync::BatchData {
-                        slot,
-                        timestamp,
-                        batch_size: 0,
-                        compressed_transactions: Vec::new(),
-                        compression_ratio: 0,
-                        job_id: job_id as u64,
-                        worker_id: 0,
-                    });
-
-                let processing_time = start_time.elapsed();
-                if let CommitBatchNotification::Batch(ref batch_data) = notification {
-                    infinisvm_logger::debug!(
-                        "Serialized batch in {:?}, compression ratio: {}%",
-                        processing_time,
-                        batch_data.compression_ratio
-                    );
-                }
-
-                let notification = Arc::new(notification);
-                return self
-                    .notification_sender
-                    .send(notification)
-                    .map_err(|e| format!("Failed to send notification to broadcaster: {e}"));
-            } else if original_len > success_len {
-                infinisvm_logger::debug!(
-                    "Broadcaster: dropping {} failed txs for slot={} job_id={} (successes={})",
-                    original_len - success_len,
-                    slot,
-                    job_id,
-                    success_len
-                );
-                metrics::counter!("broadcast_txs_dropped_errors_total").increment((original_len - success_len) as u64);
-            }
-        }
-
-        let notification = Self::serialize_and_compress_batch(filtered)?;
-
-        let processing_time = start_time.elapsed();
-        if let CommitBatchNotification::Batch(ref batch_data) = notification {
-            debug!(
-                "Serialized batch in {:?}, compression ratio: {}%",
-                processing_time, batch_data.compression_ratio
-            );
-        }
-
+    pub fn broadcast_batch(&self, batch: SyncBatchShred) -> Result<(), String> {
         // Send to broadcaster threads (non-blocking)
-        let notification = Arc::new(notification);
+        let notification = Arc::new(CommitBatchNotification::Batch(batch));
         self.notification_sender
             .send(notification)
             .map_err(|e| format!("Failed to send notification to broadcaster: {e}"))
     }
 
-    pub fn broadcast_finalization(
-        &self,
-        slot: u64,
-        job_ids: Vec<u64>,
-        hash: solana_sdk::hash::Hash,
-        parent_hash: solana_sdk::hash::Hash,
-    ) -> Result<(), String> {
-        let notification = Arc::new(CommitBatchNotification::Finalization(
-            infinisvm_types::sync::FinalizationData {
-                slot,
-                timestamp: 0,
-                job_ids,
-                hash,
-                parent_hash,
-            },
-        ));
-
+    pub fn broadcast_finalization(&self, finalization: SyncFinalization) -> Result<(), String> {
+        let notification = Arc::new(CommitBatchNotification::Finalization(finalization));
         self.notification_sender
             .send(notification)
             .map_err(|e| format!("Failed to send finalization to broadcaster: {e}"))
@@ -195,90 +94,16 @@ impl TransactionBatchBroadcaster {
 
         // All threads compete to process notifications - simple work stealing
         while let Ok(notification) = notification_receiver.recv() {
-            let start_time = Instant::now();
-
             // Broadcast to all subscribers
-            match notification_broadcast.send(notification.clone()) {
-                Ok(subscriber_count) => {
-                    let broadcast_time = start_time.elapsed();
-                    match notification.as_ref() {
-                        CommitBatchNotification::Batch(batch_data) => {
-                            debug!(
-                                "Broadcaster {} sent batch (slot: {}, {} transactions) to {} subscribers in {:?}",
-                                broadcaster_id,
-                                batch_data.slot,
-                                batch_data.batch_size,
-                                subscriber_count,
-                                broadcast_time
-                            );
-                        }
-                        CommitBatchNotification::Finalization(finalization_data) => {
-                            debug!(
-                                "Broadcaster {} sent finalization (slot: {}) to {} subscribers in {:?}",
-                                broadcaster_id, finalization_data.slot, subscriber_count, broadcast_time
-                            );
-                        }
-                    }
-                }
-                Err(_) => {
-                    debug!("Broadcaster {} - no active subscribers", broadcaster_id);
-                }
-            }
+            if notification_broadcast.send(notification).is_ok() {}
         }
 
         info!("Batch broadcaster worker {} shutting down", broadcaster_id);
-    }
-
-    fn serialize_and_compress_batch(batch: Vec<ConsumedJob>) -> Result<CommitBatchNotification, String> {
-        // Serialize the batch
-        if batch.is_empty() {
-            // Should not be used for "all failed" case; caller preserves metadata there.
-            return Err("serialize_and_compress_batch called with empty batch".to_string());
-        }
-        let serialized = bincode::serialize(&SerializableBatch::from_consumed_jobs(&batch))
-            .map_err(|e| format!("Failed to serialize batch: {e}"))?;
-
-        let original_size = serialized.len();
-
-        // Compress with zstd
-        let compressed = zstd::encode_all(&serialized[..], COMPRESSION_LEVEL)
-            .map_err(|e| format!("Failed to compress batch: {e}"))?;
-
-        let compressed_size = compressed.len();
-        let compression_ratio = if compressed_size > 0 {
-            (original_size * 100) / compressed_size
-        } else {
-            100
-        };
-
-        debug!(
-            "Batch serialization: original {}KB, compressed {}KB, ratio {}%",
-            original_size / 1024,
-            compressed_size / 1024,
-            compression_ratio
-        );
-
-        Ok(CommitBatchNotification::Batch(infinisvm_types::sync::BatchData {
-            slot: batch[0].slot,
-            timestamp: batch[0].timestamp,
-            batch_size: batch.len() as u32,
-            compressed_transactions: compressed,
-            compression_ratio: compression_ratio as u64,
-            job_id: batch[0].job_id as u64,
-            worker_id: batch[0].worker_id,
-        }))
     }
 }
 
 impl Default for TransactionBatchBroadcaster {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-impl Drop for TransactionBatchBroadcaster {
-    fn drop(&mut self) {
-        info!("TransactionBatchBroadcaster shutting down...");
-        // The sender being dropped will cause all threads to exit their loops
     }
 }

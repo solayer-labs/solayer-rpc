@@ -1,6 +1,6 @@
 [package]
 name = "rpc-v2"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 
 [dependencies]
@@ -11,6 +11,7 @@ infinisvm-core = { workspace = true }
 infinisvm-jsonrpc = { workspace = true }
 infinisvm-types = { workspace = true }
 infinisvm-indexer = { workspace = true }
+infinisvm-retirement = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
@@ -37,6 +38,7 @@ solana-pubkey = { workspace = true }
 hex = { workspace = true }
 base64 = { workspace = true }
 bs58 = { workspace = true }
+libmdbx = "0.6"
 pyroscope = { workspace = true, optional = true }
 pyroscope_pprofrs = { workspace = true, optional = true }
 
@@ -51,6 +53,7 @@ url = "2.5.7"
 
 
 [features]
+no_index = []
 pyroscope = ["dep:pyroscope", "dep:pyroscope_pprofrs"]
 
 track_oom = [

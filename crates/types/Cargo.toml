@@ -1,6 +1,6 @@
 [package]
 name = "infinisvm-types"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 
 [dependencies]
@@ -18,19 +18,20 @@ bincode = { workspace = true }
 hashbrown = { workspace = true }
 solana-account-decoder-client-types = { workspace = true }
 async-trait = { workspace = true }
-tokio-postgres = { workspace = true }
 futures-util = { version = "0.3.14", features = ["sink"] }
-futures-core = "0.3"
+futures-core = { workspace = true }
 http = "1.0"
 bytes = "1.0"
-hyper = { version = "0.14", features = ["full"] }
+hyper = { workspace = true }
 # Enable HTTPS for bincode client
-hyper-rustls = { version = "0.24", features = ["http2", "webpki-roots"] }
-rustls-pemfile = "1.0"
-rustls = "0.21"
-tower = "0.4"
-http-body-util = "0.1"
-http-body = "1.0"
+hyper-rustls = { workspace = true }
+
+
+rustls-pemfile = { workspace = true }
+rustls = { workspace = true }
+tower = { workspace = true }
+http-body-util = { workspace = true }
+http-body = { workspace = true }
 bb8 = { version = "0.9.0" }
 cdrs-tokio = "8.1.6"
 cassandra-protocol = "3.3.0"
@@ -45,5 +46,6 @@ solana-svm = { workspace = true }
 spl-token = { workspace = true }
 spl-token-2022 = { workspace = true }
 hex = "0.4"
+num-bigint = { version = "0.4.6", features = ["serde"] }
 
 # Build dependencies removed - using bincode for gRPC instead of protobuf

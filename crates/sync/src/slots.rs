@@ -3,12 +3,12 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use bytes::Bytes;
 use eyre::Result;
 use futures_util::future;
+use infinisvm_logger::info;
 use serde::{Deserialize, Serialize};
-use tokio::task;
 use walkdir::{DirEntry, WalkDir};
-use zstd::decode_all;
 
 pub const MAX_SLOT_RANGE: usize = 100;
 
@@ -26,8 +26,8 @@ struct SlotAccumulator {
 
 #[derive(Serialize, Deserialize)]
 pub struct SlotData {
-    pub info: Vec<u8>,
-    pub shards: Vec<Vec<u8>>,
+    pub info: Bytes,
+    pub shards: Vec<Bytes>,
 }
 
 /// Compute the canonical on-disk directory for a given slot archive.
@@ -41,7 +41,7 @@ fn slot_for_entry(entry: &DirEntry) -> Option<u64> {
     entry
         .path()
         .components()
-        .last()
+        .next_back()
         .and_then(|component| component.as_os_str().to_str())
         .and_then(|s| s.parse::<u64>().ok())
 }
@@ -71,7 +71,7 @@ fn in_range(slot: u64, min_slot: Option<u64>, max_slot: Option<u64>) -> bool {
 
 /// Enumerate all slot archives located under the provided root directory,
 /// applying optional lower/upper slot bounds.
-pub fn enumerate_archives(
+pub fn enumerate_archives_in_order(
     root: &Path,
     min_slot: Option<u64>,
     max_slot: Option<u64>,
@@ -132,18 +132,12 @@ pub fn enumerate_archives(
     Ok(archives)
 }
 
-pub async fn read_slot_file(slots_path: &Path, slot: u64, file_name: &str) -> Result<Option<Vec<u8>>> {
+pub async fn read_slot_file(slots_path: &Path, slot: u64, file_name: &str) -> Result<Option<Bytes>> {
     let dir = slot_directory(slots_path, slot);
     let file_path = dir.join(file_name);
 
     match tokio::fs::read(&file_path).await {
-        Ok(compressed) => {
-            let data = task::spawn_blocking(move || {
-                decode_all(&compressed[..]).map_err(|e| eyre::eyre!("zstd decode failed: {}", e))
-            })
-            .await??;
-            Ok(Some(data))
-        }
+        Ok(compressed) => Ok(Some(compressed.into())),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(err) => Err(eyre::eyre!("Failed to read slot file: {}", err)),
     }
@@ -159,6 +153,7 @@ pub async fn load_slot(root: &Path, slot: u64) -> Result<Option<SlotData>> {
 
     // Check if the slot directory exists
     if !slot_dir.exists() || !slot_dir.is_dir() {
+        info!("slot_dir {slot_dir:?} does not exist", slot_dir = slot_dir);
         return Ok(None);
     }
 
@@ -221,6 +216,12 @@ pub async fn load_slots(root: &Path, min_slot: u64, max_slot: u64) -> Result<Has
         return Err(eyre::eyre!("Slot range is too large: {} - {}", min_slot, max_slot));
     }
 
+    info!(
+        "load_slots from {min_slot} to {max_slot}",
+        min_slot = min_slot,
+        max_slot = max_slot
+    );
+
     // Create futures for loading all slots in parallel
     let load_futures: Vec<_> = (min_slot..=max_slot)
         .map(|slot| {
@@ -279,7 +280,7 @@ mod tests {
     #[test]
     fn enumerate_archives_empty_dir() {
         let tmp = TempDir::new().unwrap();
-        let archives = enumerate_archives(tmp.path(), None, None).unwrap();
+        let archives = enumerate_archives_in_order(tmp.path(), None, None).unwrap();
         assert!(archives.is_empty());
     }
 
@@ -290,7 +291,7 @@ mod tests {
         create_slot(tmp.path(), 20, &[0]);
         create_slot(tmp.path(), 30, &[]);
 
-        let archives = enumerate_archives(tmp.path(), Some(15), Some(25)).unwrap();
+        let archives = enumerate_archives_in_order(tmp.path(), Some(15), Some(25)).unwrap();
         assert_eq!(archives.len(), 1);
         assert_eq!(
             archives[0],
@@ -308,7 +309,7 @@ mod tests {
         std::fs::create_dir_all(&slot_dir).unwrap();
         std::fs::write(slot_dir.join("0"), b"test").unwrap();
 
-        let archives = enumerate_archives(tmp.path(), None, None).unwrap();
+        let archives = enumerate_archives_in_order(tmp.path(), None, None).unwrap();
         assert!(archives.is_empty());
     }
 
@@ -319,7 +320,7 @@ mod tests {
         let slot_dir = slot_directory(tmp.path(), 5);
         std::fs::write(slot_dir.join("not-a-number"), b"junk").unwrap();
 
-        let archives = enumerate_archives(tmp.path(), None, None).unwrap();
+        let archives = enumerate_archives_in_order(tmp.path(), None, None).unwrap();
         assert_eq!(archives.len(), 1);
         assert_eq!(
             archives[0],

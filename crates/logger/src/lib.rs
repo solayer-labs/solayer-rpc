@@ -1,6 +1,6 @@
 pub mod timer;
 pub use metrics;
-pub use tracing::{self, debug, error, info, level_filters::LevelFilter, trace, warn};
+pub use tracing::{self, debug, error, info, info_span, level_filters::LevelFilter, trace, warn};
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer, Registry};
 
 static DEFAULT_FOLDER: &str = "./logs/";

@@ -1,6 +1,6 @@
 [package]
 name = "infinisvm-db"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 
 [dependencies]
@@ -16,9 +16,11 @@ crossbeam-channel = { workspace = true }
 bytes = { workspace = true }
 
 infinisvm-logger = { workspace = true }
+infinisvm-types = { workspace = true }
 
 object_store = { version = "0.12.0", features = ["aws"] }
 tokio = { workspace = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", default-features = false }
+tempfile = "3.10"

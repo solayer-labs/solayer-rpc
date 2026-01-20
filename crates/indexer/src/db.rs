@@ -17,35 +17,32 @@ use cdrs_tokio::{
     load_balancing::RoundRobinLoadBalancingStrategy,
     transport::TransportTcp,
 };
-use futures_util::pin_mut;
 use infinisvm_core::{indexer::Indexer, s3::S3FsClient};
 use infinisvm_jsonrpc::rpc_state::RpcIndexer;
 use infinisvm_logger::{debug, error, info, timer::ScopedTimer};
 use infinisvm_types::{
-    convert::{to_signature_rows, to_tx_row, token_balance_diff_from_diffs},
-    jobs::ConsumedJob,
+    convert::{to_signature_rows, to_tx_row, token_balance_diff_from_diffs, JobEffectDiff, TxOrdering},
     serializable::{
-        AccountDataDiff, AccountMintRow, AccountOwnerRow, RowTy, SerializableTxRow, SignatureRow, SingleAccountRow,
+        AccountDataDiff, AccountMintQueryRow, AccountMintQueryRowWithoutType, AccountMintRow, AccountOwnerRow,
+        ProgramAccountRow, RowTy, SerializableTxRow, SignatureRow, SingleAccountRow, SingleOrderingRow,
         SingleSignatureRow, SlotRow, TransactionExecutionDetailsSerializable, TxRow, TxRowWithTimestamp,
     },
+    sync::{JobEffects, ShredId},
     BlockWithTransactions, TransactionWithMetadata,
-};
-use itertools::Itertools;
-use klickhouse::{
-    bb8::{Pool, PooledConnection},
-    ConnectionManager,
 };
 use solana_account_decoder_client_types::token::UiTokenAmount;
 use solana_hash::Hash;
 use solana_pubkey::Pubkey;
 use solana_sdk::{
-    account::AccountSharedData, clock::Slot, message::v0::LoadedAddresses, signature::Signature,
+    account::{AccountSharedData, ReadableAccount},
+    clock::Slot,
+    message::v0::LoadedAddresses,
+    signature::Signature,
     transaction::VersionedTransaction,
 };
 use solana_transaction_status_client_types::{TransactionStatusMeta, TransactionTokenBalance};
-// Removed SortedVec usage to avoid O(n) per-insert cost under contention
-use tokio_postgres::binary_copy::BinaryCopyInWriter;
 
+// Removed SortedVec usage to avoid O(n) per-insert cost under contention
 use crate::{
     map_inner_instructions,
     metrics::{DatabaseIndexerMetrics, MultiDatabaseIndexerMetrics},
@@ -59,6 +56,7 @@ const SIGNATURE_TABLE_NAME: &str = "indexer_dev.signatures";
 const TX_TABLE_NAME: &str = "indexer_dev.tx";
 const ACCOUNT_MINT_TABLE_NAME: &str = "indexer_dev.account_ops_mint";
 const ACCOUNT_TABLE_NAME: &str = "indexer_dev.account_ops";
+const PROGRAM_ACCOUNT_TABLE_NAME: &str = "indexer_dev.program_accounts";
 
 pub struct DatabaseIndexer<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB> {
     tx_client: TX,
@@ -74,6 +72,8 @@ pub struct DatabaseIndexer<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB,
     pub(crate) account_ops_delete_cache: Vec<(Pubkey, Pubkey)>,
     pub(crate) account_ops_mint_create_cache: Vec<(Pubkey, Pubkey, u8, Pubkey)>,
     pub(crate) account_ops_mint_delete_cache: Vec<(Pubkey, Pubkey)>,
+    pub(crate) program_account_create_cache: Vec<(Pubkey, Pubkey)>,
+    pub(crate) program_account_delete_cache: Vec<(Pubkey, Pubkey)>,
     // Cache signature
     signature_cache: Vec<SignatureRow>,
     // slot_time
@@ -299,7 +299,7 @@ impl IndexerDB for CassandraIndexerDB {
             }
 
             // Apply offset and limit to the collected rows
-            let start = offset as usize;
+            let start = (offset as usize).min(all_rows.len());
             let end = (start + limit as usize).min(all_rows.len());
 
             return Ok(all_rows[start..end]
@@ -320,140 +320,6 @@ impl IndexerDB for CassandraIndexerDB {
 
     fn to_array_string(bytes: &[u8]) -> String {
         format!("0x{}", hex::encode(bytes))
-    }
-
-    fn require_distributed() -> bool {
-        false
-    }
-}
-
-#[derive(Clone)]
-pub struct ClickhouseIndexerDB {
-    client: Pool<ConnectionManager>,
-}
-
-impl ClickhouseIndexerDB {
-    pub fn new(client: Pool<ConnectionManager>) -> Self {
-        Self { client }
-    }
-
-    pub async fn get_client(&self) -> Result<PooledConnection<ConnectionManager>, klickhouse::KlickhouseError> {
-        match self.client.get().await {
-            Ok(client) => Ok(client),
-            Err(e) => Err(klickhouse::KlickhouseError::ProtocolError(e.to_string())),
-        }
-    }
-}
-
-#[async_trait]
-impl IndexerDB for ClickhouseIndexerDB {
-    type Error = klickhouse::KlickhouseError;
-    async fn insert_native_block<T: RowTy>(
-        &self,
-        table_name: &str,
-        columns: &[&str],
-        block: Vec<T>,
-    ) -> Result<(), Self::Error> {
-        let conn = self.get_client().await?;
-        conn.insert_native_block(
-            format!("INSERT INTO {} ({}) FORMAT NATIVE", table_name, columns.join(", ")),
-            block,
-        )
-        .await?;
-        Ok(())
-    }
-    async fn execute(&self, query: &str) -> Result<(), Self::Error> {
-        let conn = self.get_client().await?;
-        conn.execute(query).await?;
-        Ok(())
-    }
-
-    async fn query_collect<T: RowTy>(&self, query: &str) -> Result<Vec<T>, Self::Error> {
-        let conn = self.get_client().await?;
-        let result = conn.query_collect(query).await?;
-        Ok(result)
-    }
-
-    fn to_array_string(bytes: &[u8]) -> String {
-        format!(
-            "[{}]",
-            bytes.iter().map(|x| format!("{x}")).collect::<Vec<String>>().join(",")
-        )
-    }
-
-    fn require_distributed() -> bool {
-        true
-    }
-}
-
-#[derive(Clone)]
-pub struct PostgresIndexerDB {
-    client: Arc<bb8::Pool<bb8_postgres::PostgresConnectionManager<tokio_postgres::NoTls>>>,
-}
-
-impl PostgresIndexerDB {
-    pub async fn new(pg_url: &str) -> Self {
-        println!("Connecting to {pg_url}");
-        let manager =
-            bb8_postgres::PostgresConnectionManager::new_from_stringlike(pg_url, tokio_postgres::NoTls).unwrap();
-        let pool = bb8::Pool::builder().max_size(15).build(manager).await.unwrap();
-
-        Self { client: Arc::new(pool) }
-    }
-
-    async fn get_client(
-        &self,
-    ) -> bb8::PooledConnection<bb8_postgres::PostgresConnectionManager<tokio_postgres::NoTls>> {
-        self.client.get().await.unwrap()
-    }
-}
-
-#[async_trait]
-impl IndexerDB for PostgresIndexerDB {
-    type Error = tokio_postgres::Error;
-
-    async fn insert_native_block<T: RowTy>(
-        &self,
-        table_name: &str,
-        columns: &[&str],
-        block: Vec<T>,
-    ) -> Result<(), Self::Error> {
-        if block.is_empty() {
-            return Ok(());
-        }
-        let conn = self.get_client().await;
-        let sink = conn
-            .copy_in(&format!(
-                "COPY {} ({}) FROM STDIN BINARY",
-                table_name,
-                columns.join(",")
-            ))
-            .await?;
-        let writer = BinaryCopyInWriter::new(sink, &block[0].postgres_types());
-        pin_mut!(writer);
-        for row in block {
-            row.write_to_postgres(writer.as_mut()).await?;
-        }
-        writer.finish().await?;
-        Ok(())
-    }
-
-    async fn execute(&self, query: &str) -> Result<(), Self::Error> {
-        let conn = self.get_client().await;
-        conn.execute(query, &[]).await?;
-        Ok(())
-    }
-
-    async fn query_collect<T: RowTy>(&self, query: &str) -> Result<Vec<T>, Self::Error> {
-        let conn: bb8::PooledConnection<'_, bb8_postgres::PostgresConnectionManager<tokio_postgres::NoTls>> =
-            self.get_client().await;
-        let result = conn.query(query, &[]).await?;
-        Ok(result.into_iter().map(|row| T::from_postgres(row)).collect())
-    }
-
-    fn to_array_string(bytes: &[u8]) -> String {
-        let x = format!("'\\x{}'::bytea", hex::encode(bytes));
-        x
     }
 
     fn require_distributed() -> bool {
@@ -500,6 +366,8 @@ impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB>
             account_ops_delete_cache: Vec::with_capacity(cache_size),
             account_ops_mint_create_cache: Vec::with_capacity(cache_size),
             account_ops_mint_delete_cache: Vec::with_capacity(cache_size),
+            program_account_create_cache: Vec::with_capacity(cache_size),
+            program_account_delete_cache: Vec::with_capacity(cache_size),
             slot_time: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
@@ -529,6 +397,8 @@ impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB>
             account_ops_delete_cache: Vec::with_capacity(DEFAULT_CACHE_SIZE),
             account_ops_mint_create_cache: Vec::with_capacity(DEFAULT_CACHE_SIZE),
             account_ops_mint_delete_cache: Vec::with_capacity(DEFAULT_CACHE_SIZE),
+            program_account_create_cache: Vec::with_capacity(DEFAULT_CACHE_SIZE),
+            program_account_delete_cache: Vec::with_capacity(DEFAULT_CACHE_SIZE),
             slot_time: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
@@ -554,7 +424,7 @@ impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB>
         let block = std::mem::take(&mut self.tx_cache);
         let block_len = block.len();
         let slot = block[0].slot;
-        debug!("Flushing {} transactions to ClickHouse for slot {}", block_len, slot);
+        debug!("Flushing {} transactions to DB for slot {}", block_len, slot);
 
         // Execute the query
         let result = match self
@@ -568,7 +438,7 @@ impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB>
                     "slot",
                     "pre_accounts",
                     "block_unix_timestamp",
-                    "seq_number",
+                    "ordering",
                 ],
                 block,
             )
@@ -615,7 +485,7 @@ impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB>
             .signature_client
             .insert_native_block(
                 SIGNATURE_TABLE_NAME,
-                &["account", "signature", "slot", "block_unix_timestamp", "seq_number"],
+                &["account", "signature", "slot", "block_unix_timestamp", "ordering"],
                 block,
             )
             .await
@@ -654,7 +524,9 @@ impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB>
         if self.account_ops_create_cache.is_empty() &&
             self.account_ops_delete_cache.is_empty() &&
             self.account_ops_mint_create_cache.is_empty() &&
-            self.account_ops_mint_delete_cache.is_empty()
+            self.account_ops_mint_delete_cache.is_empty() &&
+            self.program_account_create_cache.is_empty() &&
+            self.program_account_delete_cache.is_empty()
         {
             debug!("account_ops_cache is empty, nothing to flush");
             return Ok(());
@@ -662,7 +534,7 @@ impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB>
 
         self.metrics.report_account_ops_cache_flush();
 
-        let block = std::mem::take(&mut self.account_ops_create_cache)
+        let block: Vec<AccountOwnerRow> = std::mem::take(&mut self.account_ops_create_cache)
             .into_iter()
             .map(|(account, owner)| AccountOwnerRow {
                 account: account.to_bytes(),
@@ -670,24 +542,19 @@ impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB>
             })
             .collect();
 
-        let result = match self
-            .account_client
-            .insert_native_block(ACCOUNT_TABLE_NAME, &["account", "owner"], block)
-            .await
-        {
-            Ok(_) => Ok(()),
-            Err(e) => {
+        if !block.is_empty() {
+            if let Err(e) = self
+                .account_client
+                .insert_native_block(ACCOUNT_TABLE_NAME, &["account", "owner"], block)
+                .await
+            {
                 self.metrics.report_db_error("flush_account_ops_create_cache");
-                Err(Box::new(e))
+                error!("Failed to flush account_ops_create_cache: {}", e);
+                return Err(Box::new(e));
             }
-        };
-
-        if let Err(e) = result {
-            error!("Failed to flush account_ops_create_cache: {}", e);
-            return Err(Box::new(e));
         }
 
-        let block = std::mem::take(&mut self.account_ops_mint_create_cache)
+        let block: Vec<AccountMintRow> = std::mem::take(&mut self.account_ops_mint_create_cache)
             .into_iter()
             .map(|(account, owner, account_type, mint)| AccountMintRow {
                 account: account.to_bytes(),
@@ -697,25 +564,40 @@ impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB>
             })
             .collect();
 
-        let result = match self
-            .account_client
-            .insert_native_block(
-                ACCOUNT_MINT_TABLE_NAME,
-                &["account", "owner", "mint", "account_type"],
-                block,
-            )
-            .await
-        {
-            Ok(_) => Ok(()),
-            Err(e) => {
+        if !block.is_empty() {
+            if let Err(e) = self
+                .account_client
+                .insert_native_block(
+                    ACCOUNT_MINT_TABLE_NAME,
+                    &["account", "owner", "mint", "account_type"],
+                    block,
+                )
+                .await
+            {
                 self.metrics.report_db_error("flush_account_ops_mint_create_cache");
-                Err(Box::new(e))
+                error!("Failed to flush account_ops_mint_create_cache: {}", e);
+                return Err(Box::new(e));
             }
-        };
+        }
 
-        if let Err(e) = result {
-            error!("Failed to flush account_ops_mint_create_cache: {}", e);
-            return Err(Box::new(e));
+        let block: Vec<ProgramAccountRow> = std::mem::take(&mut self.program_account_create_cache)
+            .into_iter()
+            .map(|(program_id, account)| ProgramAccountRow {
+                program_id: program_id.to_bytes(),
+                account: account.to_bytes(),
+            })
+            .collect();
+
+        if !block.is_empty() {
+            if let Err(e) = self
+                .account_client
+                .insert_native_block(PROGRAM_ACCOUNT_TABLE_NAME, &["program_id", "account"], block)
+                .await
+            {
+                self.metrics.report_db_error("flush_program_account_create_cache");
+                error!("Failed to flush program_account_create_cache: {}", e);
+                return Err(Box::new(e));
+            }
         }
 
         macro_rules! process_delete_cache {
@@ -777,6 +659,29 @@ impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB>
             );
         }
 
+        if !self.program_account_delete_cache.is_empty() {
+            let table_name = if ACCOUNT::require_distributed() {
+                format!("{PROGRAM_ACCOUNT_TABLE_NAME}_dist")
+            } else {
+                PROGRAM_ACCOUNT_TABLE_NAME.to_string()
+            };
+
+            for (program_id, account) in std::mem::take(&mut self.program_account_delete_cache) {
+                let query = format!(
+                    "DELETE FROM {} WHERE program_id = {} AND account = {}",
+                    table_name,
+                    ACCOUNT::to_array_string(&program_id.to_bytes()),
+                    ACCOUNT::to_array_string(&account.to_bytes())
+                );
+
+                if let Err(e) = self.account_client.execute(&query).await {
+                    error!("Failed to flush program_account_delete_cache batch: {}", e);
+                    self.metrics.report_db_error("flush_program_account_delete_cache");
+                    return Err(Box::new(e));
+                }
+            }
+        }
+
         // Update cache size metrics after flush
         self.metrics.report_cache_sizes(
             self.tx_cache.len(),
@@ -796,10 +701,50 @@ impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB>
         Ok(())
     }
 
-    pub async fn index_transaction(&mut self, job: ConsumedJob) -> usize {
-        debug!("Processing transaction: {}", job.sanitized_transaction.signature());
-        let signature_rows = to_signature_rows(&job);
-        let (tx_row, account_delta) = to_tx_row(&job);
+    fn collect_program_account_ops(job_effect_diff: &JobEffectDiff) -> (Vec<(Pubkey, Pubkey)>, Vec<(Pubkey, Pubkey)>) {
+        let mut creates = Vec::new();
+        let mut deletes = Vec::new();
+
+        for ((address, pre_account), diffs) in job_effect_diff.pre_accounts.iter().zip(&job_effect_diff.diffs) {
+            let pre_owner = pre_account.as_ref().map(|a| *a.owner()).unwrap_or_default();
+            let mut post_account = pre_account.clone().unwrap_or_default();
+
+            for diff in diffs {
+                diff.apply_to_account(&mut post_account);
+            }
+
+            let post_owner = *post_account.owner();
+
+            // Account deleted or owner changed
+            if pre_owner != Pubkey::default() && pre_owner != post_owner {
+                deletes.push((pre_owner, *address));
+            }
+
+            // Account created or moved under a new owner
+            if post_owner != Pubkey::default() && pre_owner != post_owner {
+                creates.push((post_owner, *address));
+            }
+        }
+
+        (creates, deletes)
+    }
+
+    pub async fn index_transaction(
+        &mut self,
+        job: JobEffects,
+        block_unix_timestamp: u64,
+        ordering: TxOrdering,
+    ) -> usize {
+        let slot = ordering.slot();
+        let ordering_for_sigs = ordering.clone();
+        let sanitized_tx = match job.sanitized_tx() {
+            Ok(sanitized_tx) => sanitized_tx,
+            Err(_) => return 0,
+        };
+        let signature_rows = to_signature_rows(&sanitized_tx, slot, block_unix_timestamp, ordering_for_sigs);
+        let (program_account_creates, program_account_deletes) =
+            Self::collect_program_account_ops(&job.job_effect_diff);
+        let (tx_row, account_delta) = to_tx_row(job, &sanitized_tx, slot, block_unix_timestamp, ordering);
 
         // Report metrics for indexed signatures
         self.metrics.report_signatures_indexed(signature_rows.len() as u64);
@@ -811,14 +756,16 @@ impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB>
 
         self.tx_cache.push(tx_row);
 
-        if let Some((account_ops_create, account_ops_delete, account_ops_mint_create, account_ops_mint_delete)) =
-            account_delta
-        {
-            self.account_ops_create_cache.extend(account_ops_create);
-            self.account_ops_delete_cache.extend(account_ops_delete);
-            self.account_ops_mint_create_cache.extend(account_ops_mint_create);
-            self.account_ops_mint_delete_cache.extend(account_ops_mint_delete);
-        }
+        self.account_ops_create_cache.extend(account_delta.account_ops_create);
+        self.account_ops_delete_cache.extend(account_delta.account_ops_delete);
+        self.account_ops_mint_create_cache
+            .extend(account_delta.account_ops_mint_create);
+        self.account_ops_mint_delete_cache
+            .extend(account_delta.account_ops_mint_delete);
+        self.program_account_create_cache
+            .extend(program_account_creates.into_iter());
+        self.program_account_delete_cache
+            .extend(program_account_deletes.into_iter());
 
         // Update cache size metrics
         self.metrics.report_cache_sizes(
@@ -854,7 +801,11 @@ impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB>
         }
 
         if self.account_ops_create_cache.len() >= self.max_cache_size ||
-            self.account_ops_delete_cache.len() >= self.max_cache_size
+            self.account_ops_delete_cache.len() >= self.max_cache_size ||
+            self.account_ops_mint_create_cache.len() >= self.max_cache_size ||
+            self.account_ops_mint_delete_cache.len() >= self.max_cache_size ||
+            self.program_account_create_cache.len() >= self.max_cache_size ||
+            self.program_account_delete_cache.len() >= self.max_cache_size
         {
             if let Err(e) = self.flush_account_ops_cache_async().await {
                 error!("Error flushing account ops cache: {}", e);
@@ -867,8 +818,9 @@ impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB>
     // Batch process transactions for better efficiency
     pub async fn batch_index_transactions(
         &mut self,
-        transactions: Vec<ConsumedJob>,
-        _block_unix_timestamp: u64,
+        transactions: Vec<JobEffects>,
+        block_unix_timestamp: u64,
+        shred_id: ShredId,
     ) -> usize {
         let total = transactions.len();
         debug!("Batch indexing {} transactions", total);
@@ -879,12 +831,18 @@ impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB>
 
         let mut valid_tx_count = 0;
         let mut flushed_tx = 0;
-        for job in transactions {
-            if job.processed_transaction.is_err() {
+        for (kth, job) in transactions.into_iter().enumerate() {
+            if job.execution_result.is_err() {
                 continue;
             }
             valid_tx_count += 1;
-            flushed_tx += self.index_transaction(job).await;
+            flushed_tx += self
+                .index_transaction(
+                    job,
+                    block_unix_timestamp,
+                    TxOrdering::from_shred_id(&shred_id, kth as u64),
+                )
+                .await;
         }
 
         // Update metrics for the batch
@@ -911,12 +869,19 @@ impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB>
 
         // Execute the query
         let query = format!(
-            "INSERT INTO slots (slot, block_unix_timestamp, blockhash, parent_blockhash) VALUES ({}, {}, {}, {})",
+            "INSERT INTO {} (slot, block_unix_timestamp, blockhash, parent_blockhash) VALUES ({}, {}, {}, {})",
+            if SLOT::require_distributed() {
+                format!("{SLOT_TABLE_NAME}_dist")
+            } else {
+                SLOT_TABLE_NAME.to_string()
+            },
             slot,
             timestamp,
             SLOT::to_array_string(blockhash.as_ref()),
             SLOT::to_array_string(parent_blockhash.as_ref())
         );
+
+        info!("index_block_async query: {}", query);
 
         match self.slot_client.execute(&query).await {
             Ok(_) => {
@@ -999,7 +964,7 @@ impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB>
             blockhash: Hash::new(&row.blockhash.0).to_string(),
             #[allow(deprecated)]
             parent_blockhash: Hash::new(&row.parent_blockhash.0).to_string(),
-            parent_slot: row.slot,
+            parent_slot: row.slot.saturating_sub(1),
             transactions: vec![],
             signatures: vec![],
             tx_count: 0,
@@ -1012,7 +977,7 @@ impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB>
         let sig_bytes = TX::to_array_string(signature.as_ref());
         // Execute the query
         let query = format!(
-            "SELECT signature, transaction, result, slot, pre_accounts, block_unix_timestamp, seq_number FROM {} WHERE signature = {} LIMIT 1",
+            "SELECT signature, transaction, result, slot, pre_accounts, block_unix_timestamp, ordering FROM {} WHERE signature = {} LIMIT 1",
             if TX::require_distributed() { format!("{TX_TABLE_NAME}_dist") } else { TX_TABLE_NAME.to_string() },
             sig_bytes
         );
@@ -1113,7 +1078,6 @@ impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB>
                     },
                     slot: tx.slot,
                     unix_timestamp_in_millis: tx.block_unix_timestamp,
-                    seq_number: tx.seq_number,
                 })
             }
             _ => {
@@ -1243,7 +1207,7 @@ impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB>
             let mut signatures = vec![];
 
             // Execute the query
-            let query = format!("SELECT signature, transaction, result, slot, pre_accounts, block_unix_timestamp, seq_number FROM {} WHERE slot = {} LIMIT {} OFFSET {}",
+            let query = format!("SELECT signature, transaction, result, slot, pre_accounts, block_unix_timestamp, ordering FROM {} WHERE slot = {} LIMIT {} OFFSET {}",
                 if TX::require_distributed() { format!("{TX_TABLE_NAME}_dist") } else { TX_TABLE_NAME.to_string() },
                 slot,
                 limit,
@@ -1284,238 +1248,276 @@ impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB>
 
         let account_hex = SIGNATURE::to_array_string(&account.to_bytes());
 
-        if let infinisvm_types::SignatureFilters::Signature(before, after) = filters {
-            let table = if SIGNATURE::require_distributed() {
-                format!("{SIGNATURE_TABLE_NAME}_dist")
-            } else {
-                SIGNATURE_TABLE_NAME.to_string()
-            };
+        let table = if SIGNATURE::require_distributed() {
+            format!("{SIGNATURE_TABLE_NAME}_dist")
+        } else {
+            SIGNATURE_TABLE_NAME.to_string()
+        };
 
-            match (before, after) {
-                (Some(sig), None) => {
-                    let seq_number = self
-                        .get_transaction_by_signature_async(&sig)
-                        .await
-                        .map(|tx| tx.seq_number);
-                    if seq_number.is_none() {
-                        return vec![];
-                    }
-                    let seq_number = seq_number.unwrap();
-
-                    let sig_bytes = SIGNATURE::to_array_string(sig.as_ref());
-
-                    let query = format!("SELECT signature FROM {table} WHERE account = {account_hex} AND seq_number = {seq_number} AND signature < {sig_bytes} LIMIT {limit}");
-                    let result = self.signature_client.query_collect::<SingleSignatureRow>(&query).await;
-                    if result.is_err() {
-                        error!("get_signatures_by_account_async: {}", result.err().unwrap());
-                        return vec![];
-                    }
-                    let mut signatures = result
-                        .unwrap()
-                        .into_iter()
-                        .map(|sig| Signature::try_from(sig.signature.as_ref()).unwrap())
-                        .collect::<Vec<_>>();
-                    // if the signatures len < limit, we need to query the next seq_number
-                    if signatures.len() >= limit {
-                        signatures.truncate(limit);
-                        return signatures;
-                    }
-                    let query_collect_more = format!("SELECT signature, seq_number FROM {} WHERE account = {} AND seq_number < {} ORDER BY seq_number DESC LIMIT {}", table, account_hex, seq_number, limit - signatures.len());
-                    let result = self
-                        .signature_client
-                        .query_collect::<SingleSignatureRow>(&query_collect_more)
-                        .await;
-                    if result.is_err() {
-                        error!("get_signatures_by_account_async: {}", result.err().unwrap());
-                        return vec![];
-                    }
-                    let new_signatures = result.unwrap();
-                    if new_signatures.is_empty() {
-                        signatures.truncate(limit);
-                        return signatures;
-                    }
-                    let last_seq_number = new_signatures.iter().map(|sig| sig.seq_number).min().unwrap_or(0);
-                    for sig in new_signatures {
-                        if sig.seq_number != last_seq_number {
-                            signatures.push(Signature::try_from(sig.signature.as_ref()).unwrap());
-                        }
-                    }
-                    if signatures.len() >= limit {
-                        signatures.truncate(limit);
-                        return signatures;
-                    }
-                    // fill the last job_id
-                    let query_collect_last_seq = format!(
-                        "SELECT signature, seq_number FROM {} WHERE account = {} AND seq_number = {} LIMIT {}",
-                        table,
-                        account_hex,
-                        last_seq_number,
-                        limit - signatures.len()
-                    );
-                    let result = self
-                        .signature_client
-                        .query_collect::<SingleSignatureRow>(&query_collect_last_seq)
-                        .await;
-                    if result.is_err() {
-                        error!("get_signatures_by_account_async: {}", result.err().unwrap());
-                        return vec![];
-                    }
-                    for sig in result.unwrap().into_iter().sorted_by_key(|sig| sig.seq_number) {
-                        signatures.push(Signature::try_from(sig.signature.as_ref()).unwrap());
-                    }
-                    signatures.truncate(limit);
-                    return signatures;
-                }
-                (None, Some(sig)) => {
-                    // collect all signatures in the same seq_number as the given signature, filter
-                    // out the < sig
-                    let seq_number = self
-                        .get_transaction_by_signature_async(&sig)
-                        .await
-                        .map(|tx| tx.seq_number);
-                    if seq_number.is_none() {
-                        return vec![];
-                    }
-                    let seq_number = seq_number.unwrap();
-
-                    let sig_bytes = SIGNATURE::to_array_string(sig.as_ref());
-
-                    let query = format!("SELECT signature FROM {table} WHERE account = {account_hex} AND seq_number = {seq_number} AND signature > {sig_bytes} LIMIT {limit}");
-                    let result = self.signature_client.query_collect::<SingleSignatureRow>(&query).await;
-                    if result.is_err() {
-                        error!("get_signatures_by_account_async: {}", result.err().unwrap());
-                        return vec![];
-                    }
-                    let mut signatures = result
-                        .unwrap()
-                        .into_iter()
-                        .map(|sig| Signature::try_from(sig.signature.as_ref()).unwrap())
-                        .collect::<Vec<_>>();
-                    // if the signatures len < limit, we need to query the next seq_number
-                    if signatures.len() >= limit {
-                        signatures.truncate(limit);
-                        return signatures;
-                    }
-                    let query_collect_more = format!("SELECT signature, seq_number FROM {} WHERE account = {} AND seq_number > {} ORDER BY seq_number ASC LIMIT {}", table, account_hex, seq_number, limit - signatures.len());
-                    let result = self
-                        .signature_client
-                        .query_collect::<SingleSignatureRow>(&query_collect_more)
-                        .await;
-                    if result.is_err() {
-                        error!("get_signatures_by_account_async: {}", result.err().unwrap());
-                        return vec![];
-                    }
-                    let new_signatures = result.unwrap();
-                    if new_signatures.is_empty() {
-                        signatures.truncate(limit);
-                        return signatures;
-                    }
-                    let last_seq_number = new_signatures.iter().map(|sig| sig.seq_number).max().unwrap_or(0);
-                    for sig in new_signatures {
-                        if sig.seq_number != last_seq_number {
-                            signatures.push(Signature::try_from(sig.signature.as_ref()).unwrap());
-                        }
-                    }
-                    if signatures.len() >= limit {
-                        signatures.truncate(limit);
-                        return signatures;
-                    }
-                    // fill the last job_id
-                    let query_collect_last_seq = format!(
-                        "SELECT signature, seq_number FROM {} WHERE account = {} AND seq_number = {} LIMIT {}",
-                        table,
-                        account_hex,
-                        last_seq_number,
-                        limit - signatures.len()
-                    );
-                    let result = self
-                        .signature_client
-                        .query_collect::<SingleSignatureRow>(&query_collect_last_seq)
-                        .await;
-                    if result.is_err() {
-                        error!("get_signatures_by_account_async: {}", result.err().unwrap());
-                        return vec![];
-                    }
-                    for sig in result.unwrap().into_iter().sorted_by_key(|sig| sig.seq_number) {
-                        signatures.push(Signature::try_from(sig.signature.as_ref()).unwrap());
-                    }
-                    signatures.truncate(limit);
-                    return signatures;
-                }
-                (None, None) => {}
-                (Some(_), Some(_)) => {}
-            }
-
-            // match (before, after) {
-            //     (Some(sig), None) => {
-            //         let sequence = self
-            //             .get_transaction_by_signature_async(&sig)
-            //             .await
-            //             .map(|tx| tx.seq_number);
-            //         if sequence.is_none() {
-            //             return vec![];
-            //         }
-            //         let sequence = sequence.unwrap();
-            //         query = format!(
-            //             "SELECT signature FROM {} WHERE account = {} AND
-            // (seq_number < {} OR (seq_number = {} AND signature < {}))
-            // ORDER BY seq_number DESC, signature DESC",
-            //             table,
-            //             account_hex,
-            //             sequence,
-            //             sequence,
-            //             SIGNATURE::to_array_string(sig.as_ref())
-            //         );
-            //     }
-            //     (None, Some(sig)) => {
-            //         let sequence = self
-            //             .get_transaction_by_signature_async(&sig)
-            //             .await
-            //             .map(|tx| tx.seq_number);
-            //         if sequence.is_none() {
-            //             return vec![];
-            //         }
-            //         let sequence = sequence.unwrap();
-            //         query = format!(
-            //             "SELECT signature FROM {} WHERE account = {} AND
-            // (seq_number > {} OR (seq_number = {} AND signature > {}))
-            // ORDER BY seq_number DESC, signature DESC",
-            //             table,
-            //             account_hex,
-            //             sequence,
-            //             sequence,
-            //             SIGNATURE::to_array_string(sig.as_ref())
-            //         );
-            //     }
-            //     _ => {} // Keep original query for (None, None)
-            // }
+        // Helper to convert DB rows into (ordering, Signature)
+        fn rows_to_pairs(rows: Vec<SingleSignatureRow>) -> Vec<(num_bigint::BigInt, Signature)> {
+            rows.into_iter()
+                .filter_map(|r| match (r.ordering, Signature::try_from(r.signature.as_ref())) {
+                    (ordering, Ok(s)) => Some((ordering, s)),
+                    (_, Err(_)) => None,
+                })
+                .collect()
         }
 
-        // Construct the query
-        let mut query = format!(
-            "SELECT signature FROM {} WHERE account = {} ORDER BY seq_number DESC",
-            if SIGNATURE::require_distributed() {
-                format!("{SIGNATURE_TABLE_NAME}_dist")
-            } else {
-                SIGNATURE_TABLE_NAME.to_string()
-            },
-            account_hex
+        if let infinisvm_types::SignatureFilters::Signature(before, after) = filters {
+            //
+            // BEFORE branch: (Some(sig), None)
+            //
+            if let (Some(sig), None) = (before, after) {
+                let sig_bytes = SIGNATURE::to_array_string(sig.as_ref());
+
+                // 1) Find the ordering of the anchor signature
+                let ordering_lookup = format!(
+                    "SELECT ordering FROM {table} \
+                     WHERE account = {account_hex} AND signature = {sig_bytes} \
+                     ORDER BY ordering DESC \
+                     LIMIT 1"
+                );
+                let current_ordering = match self
+                    .signature_client
+                    .query_collect::<SingleOrderingRow>(&ordering_lookup)
+                    .await
+                {
+                    Ok(rows) if !rows.is_empty() => rows[0].ordering.clone(),
+                    _ => return vec![],
+                };
+
+                let mut signatures: Vec<(num_bigint::BigInt, Signature)> = Vec::with_capacity(limit);
+
+                // 2) Same-ordering, earlier signatures (all rows for that ordering; filter in
+                //    Rust)
+                let query_same = format!(
+                    "SELECT signature, ordering FROM {table} \
+                     WHERE account = {account_hex} AND ordering = {current_ordering}"
+                );
+                if let Ok(rows) = self
+                    .signature_client
+                    .query_collect::<SingleSignatureRow>(&query_same)
+                    .await
+                {
+                    let mut pairs = rows_to_pairs(rows);
+                    pairs.retain(|(ordering, s)| ordering == &current_ordering && s < &sig);
+                    signatures.extend(pairs);
+                }
+
+                // If we already have enough and only touched current_ordering, we can return
+                if signatures.len() >= limit {
+                    signatures.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+                    signatures.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
+                    signatures.truncate(limit);
+                    return signatures.into_iter().map(|(_, s)| s).collect();
+                }
+
+                // 3) Earlier orderings (< current_ordering)
+                let remaining = limit - signatures.len();
+                if remaining > 0 {
+                    let query_more = format!(
+                        "SELECT signature, ordering FROM {table} \
+                         WHERE account = {account_hex} AND ordering < {current_ordering} \
+                         ORDER BY ordering DESC \
+                         LIMIT {remaining}"
+                    );
+                    if let Ok(rows) = self
+                        .signature_client
+                        .query_collect::<SingleSignatureRow>(&query_more)
+                        .await
+                    {
+                        signatures.extend(rows_to_pairs(rows));
+                    }
+                }
+
+                if signatures.is_empty() {
+                    return vec![];
+                }
+
+                // 4) Boundary fix: if we cut through the *oldest* ordering among those <
+                //    current_ordering,
+                // re-fetch that entire ordering to ensure we don't miss higher-signature rows.
+                let min_earlier_ordering = signatures
+                    .iter()
+                    .filter(|(ordering, _)| ordering < &current_ordering)
+                    .map(|(ordering, _)| ordering)
+                    .min()
+                    .cloned();
+
+                if let Some(last_ordering) = min_earlier_ordering {
+                    let query_less = format!(
+                        "SELECT signature, ordering FROM {table} \
+                         WHERE account = {account_hex} AND ordering = {last_ordering}"
+                    );
+                    if let Ok(rows) = self
+                        .signature_client
+                        .query_collect::<SingleSignatureRow>(&query_less)
+                        .await
+                    {
+                        signatures.extend(rows_to_pairs(rows));
+                    }
+                }
+
+                // Final canonical order for "before": ordering DESC, signature DESC
+                signatures.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+                signatures.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
+                signatures.truncate(limit);
+                return signatures.into_iter().map(|(_, s)| s).collect();
+            }
+
+            //
+            // AFTER branch: (None, Some(sig))
+            //
+            if let (None, Some(sig)) = (before, after) {
+                let sig_bytes = SIGNATURE::to_array_string(sig.as_ref());
+
+                // 1) Find ordering of anchor signature
+                let ordering_lookup = format!(
+                    "SELECT ordering FROM {table} \
+                     WHERE account = {account_hex} AND signature = {sig_bytes} \
+                     ORDER BY ordering DESC \
+                     LIMIT 1"
+                );
+                let current_ordering = match self
+                    .signature_client
+                    .query_collect::<SingleOrderingRow>(&ordering_lookup)
+                    .await
+                {
+                    Ok(rows) if !rows.is_empty() => rows[0].ordering.clone(),
+                    _ => return vec![],
+                };
+
+                let mut signatures: Vec<(num_bigint::BigInt, Signature)> = Vec::with_capacity(limit);
+
+                // 2) Same-ordering, later signatures (all rows for that ordering; filter in
+                //    Rust)
+                let query_same = format!(
+                    "SELECT signature, ordering FROM {table} \
+                     WHERE account = {account_hex} AND ordering = {current_ordering}"
+                );
+                if let Ok(rows) = self
+                    .signature_client
+                    .query_collect::<SingleSignatureRow>(&query_same)
+                    .await
+                {
+                    let mut pairs = rows_to_pairs(rows);
+                    pairs.retain(|(ordering, s)| ordering == &current_ordering && s > &sig);
+                    signatures.extend(pairs);
+                }
+
+                // If enough from same ordering, return sorted
+                if signatures.len() >= limit {
+                    // ordering ASC, signature DESC (your original after-branch behavior)
+                    signatures.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)));
+                    signatures.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
+                    signatures.truncate(limit);
+                    return signatures.into_iter().map(|(_, s)| s).collect();
+                }
+
+                // 3) Later orderings (> current_ordering)
+                let remaining = limit - signatures.len();
+                if remaining > 0 {
+                    let query_more = format!(
+                        "SELECT signature, ordering FROM {table} \
+                         WHERE account = {account_hex} AND ordering > {current_ordering} \
+                         ORDER BY ordering ASC \
+                         LIMIT {remaining}"
+                    );
+                    if let Ok(rows) = self
+                        .signature_client
+                        .query_collect::<SingleSignatureRow>(&query_more)
+                        .await
+                    {
+                        signatures.extend(rows_to_pairs(rows));
+                    }
+                }
+
+                if signatures.is_empty() {
+                    return vec![];
+                }
+
+                // 4) Boundary fix for "later" side: we may have partially fetched the *largest*
+                // ordering > current_ordering; re-fetch that full ordering.
+                let max_later_ordering = signatures
+                    .iter()
+                    .filter(|(ordering, _)| ordering > &current_ordering)
+                    .map(|(ordering, _)| ordering)
+                    .max()
+                    .cloned();
+
+                if let Some(last_ordering) = max_later_ordering {
+                    let query_same_order = format!(
+                        "SELECT signature, ordering FROM {table} \
+                         WHERE account = {account_hex} AND ordering = {last_ordering}"
+                    );
+                    if let Ok(rows) = self
+                        .signature_client
+                        .query_collect::<SingleSignatureRow>(&query_same_order)
+                        .await
+                    {
+                        signatures.extend(rows_to_pairs(rows));
+                    }
+                }
+
+                // Final order for "after": ordering ASC, signature DESC
+                signatures.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)));
+                signatures.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
+                signatures.truncate(limit);
+                return signatures.into_iter().map(|(_, s)| s).collect();
+            }
+        }
+
+        //
+        // No before/after filter (or unsupported combination): return latest `limit`
+        // in canonical order (ordering DESC, signature DESC) without using signature
+        // in SQL ORDER BY.
+        //
+        let query = format!(
+            "SELECT signature, ordering FROM {table} \
+             WHERE account = {account_hex} \
+             ORDER BY ordering DESC \
+             LIMIT {limit}"
         );
+        debug!("get_signatures_by_account_async query: {}", query);
 
-        query = format!("{query} LIMIT {limit}");
-        debug!("query: {}", query);
-
-        // Execute the query
-        match self.signature_client.query_collect::<SingleSignatureRow>(&query).await {
-            Ok(result) => result
-                .into_iter()
-                .filter_map(|sig| Signature::try_from(sig.signature.as_ref()).ok())
-                .collect(),
+        let rows = match self.signature_client.query_collect::<SingleSignatureRow>(&query).await {
+            Ok(rows) => rows,
             Err(e) => {
                 error!("Error querying signatures by account {}: {}", account_hex, e);
-                Vec::new()
+                return Vec::new();
+            }
+        };
+
+        if rows.is_empty() {
+            return vec![];
+        }
+
+        let mut signatures = rows_to_pairs(rows);
+
+        // Boundary fix as in the branches: we might be cutting through the oldest
+        // ordering included in this limited query. Re-fetch that ordering completely.
+        let min_ordering = signatures.iter().map(|(ordering, _)| ordering).min().cloned();
+
+        if let Some(last_ordering) = min_ordering {
+            let query_boundary = format!(
+                "SELECT signature, ordering FROM {table} \
+                 WHERE account = {account_hex} AND ordering = {last_ordering}"
+            );
+            if let Ok(rows) = self
+                .signature_client
+                .query_collect::<SingleSignatureRow>(&query_boundary)
+                .await
+            {
+                signatures.extend(rows_to_pairs(rows));
             }
         }
+
+        // Global canonical ordering for default case: ordering DESC, signature DESC
+        signatures.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+        signatures.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
+        signatures.truncate(limit);
+        signatures.into_iter().map(|(_, s)| s).collect()
     }
 
     pub async fn flush_caches_conditionally(&mut self) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
@@ -1536,25 +1538,13 @@ impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB>
             }
         }
 
-        if self.account_ops_create_cache.len() >= self.max_cache_size {
-            if let Err(e) = self.flush_account_ops_cache_async().await {
-                error!("Error flushing account ops cache: {}", e);
-            }
-        }
-
-        if self.account_ops_delete_cache.len() >= self.max_cache_size {
-            if let Err(e) = self.flush_account_ops_cache_async().await {
-                error!("Error flushing account ops cache: {}", e);
-            }
-        }
-
-        if self.account_ops_mint_create_cache.len() >= self.max_cache_size {
-            if let Err(e) = self.flush_account_ops_cache_async().await {
-                error!("Error flushing account ops cache: {}", e);
-            }
-        }
-
-        if self.account_ops_mint_delete_cache.len() >= self.max_cache_size {
+        if self.account_ops_create_cache.len() >= self.max_cache_size ||
+            self.account_ops_delete_cache.len() >= self.max_cache_size ||
+            self.account_ops_mint_create_cache.len() >= self.max_cache_size ||
+            self.account_ops_mint_delete_cache.len() >= self.max_cache_size ||
+            self.program_account_create_cache.len() >= self.max_cache_size ||
+            self.program_account_delete_cache.len() >= self.max_cache_size
+        {
             if let Err(e) = self.flush_account_ops_cache_async().await {
                 error!("Error flushing account ops cache: {}", e);
             }
@@ -1563,10 +1553,16 @@ impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB>
         Ok(tx_flushed)
     }
 
-    pub async fn index_transactions_async(&mut self, batch: Vec<ConsumedJob>, block_unix_timestamp: u64) -> usize {
+    pub async fn index_transactions_async(
+        &mut self,
+        batch: Vec<JobEffects>,
+        block_unix_timestamp: u64,
+        shred_id: ShredId,
+    ) -> usize {
         let mut tx_flushed = if !batch.is_empty() {
             debug!("Indexing batch of {} transactions", batch.len());
-            self.batch_index_transactions(batch, block_unix_timestamp).await
+            self.batch_index_transactions(batch, block_unix_timestamp, shred_id)
+                .await
         } else {
             0
         };
@@ -1579,6 +1575,117 @@ impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB>
         };
 
         tx_flushed
+    }
+
+    pub async fn get_token_account_owned_by_owner_async(
+        &self,
+        owner: Option<Pubkey>,
+        program_id: Option<Pubkey>,
+        mint: Option<Pubkey>,
+        limit: usize,
+        offset: usize,
+    ) -> Vec<Pubkey> {
+        let _timer = ScopedTimer::new(&self.metrics.histogram_get_token_accounts_owned_by_account);
+
+        // Cassandra requires filtering on partition key (owner)
+        let owner = match owner {
+            Some(owner) => owner,
+            None => return Vec::new(),
+        };
+
+        let table_name = if ACCOUNT::require_distributed() {
+            format!("{ACCOUNT_MINT_TABLE_NAME}_dist")
+        } else {
+            ACCOUNT_MINT_TABLE_NAME.to_string()
+        };
+
+        // Build valid Cassandra query: must start with partition key (owner)
+        // Note: Cannot filter on account_type without filtering on account first
+        // (PRIMARY KEY order: owner, account, account_type) So we fetch all
+        // rows and filter by account_type and mint in application code
+        // Only select account_type if we need to filter by it
+        let select_columns = if program_id.is_some() {
+            "account, mint, account_type"
+        } else {
+            "account, mint"
+        };
+
+        let mut query = format!(
+            "SELECT {} FROM {} WHERE owner = {}",
+            select_columns,
+            table_name,
+            ACCOUNT::to_array_string(&owner.to_bytes())
+        );
+
+        // Cassandra LIMIT clause uses Int32, max value is 2,147,483,647
+        const CASSANDRA_MAX_LIMIT: usize = i32::MAX as usize;
+
+        // Calculate how many rows to fetch based on filters
+        // We need to fetch more if filtering by account_type or mint since we filter in
+        // application code
+        let needs_app_filtering = program_id.is_some() || mint.is_some();
+        let fetch_limit = if needs_app_filtering {
+            // Fetch more rows to account for filtering (multiply by a factor to ensure we
+            // get enough)
+            ((limit + offset) * 3).min(CASSANDRA_MAX_LIMIT)
+        } else {
+            // No filtering needed, use offset/limit directly
+            if offset > 0 {
+                (limit + offset).min(CASSANDRA_MAX_LIMIT)
+            } else {
+                limit.min(CASSANDRA_MAX_LIMIT)
+            }
+        };
+
+        // Build query with limit
+        query = format!("{query} LIMIT {fetch_limit}");
+
+        let query_result = if program_id.is_some() {
+            self.account_client.query_collect::<AccountMintQueryRow>(&query).await
+        } else {
+            // Use a simpler row type when account_type is not selected
+            self.account_client
+                .query_collect::<AccountMintQueryRowWithoutType>(&query)
+                .await
+                .map(|rows| {
+                    rows.into_iter()
+                        .map(|r| AccountMintQueryRow {
+                            account: r.account,
+                            mint: r.mint,
+                            account_type: 0, // Default value, won't be used for filtering
+                        })
+                        .collect()
+                })
+        };
+
+        match query_result {
+            Ok(mut rows) => {
+                // Filter by account_type if program_id is provided
+                // Cannot filter in WHERE clause because account_type requires account to be
+                // filtered first
+                if let Some(program_id) = program_id {
+                    let account_type = if program_id == spl_token::id() { 1 } else { 2 };
+                    rows.retain(|r| r.account_type == account_type);
+                }
+
+                // Filter by mint if provided (mint is not part of PRIMARY KEY)
+                if let Some(mint_filter) = mint {
+                    rows.retain(|r| r.mint.0.as_slice() == mint_filter.to_bytes());
+                }
+
+                // Apply offset and limit in application code
+                let final_rows: Vec<_> = rows.into_iter().skip(offset).take(limit).collect();
+
+                final_rows
+                    .into_iter()
+                    .map(|r| Pubkey::try_from(r.account.0.as_slice()).unwrap())
+                    .collect()
+            }
+            Err(e) => {
+                error!("Error querying account_ops_mint: {}", e);
+                Vec::new()
+            }
+        }
     }
 
     pub async fn get_token_account_owned_by_account_async(
@@ -1666,6 +1773,33 @@ impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB>
         }
     }
 
+    pub async fn get_program_accounts_async(&self, program_id: &Pubkey, limit: usize, offset: usize) -> Vec<Pubkey> {
+        let program_hex = ACCOUNT::to_array_string(&program_id.to_bytes());
+        let mut query = format!(
+            "SELECT account FROM {} WHERE program_id = {}",
+            if ACCOUNT::require_distributed() {
+                format!("{PROGRAM_ACCOUNT_TABLE_NAME}_dist")
+            } else {
+                PROGRAM_ACCOUNT_TABLE_NAME.to_string()
+            },
+            program_hex
+        );
+
+        query = format!("{query} LIMIT {limit} OFFSET {offset}");
+
+        let result = self.account_client.query_collect::<SingleAccountRow>(&query).await;
+        match result {
+            Ok(result) => result
+                .into_iter()
+                .map(|r| Pubkey::try_from(r.account.0.as_slice()).unwrap())
+                .collect(),
+            Err(e) => {
+                error!("Error querying program_accounts: {}", e);
+                Vec::new()
+            }
+        }
+    }
+
     pub fn report_metrics(&self) {
         // Report current cache sizes
         self.metrics.report_cache_sizes(
@@ -1699,33 +1833,13 @@ impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB> I
         }
     }
 
-    fn index_transactions(&mut self, batch: Vec<ConsumedJob>, block_unix_timestamp: u64) {
+    fn index_transactions(&mut self, batch: Vec<JobEffects>, block_unix_timestamp: u64, shred_id: ShredId) {
         if batch.is_empty() {
             return;
         }
 
         let runtime = self.runtime.clone();
-        let _ = runtime.block_on(self.index_transactions_async(batch, block_unix_timestamp));
-    }
-
-    async fn index_serializable_tx(
-        &mut self,
-        tx: SerializableTxRow,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // info!("Indexing serializable tx: {:?}", tx.signature);
-        let (signature_rows, account_ops_create, account_ops_delete, account_ops_mint_create, account_ops_mint_delete) =
-            tx.get_all_rows()?;
-        let tx_row = TxRow::from_serializable(tx);
-        self.tx_cache.push(tx_row);
-        self.signature_cache.extend(signature_rows);
-        self.account_ops_create_cache.extend(account_ops_create);
-        self.account_ops_delete_cache.extend(account_ops_delete);
-        self.account_ops_mint_create_cache.extend(account_ops_mint_create);
-        self.account_ops_mint_delete_cache.extend(account_ops_mint_delete);
-
-        let _ = self.flush_caches_conditionally().await;
-
-        Ok(())
+        let _ = runtime.block_on(self.index_transactions_async(batch, block_unix_timestamp, shred_id));
     }
 
     fn flush(&mut self) {
@@ -1754,6 +1868,10 @@ impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB> R
         self.get_account_owned_by_account_async(owner, limit, offset).await
     }
 
+    async fn find_accounts_by_program(&self, program_id: &Pubkey, limit: usize, offset: usize) -> Vec<Pubkey> {
+        self.get_program_accounts_async(program_id, limit, offset).await
+    }
+
     async fn find_token_accounts_owned_by(
         &self,
         owner: &Pubkey,
@@ -1762,7 +1880,7 @@ impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB> R
         limit: usize,
         offset: usize,
     ) -> Vec<Pubkey> {
-        self.get_token_account_owned_by_account_async(Some(*owner), program_id, mint, limit, offset)
+        self.get_token_account_owned_by_owner_async(Some(*owner), program_id, mint, limit, offset)
             .await
     }
 
@@ -1842,12 +1960,16 @@ pub struct MultiDatabaseIndexer<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: Index
 
 // Commands to be sent to worker processes - now only write operations
 enum IndexerCommand {
-    IndexTransactions {
-        batch: Vec<ConsumedJob>,
-        block_unix_timestamp: u64,
+    IndexBlock {
+        slot: u64,
+        timestamp: u64,
+        blockhash: Hash,
+        parent_blockhash: Hash,
     },
-    IndexSerializableTx {
-        tx: SerializableTxRow,
+    IndexTransactions {
+        batch: Vec<JobEffects>,
+        block_unix_timestamp: u64,
+        shred_id: ShredId,
     },
     Flush,
     Shutdown,
@@ -1891,7 +2013,7 @@ impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB>
         for (tx_client, slot_client, signature_client, account_client) in clients {
             let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<IndexerCommand>();
             senders.push(sender);
-            // Create a new ClickhouseIndexer for this worker, sharing the same runtime
+            // Create a new DatabaseIndexer for this worker, sharing the same runtime
             let runtime_clone = Arc::clone(&runtime);
             let mut indexer = DatabaseIndexer::with_runtime(
                 tx_client.clone(),
@@ -1920,21 +2042,28 @@ impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB>
                         IndexerCommand::IndexTransactions {
                             batch,
                             block_unix_timestamp,
+                            shred_id,
                         } => {
                             if batch.is_empty() {
                                 return;
                             }
                             let tx_flushed = worker_indexer
-                                .index_transactions_async(batch, block_unix_timestamp)
+                                .index_transactions_async(batch, block_unix_timestamp, shred_id)
                                 .await;
                             if tx_flushed > 0 {
                                 debug!("Indexed {} transactions", tx_flushed);
                                 total_processed_clone.fetch_add(tx_flushed as u64, Ordering::Relaxed);
                             }
                         }
-                        IndexerCommand::IndexSerializableTx { tx } => {
-                            // info!("Indexing serializable tx (worker): {:?}", tx.signature);
-                            let _ = worker_indexer.index_serializable_tx(tx).await;
+                        IndexerCommand::IndexBlock {
+                            slot,
+                            timestamp,
+                            blockhash,
+                            parent_blockhash,
+                        } => {
+                            let _ = worker_indexer
+                                .index_block_async(slot, timestamp, blockhash, parent_blockhash)
+                                .await;
                         }
                         IndexerCommand::Flush => {
                             let tx_flushed = worker_indexer.flush_tx_cache_async().await.unwrap_or(0);
@@ -2038,7 +2167,7 @@ impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB> D
     for MultiDatabaseIndexer<TX, SLOT, SIGNATURE, ACCOUNT>
 {
     fn drop(&mut self) {
-        info!("Shutting down MultiClickhouseIndexer...");
+        info!("Shutting down MultiDatabaseIndexer...");
 
         // Send shutdown command to all workers
         for sender in &self.senders {
@@ -2050,7 +2179,7 @@ impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB> D
         // Allow some time for workers to process shutdown
         std::thread::sleep(std::time::Duration::from_millis(500));
 
-        info!("MultiClickhouseIndexer shutdown complete");
+        info!("MultiDatabaseIndexer shutdown complete");
     }
 }
 
@@ -2059,7 +2188,7 @@ impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB> I
     for MultiDatabaseIndexer<TX, SLOT, SIGNATURE, ACCOUNT>
 {
     fn index_block(&mut self, slot: u64, timestamp: u64, blockhash: Hash, parent_blockhash: Hash) {
-        debug!("MultiClickhouseIndexer: Indexing block at slot {}", slot);
+        debug!("MultiDatabaseIndexer: Indexing block at slot {}", slot);
 
         // Flush all workers before indexing a new block
         self.flush_all();
@@ -2070,16 +2199,22 @@ impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB> I
         std::mem::swap(&mut self.slot_cache, &mut self.next_slot);
         self.current_slot = slot + 1;
 
+        // @chaz: still needed? How do RPC records slots?
         if let Some(s3) = self.s3.clone() {
             std::thread::spawn(move || {
                 // Sort outside the critical section to minimize index_block latency
-                all_txs.sort_unstable_by_key(|tx| tx.seq_number);
+                all_txs.sort_unstable_by(|a, b| a.ordering.cmp(&b.ordering));
                 let mut futures = Vec::new();
                 let file_path = format!("{}/{}/{}/info", slot % 256, slot % 65535, slot);
-                futures.push(s3.put_object(
-                    file_path,
-                    bincode::serialize(&(slot, timestamp, blockhash, parent_blockhash)).unwrap(),
-                ));
+
+                futures.push(
+                    s3.put_object(
+                        file_path,
+                        bincode::serialize(&(slot, timestamp, blockhash, parent_blockhash))
+                            .unwrap()
+                            .into(),
+                    ),
+                );
 
                 loop {
                     let txs: Vec<_> = all_txs.drain(0..FILE_CHUNK_SIZE.min(all_txs.len())).collect();
@@ -2090,7 +2225,9 @@ impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB> I
                     let file_path = format!("{}/{}/{}/{}", slot % 256, slot % 65535, slot, shard_idx);
                     let fut = s3.put_object(
                         file_path,
-                        bincode::serialize(&txs.iter().map(|tx| tx.to_serializable()).collect::<Vec<_>>()).unwrap(),
+                        bincode::serialize(&txs.iter().map(|tx| tx.to_serializable()).collect::<Vec<_>>())
+                            .unwrap()
+                            .into(),
                     );
                     shard_idx += 1;
                     futures.push(fut);
@@ -2104,6 +2241,14 @@ impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB> I
                 });
             });
         }
+
+        // save to database
+        self.dispatch_command(IndexerCommand::IndexBlock {
+            slot,
+            timestamp,
+            blockhash,
+            parent_blockhash,
+        });
 
         // Report cache sizes
         self.metrics.report_cache_sizes(
@@ -2120,20 +2265,26 @@ impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB> I
         }
     }
 
-    fn index_transactions(&mut self, batch: Vec<ConsumedJob>, block_unix_timestamp: u64) {
+    fn index_transactions(&mut self, batch: Vec<JobEffects>, block_unix_timestamp: u64, shred_id: ShredId) {
         if batch.is_empty() {
             return;
         }
 
-        for tx in &batch {
-            if tx.processed_transaction.is_err() {
+        // @chaz: still needed? How do RPC records slots?
+        for (job_k, tx) in batch.iter().enumerate() {
+            if tx.execution_result.is_err() {
                 continue;
             }
-            let (tx_row, _) = to_tx_row(tx);
+            let ordering = TxOrdering::from_shred_id(&shred_id, job_k as u64);
+            let sanitized_tx = match tx.sanitized_tx() {
+                Ok(sanitized_tx) => sanitized_tx,
+                Err(_) => continue,
+            };
+            let (tx_row, _) = to_tx_row(tx.clone(), &sanitized_tx, shred_id.slot, block_unix_timestamp, ordering);
             // Before first index_block, buffer into next_slot to avoid huge first sort
             if self.current_slot == u64::MAX {
                 self.next_slot.push(tx_row);
-            } else if tx.slot <= self.current_slot {
+            } else if shred_id.slot <= self.current_slot {
                 self.slot_cache.push(tx_row);
             } else {
                 self.next_slot.push(tx_row);
@@ -2148,31 +2299,12 @@ impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB> I
             self.next_slot.capacity(),
         );
 
-        debug!("MultiClickhouseIndexer: Indexing batch of {} transactions", batch.len());
+        debug!("MultiDatabaseIndexer: Indexing batch of {} transactions", batch.len());
         self.dispatch_command(IndexerCommand::IndexTransactions {
             batch,
             block_unix_timestamp,
+            shred_id,
         });
-    }
-
-    async fn index_serializable_tx(
-        &mut self,
-        tx: SerializableTxRow,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // info!("Indexing serializable tx (MultiDatabaseIndexer): {:?}", tx.signature);
-        let tx_clone = tx.clone();
-        let tx_row = TxRow::from_serializable(tx);
-        if self.current_slot == u64::MAX {
-            // Buffer all txs until the first block boundary is known
-            self.next_slot.push(tx_row);
-        } else if tx_row.slot <= self.current_slot {
-            self.slot_cache.push(tx_row);
-        } else {
-            self.next_slot.push(tx_row);
-        }
-
-        self.dispatch_command(IndexerCommand::IndexSerializableTx { tx: tx_clone });
-        Ok(())
     }
 
     fn flush(&mut self) {
@@ -2187,6 +2319,13 @@ impl<TX: IndexerDB, SLOT: IndexerDB, SIGNATURE: IndexerDB, ACCOUNT: IndexerDB> R
     async fn find_accounts_owned_by(&self, pubkey: &Pubkey, limit: usize, offset: usize) -> Vec<Pubkey> {
         // Use round-robin client selection for read operations
         self.clients[0].find_accounts_owned_by(pubkey, limit, offset).await
+    }
+
+    async fn find_accounts_by_program(&self, program_id: &Pubkey, limit: usize, offset: usize) -> Vec<Pubkey> {
+        // Use round-robin client selection for read operations
+        self.clients[0]
+            .find_accounts_by_program(program_id, limit, offset)
+            .await
     }
 
     async fn find_token_accounts_by_mint(
@@ -2255,6 +2394,11 @@ impl Indexer for NoopIndexer {}
 impl RpcIndexer for NoopIndexer {
     async fn find_accounts_owned_by(&self, _: &Pubkey, _limit: usize, _offset: usize) -> Vec<Pubkey> {
         error!("NoopIndexer: find_accounts_owned_by");
+        vec![]
+    }
+
+    async fn find_accounts_by_program(&self, _: &Pubkey, _limit: usize, _offset: usize) -> Vec<Pubkey> {
+        error!("NoopIndexer: find_accounts_by_program");
         vec![]
     }
 

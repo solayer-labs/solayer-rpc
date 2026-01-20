@@ -6,21 +6,17 @@ use axum::{
     routing::get,
     Router,
 };
+use bytes::Bytes;
 use infinisvm_logger::info;
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
 use tower_http::compression::CompressionLayer;
 
-use crate::{
-    slots::{self, SlotData},
-    state::SyncState,
-};
+use crate::slots::{self, SlotData};
 
 #[derive(Clone)]
 pub struct AppState {
     pub db_path: String,
     pub slots_path: String,
-    pub sync_state: Arc<RwLock<SyncState>>,
 }
 
 #[derive(Serialize)]
@@ -40,17 +36,8 @@ struct BatchSlotQuery {
 }
 
 // Standalone HTTP server function
-pub async fn start_http_server(
-    addr: SocketAddr,
-    db_path: String,
-    slots_path: String,
-    sync_state: Arc<RwLock<SyncState>>,
-) -> eyre::Result<()> {
-    let app_state = Arc::new(AppState {
-        db_path,
-        slots_path,
-        sync_state,
-    });
+pub async fn start_http_server(addr: SocketAddr, db_path: String, slots_path: String) -> eyre::Result<()> {
+    let app_state = Arc::new(AppState { db_path, slots_path });
 
     let app = Router::new()
         .route("/solayer/snapshots", get(handle_snapshots))
@@ -80,8 +67,8 @@ async fn handle_snapshots(State(state): State<Arc<AppState>>) -> Response {
 
     let mut files = Vec::new();
 
-    if let Ok(entries) = std::fs::read_dir(&db_path) {
-        for entry in entries.filter_map(Result::ok) {
+    if let Ok(mut entries) = tokio::fs::read_dir(&db_path).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
             if let Some(file_name) = entry.file_name().to_str() {
                 if file_name.ends_with(".bin") {
                     files.push(file_name.to_string());
@@ -152,7 +139,7 @@ async fn handle_batch_slots(State(state): State<Arc<AppState>>, Query(query): Qu
     if min_slot > max_slot {
         return (
             axum::http::StatusCode::BAD_REQUEST,
-            format!("min_slot ({}) must be <= max_slot ({})", min_slot, max_slot),
+            format!("min_slot ({min_slot}) must be <= max_slot ({max_slot})"),
         )
             .into_response();
     }
@@ -162,10 +149,12 @@ async fn handle_batch_slots(State(state): State<Arc<AppState>>, Query(query): Qu
     if max_slot - min_slot > slots::MAX_SLOT_RANGE as u64 {
         return (
             axum::http::StatusCode::BAD_REQUEST,
-            format!("Slot range is too large: {} - {}", min_slot, max_slot),
+            format!("Slot range is too large: {min_slot} - {max_slot}"),
         )
             .into_response();
     }
+
+    info!("Loading slots from {min_slot} to {max_slot}");
 
     // Load slots
     match slots::load_slots(&slots_path, min_slot, max_slot).await {
@@ -174,7 +163,7 @@ async fn handle_batch_slots(State(state): State<Arc<AppState>>, Query(query): Qu
             infinisvm_logger::error!("Failed to load batch slots: {}", e);
             (
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to load slots: {}", e),
+                format!("Failed to load slots: {e}"),
             )
                 .into_response()
         }
@@ -215,7 +204,7 @@ async fn handle_slot_shard(State(state): State<Arc<AppState>>, Path((slot, shard
     }
 }
 
-fn build_binary_response(data: Vec<u8>) -> Response {
+fn build_binary_response(data: Bytes) -> Response {
     axum::http::Response::builder()
         .status(axum::http::StatusCode::OK)
         .header("Content-Type", "application/octet-stream")
