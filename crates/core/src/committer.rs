@@ -10,12 +10,11 @@ use std::{
 use crossbeam_channel::Receiver;
 use infinisvm_logger::{info, warn};
 use infinisvm_sync::grpc::TransactionBatchBroadcaster;
-use infinisvm_types::sync::SyncFinalization;
+use infinisvm_types::{core_batch_shred::CoreBatchShred, sync::SyncFinalization};
 use metrics::gauge;
 use rand::seq::SliceRandom;
 
 use crate::wal_writer::WalWriter;
-use infinisvm_types::core_batch_shred::CoreBatchShred;
 
 pub type PerfSample = (u64, u64, u64, u64); // slot(sampled at), num_transactions, num_slots, sample_duration
 

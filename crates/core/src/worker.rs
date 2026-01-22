@@ -5,16 +5,13 @@ use std::{
 
 use crossbeam_channel::{Receiver, Sender};
 use infinisvm_logger::{error, info};
-use infinisvm_types::consumed_job::ConsumedJob;
-use infinisvm_types::transaction_batch_id::TransactionBatchId;
-use infinisvm_types::transaction_id::TransactionId;
+use infinisvm_types::{
+    consumed_job::ConsumedJob, transaction_batch_id::TransactionBatchId, transaction_id::TransactionId,
+};
 use solana_sdk::transaction::SanitizedTransaction;
 use solana_svm::transaction_processor::{LoadAndExecuteSanitizedTransactionsOutput, TransactionProcessingConfig};
 
-use crate::{
-    bank::Bank,
-    metrics::WorkerMetrics,
-};
+use crate::{bank::Bank, metrics::WorkerMetrics};
 
 // Global metrics instance for worker
 static WORKER_METRICS: LazyLock<WorkerMetrics> = LazyLock::new(WorkerMetrics::default);

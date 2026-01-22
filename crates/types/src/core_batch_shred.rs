@@ -1,6 +1,7 @@
-use crate::sync::{ShredId, SyncBatchShred};
-
-use crate::consumed_job::ConsumedJob;
+use crate::{
+    consumed_job::ConsumedJob,
+    sync::{ShredId, SyncBatchShred},
+};
 
 #[derive(Debug)]
 pub struct CoreBatchShred {

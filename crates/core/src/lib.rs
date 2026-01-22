@@ -2,7 +2,6 @@ pub mod bank;
 
 mod blockhash_generator;
 pub mod committer;
-pub mod quic_tx_receiver;
 pub mod s3;
 pub mod ticker;
 pub mod wal_uploader;

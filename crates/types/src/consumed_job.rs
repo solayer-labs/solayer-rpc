@@ -1,4 +1,3 @@
-use crate::{convert::JobEffectDiff, sync::JobEffects};
 use solana_hash::Hash;
 use solana_sdk::{
     account::AccountSharedData,
@@ -7,7 +6,7 @@ use solana_sdk::{
 };
 use solana_svm::transaction_processing_result::ProcessedTransaction;
 
-use crate::transaction_id::TransactionId;
+use crate::{convert::JobEffectDiff, sync::JobEffects, transaction_id::TransactionId};
 
 pub struct ConsumedJob {
     pub worker_id: usize,

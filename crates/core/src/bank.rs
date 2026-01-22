@@ -13,8 +13,9 @@ use ahash::{HashSet, HashSetExt};
 use crossbeam_channel::{Receiver, Sender};
 use dashmap::DashMap;
 use hashbrown::HashMap;
-use infinisvm_db::{merger, persistence::PersistedInMemoryDB, Database, SlotHashTimestamp};
+use infinisvm_db::{persistence::PersistedInMemoryDB, Database, SlotHashTimestamp};
 use infinisvm_logger::{info, warn};
+use infinisvm_types::consumed_job::ConsumedJob;
 use metrics::gauge;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use solana_bpf_loader_program::syscalls::{
@@ -55,7 +56,6 @@ use solana_svm::{
 };
 use solana_svm_transaction::svm_message::SVMMessage;
 
-use infinisvm_types::consumed_job::ConsumedJob;
 use crate::{
     blockhash_generator::DummyRpcBlockhashGenerator, fork_graph::EmptyForkGraph, metrics::BankMetrics,
     subscription::Notifier, wal_writer, SCHEDULER_WORKER_COUNT,
