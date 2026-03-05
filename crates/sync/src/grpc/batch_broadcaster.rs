@@ -5,7 +5,7 @@ use std::{
 
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use infinisvm_logger::info;
-use infinisvm_types::sync::{CommitBatchNotification, SyncBatchShred, SyncFinalization};
+use infinisvm_types::sync::{CommitBatchNotification, SignedFinalization, SyncBatchShred, SyncFinalization};
 use tokio::sync::broadcast;
 
 const BROADCASTER_THREADS: usize = 4; // Number of threads for broadcasting
@@ -72,6 +72,13 @@ impl TransactionBatchBroadcaster {
         self.notification_sender
             .send(notification)
             .map_err(|e| format!("Failed to send finalization to broadcaster: {e}"))
+    }
+
+    pub fn broadcast_signed_finalization(&self, finalization: SignedFinalization) -> Result<(), String> {
+        let notification = Arc::new(CommitBatchNotification::SignedFinalization(finalization));
+        self.notification_sender
+            .send(notification)
+            .map_err(|e| format!("Failed to send signed finalization to broadcaster: {e}"))
     }
 
     pub fn publish_notification(&self, notification: Arc<CommitBatchNotification>) -> Result<(), String> {

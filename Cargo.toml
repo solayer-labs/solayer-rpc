@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "bins/rpc-v2",
+    # enable on demand
 
     # instead of using wildcard, list independently
     "crates/db",
@@ -8,6 +9,7 @@ members = [
     "crates/indexer",
     "crates/jsonrpc",
     "crates/logger",
+    "crates/registry",
     "crates/retirement",
     "crates/types",
     "crates/sync",
@@ -26,31 +28,33 @@ thiserror = "1.0"
 tracing = "0.1"
 eyre = "0.6"
 bincode = "1.3.3"
+blake3 = "1.7.0"
 crossbeam-channel = "0.5.14"
 async-channel = "2.3.1"
 async-trait = "0.1.85"
 solana-pubkey = { version = "=2.2.1", default-features = false }
 solana-sdk = "=2.2.2"
-solana-program-runtime = { git = "ssh://git@github.com/solayer-labs/agave.git", rev = "6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a" }
-solana-svm = { git = "ssh://git@github.com/solayer-labs/agave.git", rev = "6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a" }
-solana-svm-transaction = { git = "ssh://git@github.com/solayer-labs/agave.git", rev = "6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a" }
-solana-bpf-loader-program = { git = "ssh://git@github.com/solayer-labs/agave.git", rev = "6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a" }
-solana-compute-budget = { git = "ssh://git@github.com/solayer-labs/agave.git", rev = "6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a" }
-solana-compute-budget-instruction = { git = "ssh://git@github.com/solayer-labs/agave.git", rev = "6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a" }
-solana-runtime = { git = "ssh://git@github.com/solayer-labs/agave.git", rev = "6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a" }
-solana-runtime-transaction = { git = "ssh://git@github.com/solayer-labs/agave.git", rev = "6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a" }
+solana-rent = "=2.2.1"
+solana-program-runtime = { git = "https://github.com/solayer-labs/agave.git", rev = "8e8488fc141309652c65c56a00492df49416c312" }
+solana-svm = { git = "https://github.com/solayer-labs/agave.git", rev = "8e8488fc141309652c65c56a00492df49416c312" }
+solana-svm-transaction = { git = "https://github.com/solayer-labs/agave.git", rev = "8e8488fc141309652c65c56a00492df49416c312" }
+solana-bpf-loader-program = { git = "https://github.com/solayer-labs/agave.git", rev = "8e8488fc141309652c65c56a00492df49416c312" }
+solana-compute-budget = { git = "https://github.com/solayer-labs/agave.git", rev = "8e8488fc141309652c65c56a00492df49416c312" }
+solana-compute-budget-instruction = { git = "https://github.com/solayer-labs/agave.git", rev = "8e8488fc141309652c65c56a00492df49416c312" }
+solana-runtime = { git = "https://github.com/solayer-labs/agave.git", rev = "8e8488fc141309652c65c56a00492df49416c312" }
+solana-runtime-transaction = { git = "https://github.com/solayer-labs/agave.git", rev = "8e8488fc141309652c65c56a00492df49416c312" }
 solana-hash = "=2.2.1"
-solana-system-program = { git = "ssh://git@github.com/solayer-labs/agave.git", rev = "6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a" }
-solana-transaction-status = { git = "ssh://git@github.com/solayer-labs/agave.git", rev = "6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a" }
-solana-transaction-status-client-types = { git = "ssh://git@github.com/solayer-labs/agave.git", rev = "6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a" }
-solana-account-decoder-client-types = { git = "ssh://git@github.com/solayer-labs/agave.git", rev = "6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a" }
-solana-account-decoder = { git = "ssh://git@github.com/solayer-labs/agave.git", rev = "6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a" }
-solana-builtins = { git = "ssh://git@github.com/solayer-labs/agave.git", rev = "6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a" }
-agave-feature-set = { git = "ssh://git@github.com/solayer-labs/agave.git", rev = "6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a" }
-solana-transaction-context = { git = "ssh://git@github.com/solayer-labs/agave.git", rev = "6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a" }
-solana-streamer = { git = "ssh://git@github.com/solayer-labs/agave.git", rev = "6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a" }
-solana-perf = { git = "ssh://git@github.com/solayer-labs/agave.git", rev = "6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a" }
-solana-fee = { git = "ssh://git@github.com/solayer-labs/agave.git", rev = "6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a" }
+solana-system-program = { git = "https://github.com/solayer-labs/agave.git", rev = "8e8488fc141309652c65c56a00492df49416c312" }
+solana-transaction-status = { git = "https://github.com/solayer-labs/agave.git", rev = "8e8488fc141309652c65c56a00492df49416c312" }
+solana-transaction-status-client-types = { git = "https://github.com/solayer-labs/agave.git", rev = "8e8488fc141309652c65c56a00492df49416c312" }
+solana-account-decoder-client-types = { git = "https://github.com/solayer-labs/agave.git", rev = "8e8488fc141309652c65c56a00492df49416c312" }
+solana-account-decoder = { git = "https://github.com/solayer-labs/agave.git", rev = "8e8488fc141309652c65c56a00492df49416c312" }
+solana-builtins = { git = "https://github.com/solayer-labs/agave.git", rev = "8e8488fc141309652c65c56a00492df49416c312" }
+agave-feature-set = { git = "https://github.com/solayer-labs/agave.git", rev = "8e8488fc141309652c65c56a00492df49416c312" }
+solana-transaction-context = { git = "https://github.com/solayer-labs/agave.git", rev = "8e8488fc141309652c65c56a00492df49416c312" }
+solana-streamer = { git = "https://github.com/solayer-labs/agave.git", rev = "8e8488fc141309652c65c56a00492df49416c312" }
+solana-perf = { git = "https://github.com/solayer-labs/agave.git", rev = "8e8488fc141309652c65c56a00492df49416c312" }
+solana-fee = { git = "https://github.com/solayer-labs/agave.git", rev = "8e8488fc141309652c65c56a00492df49416c312" }
 solana-sha256-hasher = { version = "=2.2.1" }
 
 axum = "0.8.3"
@@ -58,9 +62,6 @@ futures-core = "0.3"
 http-body-util = "0.1"
 http-body = "1.0"
 hyper = { version = "1.6", features = ["full"] }
-# Enable HTTPS for bincode client
-hyper-rustls = { version = "0.27", features = ["http2", "webpki-roots"] }
-rustls-pemfile = "2.2"
 rustls = "0.23"
 tower = "0.4"
 klickhouse = { version = "0.13", features = ["default", "bb8"] }
@@ -68,7 +69,6 @@ jsonrpsee = { version = "0.24.7", features = [
     "macros",
     "server",
     "ws-client",
-    "client-ws-transport-tls",
 ] }
 hex = "0.4.3"
 bs58 = "0.4.0"
@@ -82,6 +82,7 @@ infinisvm-jsonrpc = { path = "./crates/jsonrpc" }
 infinisvm-indexer = { path = "./crates/indexer" }
 infinisvm-core = { path = "./crates/core" }
 infinisvm-logger = { path = "./crates/logger" }
+infinisvm-registry = { path = "./crates/registry" }
 infinisvm-types = { path = "crates/types" }
 infinisvm-sync = { path = "crates/sync" }
 infinisvm-retirement = { path = "./crates/retirement" }
@@ -91,7 +92,7 @@ spl-token-2022 = "=4.0.0"
 hashbrown = "0.14.5"
 tikv-jemallocator = "0.6"
 
-tonic = { version = "0.13.1", features = ["transport", "tls-webpki-roots"] }
+tonic = { version = "0.13.1", features = ["transport"] }
 prost = "0.13.1"
 tonic-build = "0.13.1"
 tokio-stream = "0.1.17"
@@ -122,3 +123,4 @@ debug = true
 
 [patch.crates-io]
 hashbrown = { path = "./patches/hashbrown-0.14.5" }
+solana-rent = { path = "./patches/solana-rent-2.2.1" }

@@ -3,11 +3,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-use eyre::Result;
+use eyre::{eyre, Result};
 use hashbrown::HashMap;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use infinisvm_db::persistence::DBFile;
 use infinisvm_logger::{error, info, warn};
+use infinisvm_registry::{RpcPeerInfo, RpcRegisterRequest, RpcSetResponse};
 use reqwest::Client;
 use serde::Deserialize;
 use solana_sdk::{account::AccountSharedData, pubkey::Pubkey};
@@ -298,6 +299,33 @@ impl HttpClient {
 
         let bytes = response.bytes().await?;
         Ok(Some(bytes.to_vec()))
+    }
+
+    pub async fn get_rpc_set(&self) -> Result<Vec<RpcPeerInfo>> {
+        let url = format!("{}/rpc/set", self.base_url);
+        let response = self.client.get(&url).send().await?;
+        if !response.status().is_success() {
+            return Err(eyre!("get rpc set failed with status {}", response.status()));
+        }
+        let resp: RpcSetResponse = response.json().await?;
+        Ok(resp.peers)
+    }
+
+    pub async fn register_rpc_peer(&self, grpc_addr: String, score_hint: f64) -> Result<RpcPeerInfo> {
+        let url = format!("{}/rpc/register", self.base_url);
+        let request = RpcRegisterRequest { grpc_addr, score_hint };
+        let response = self.client.post(&url).json(&request).send().await?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            let body = body.trim();
+            return Err(if body.is_empty() {
+                eyre!("register rpc peer failed with status {status}")
+            } else {
+                eyre!("register rpc peer failed with status {status}: {body}")
+            });
+        }
+        Ok(response.json().await?)
     }
 }
 

@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, RwLock,
@@ -10,11 +10,12 @@ use std::{
 use crossbeam_channel::Receiver;
 use infinisvm_logger::{info, warn};
 use infinisvm_sync::grpc::TransactionBatchBroadcaster;
-use infinisvm_types::{core_batch_shred::CoreBatchShred, sync::SyncFinalization};
+use infinisvm_types::sync::{SignedFinalization, SyncBatchShred, SyncFinalization};
 use metrics::gauge;
 use rand::seq::SliceRandom;
+use solana_sdk::signature::{Keypair, Signer};
 
-use crate::wal_writer::WalWriter;
+use crate::{scheduler::core_batch_shred::CoreBatchShred, wal_writer::WalWriter};
 
 pub type PerfSample = (u64, u64, u64, u64); // slot(sampled at), num_transactions, num_slots, sample_duration
 
@@ -32,6 +33,8 @@ pub struct Committer {
     // gRPC batch broadcaster
     batch_broadcaster: Option<Vec<Arc<TransactionBatchBroadcaster>>>,
     pending_finalizations: VecDeque<SyncFinalization>,
+    pending_shred_hashes: HashMap<u64, Vec<[u8; 32]>>,
+    finalizer_signer: Option<FinalizerSigner>,
 
     // wal
     wal_writer: WalWriter,
@@ -54,6 +57,8 @@ impl Committer {
             commit_receiver,
             batch_broadcaster: None,
             pending_finalizations: VecDeque::new(),
+            pending_shred_hashes: HashMap::new(),
+            finalizer_signer: None,
             wal_writer: WalWriter::new(),
             samples,
             tx_count: Arc::new(RwLock::new((0, Instant::now()))),
@@ -63,6 +68,11 @@ impl Committer {
 
     pub fn with_batch_broadcaster(mut self, broadcaster: Vec<Arc<TransactionBatchBroadcaster>>) -> Self {
         self.batch_broadcaster = Some(broadcaster);
+        self
+    }
+
+    pub fn with_finalizer_signer(mut self, signer: FinalizerSigner) -> Self {
+        self.finalizer_signer = Some(signer);
         self
     }
 
@@ -144,6 +154,7 @@ impl Committer {
                                 .fetch_add(num_txs as u64, std::sync::atomic::Ordering::Relaxed);
 
                             let sync_batch = commit_batch.into_sync_batch_shred();
+                            self.record_shred_hash(&sync_batch);
                             if !sync_batch.effects.is_empty() {
                                 self.wal_writer
                                     .cache_slot_transactions(sync_batch.shred_id.clone(), sync_batch.effects.clone());
@@ -177,7 +188,8 @@ impl Committer {
     }
 
     fn process_pending_finalizations(&mut self) {
-        while let Some(finalization) = self.pending_finalizations.pop_front() {
+        while let Some(mut finalization) = self.pending_finalizations.pop_front() {
+            finalization.shred_hashes = self.take_shred_hashes(finalization.slot, finalization.num_shreds);
             let shreds = self.wal_writer.take_slot_transactions(finalization.slot);
             if let Err(err) = WalWriter::persist_slot(self.wal_writer.slots_path(), finalization.clone(), shreds) {
                 panic!("Failed to persist WAL for finalized slot {finalization:?}: {err}");
@@ -191,11 +203,67 @@ impl Committer {
         let slot = finalization.slot;
         info!("Broadcasting finalization for slot {}", slot);
         if let Some(ref broadcasters) = self.batch_broadcaster {
+            let signer = self
+                .finalizer_signer
+                .as_ref()
+                .expect("finalizer signer must be configured");
+            let signed = signer.sign(&finalization);
             for broadcaster in broadcasters {
-                if let Err(e) = broadcaster.broadcast_finalization(finalization.clone()) {
-                    warn!("Failed to broadcast block finalization for slot {}: {}", slot, e);
+                if let Err(e) = broadcaster.broadcast_signed_finalization(signed.clone()) {
+                    warn!("Failed to broadcast signed finalization for slot {}: {}", slot, e);
                 }
             }
+        }
+    }
+
+    fn record_shred_hash(&mut self, batch: &SyncBatchShred) {
+        let entry = self.pending_shred_hashes.entry(batch.shred_id.slot).or_default();
+        let index = batch.shred_id.index;
+        if entry.len() <= index {
+            entry.resize(index + 1, [0u8; 32]);
+        }
+        entry[index] = batch.shred_hash;
+    }
+
+    fn take_shred_hashes(&mut self, slot: u64, num_shreds: u64) -> Vec<[u8; 32]> {
+        let hashes = self.pending_shred_hashes.remove(&slot).unwrap_or_default();
+        let expected = num_shreds as usize;
+        if hashes.len() != expected {
+            panic!(
+                "shred hash list length mismatch for slot {}: expected {}, got {}",
+                slot,
+                expected,
+                hashes.len()
+            );
+        }
+        hashes
+    }
+}
+
+pub struct FinalizerSigner {
+    keypair: Keypair,
+    pubkey: [u8; 32],
+}
+
+impl FinalizerSigner {
+    pub fn new(keypair: Keypair) -> Self {
+        let pubkey = keypair.pubkey().to_bytes();
+        Self { keypair, pubkey }
+    }
+
+    pub fn pubkey_bytes(&self) -> [u8; 32] {
+        self.pubkey
+    }
+
+    pub fn sign(&self, finalization: &SyncFinalization) -> SignedFinalization {
+        let msg = bincode::serialize(finalization).expect("serialize finalization");
+        let sig = self.keypair.sign_message(&msg);
+        let mut sig_bytes = [0u8; 64];
+        sig_bytes.copy_from_slice(sig.as_ref());
+        SignedFinalization {
+            finalization: finalization.clone(),
+            sequencer_pubkey: self.pubkey,
+            signature: sig_bytes,
         }
     }
 }

@@ -122,6 +122,14 @@ impl JobEffectDiff {
         pre_accounts: &Vec<Option<AccountSharedData>>,
         transaction: &SanitizedTransaction,
     ) -> Self {
+        if details.execution_details.status.is_err() {
+            return Self::from_failed_executed_transaction(
+                &details.loaded_transaction.rollback_accounts,
+                pre_accounts,
+                transaction,
+            );
+        }
+
         let message = transaction.message();
         let mut pre_accounts_filtered = Vec::with_capacity(message.account_keys().len());
         let mut diffs = Vec::with_capacity(message.account_keys().len());
@@ -242,17 +250,92 @@ impl JobEffectDiff {
             },
         }
     }
+
+    fn from_failed_executed_transaction(
+        rollback_accounts: &RollbackAccounts,
+        pre_accounts: &[Option<AccountSharedData>],
+        transaction: &SanitizedTransaction,
+    ) -> Self {
+        let message = transaction.message();
+        let account_keys = message.account_keys();
+        let mut collected_accounts = Vec::with_capacity(rollback_accounts.count());
+        let mut diffs = Vec::with_capacity(rollback_accounts.count());
+
+        let mut collect_rollback_account = |address: &Pubkey, post_account: &AccountSharedData| {
+            let pre_account = account_keys
+                .iter()
+                .position(|key| key == address)
+                .and_then(|idx| pre_accounts.get(idx))
+                .cloned()
+                .unwrap_or(None);
+            diffs.push(AccountDataDiff::from_account(&pre_account, post_account));
+            collected_accounts.push((*address, pre_account));
+        };
+
+        let fee_payer_address = message.fee_payer();
+        match rollback_accounts {
+            RollbackAccounts::FeePayerOnly { fee_payer_account } => {
+                collect_rollback_account(fee_payer_address, fee_payer_account);
+            }
+            RollbackAccounts::SameNonceAndFeePayer { nonce } => {
+                collect_rollback_account(nonce.address(), nonce.account());
+            }
+            RollbackAccounts::SeparateNonceAndFeePayer {
+                nonce,
+                fee_payer_account,
+            } => {
+                collect_rollback_account(fee_payer_address, fee_payer_account);
+                collect_rollback_account(nonce.address(), nonce.account());
+            }
+        }
+
+        JobEffectDiff {
+            pre_accounts: collected_accounts,
+            diffs,
+            pre_balances: pre_accounts
+                .iter()
+                .map(|account| account.as_ref().map_or(0, |account| account.lamports()))
+                .collect(),
+            account_diff_ops: JobEffectAccountDiffOps::default(),
+        }
+    }
 }
 
-pub fn calculate_diff_successful_tx_for_processed_tx(
-    pre_accounts: &[(Pubkey, Option<AccountSharedData>)],
-    account_diffs: &Vec<Vec<AccountDataDiff>>,
-) -> (
+pub fn materialize_job_effect_account_updates(effect: &JobEffects) -> Vec<(Pubkey, AccountSharedData)> {
+    let mut updates = Vec::with_capacity(effect.job_effect_diff.pre_accounts.len());
+    let skip_missing_pre_accounts = effect.status.is_err();
+
+    for ((pubkey, maybe_pre), diffs) in effect
+        .job_effect_diff
+        .pre_accounts
+        .iter()
+        .zip(effect.job_effect_diff.diffs.iter())
+    {
+        if skip_missing_pre_accounts && maybe_pre.is_none() {
+            continue;
+        }
+
+        let mut account = maybe_pre.clone().unwrap_or_default();
+        for diff in diffs {
+            diff.apply_to_account(&mut account);
+        }
+        updates.push((*pubkey, account));
+    }
+
+    updates
+}
+
+pub type ProcessedTxAccountDiffOps = (
     Vec<(Pubkey, Pubkey)>,             // Account ops create
     Vec<(Pubkey, Pubkey)>,             // Account ops delete
     Vec<(Pubkey, Pubkey, u8, Pubkey)>, // Account ops mint create
     Vec<(Pubkey, Pubkey)>,             // Account ops mint delete
-) {
+);
+
+pub fn calculate_diff_successful_tx_for_processed_tx(
+    pre_accounts: &[(Pubkey, Option<AccountSharedData>)],
+    account_diffs: &Vec<Vec<AccountDataDiff>>,
+) -> ProcessedTxAccountDiffOps {
     let mut account_ops_create = Vec::with_capacity(pre_accounts.len());
     let mut account_ops_delete = Vec::with_capacity(pre_accounts.len());
     let mut account_ops_mint_create = Vec::with_capacity(pre_accounts.len());
@@ -397,4 +480,144 @@ pub fn to_signature_rows(
             ordering: ordering.to_big_int(),
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use solana_sdk::{
+        account::{AccountSharedData, ReadableAccount},
+        hash::Hash,
+        instruction::{AccountMeta, Instruction},
+        signature::Keypair,
+        signer::Signer,
+        system_program,
+        transaction::{SanitizedTransaction, Transaction, TransactionError},
+    };
+
+    use super::*;
+    use crate::sync::JobEffects;
+
+    fn build_sanitized_test_transaction() -> SanitizedTransaction {
+        let payer = Keypair::new();
+        let created_account = Pubkey::new_unique();
+        let instruction = Instruction {
+            program_id: system_program::id(),
+            accounts: vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new(created_account, false),
+            ],
+            data: vec![],
+        };
+        let transaction =
+            Transaction::new_signed_with_payer(&[instruction], Some(&payer.pubkey()), &[&payer], Hash::new_unique());
+
+        SanitizedTransaction::try_from_legacy_transaction(transaction, &HashSet::new()).unwrap()
+    }
+
+    fn build_job_effect(status: Result<(), TransactionError>, job_effect_diff: JobEffectDiff) -> JobEffects {
+        JobEffects {
+            versioned_tx: Default::default(),
+            execution_result: Ok(()),
+            job_effect_diff,
+            status,
+            log_messages: None,
+            inner_instructions: None,
+            return_data: None,
+            executed_units: 0,
+            accounts_data_len_delta: 0,
+            fee: 0,
+        }
+    }
+
+    #[test]
+    fn failed_executed_diff_uses_only_rollback_accounts() {
+        let transaction = build_sanitized_test_transaction();
+        let fee_payer = *transaction.message().fee_payer();
+        let created_account = *transaction
+            .message()
+            .account_keys()
+            .iter()
+            .find(|pubkey| **pubkey != fee_payer && **pubkey != system_program::id())
+            .unwrap();
+
+        let pre_fee_payer = AccountSharedData::new(100, 0, &system_program::id());
+        let post_fee_payer = AccountSharedData::new(90, 0, &system_program::id());
+
+        let pre_accounts = transaction
+            .message()
+            .account_keys()
+            .iter()
+            .map(|pubkey| {
+                if *pubkey == fee_payer {
+                    Some(pre_fee_payer.clone())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let diff = JobEffectDiff::from_failed_executed_transaction(
+            &RollbackAccounts::FeePayerOnly {
+                fee_payer_account: post_fee_payer.clone(),
+            },
+            &pre_accounts,
+            &transaction,
+        );
+
+        assert_eq!(diff.pre_accounts.len(), 1);
+        assert_eq!(diff.pre_accounts[0].0, fee_payer);
+        assert_eq!(diff.pre_accounts[0].1.as_ref().unwrap().lamports(), 100);
+        assert!(diff.pre_accounts.iter().all(|(pubkey, _)| *pubkey != created_account));
+        assert!(diff.account_diff_ops.account_ops_create.is_empty());
+        assert!(diff.account_diff_ops.account_ops_delete.is_empty());
+        assert_eq!(diff.pre_balances.len(), pre_accounts.len());
+    }
+
+    #[test]
+    fn materialize_updates_skips_missing_pre_accounts_for_failed_txs() {
+        let created_account = Pubkey::new_unique();
+        let owner = Pubkey::new_unique();
+        let fee_payer = Pubkey::new_unique();
+
+        let diff = JobEffectDiff {
+            pre_accounts: vec![
+                (created_account, None),
+                (fee_payer, Some(AccountSharedData::new(100, 0, &owner))),
+            ],
+            diffs: vec![
+                vec![AccountDataDiff::Owner(owner), AccountDataDiff::Lamports(1)],
+                vec![AccountDataDiff::Lamports(90)],
+            ],
+            pre_balances: vec![0, 100],
+            account_diff_ops: JobEffectAccountDiffOps::default(),
+        };
+
+        let effect = build_job_effect(Err(TransactionError::InvalidAccountIndex), diff);
+        let updates = materialize_job_effect_account_updates(&effect);
+
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].0, fee_payer);
+        assert_eq!(updates[0].1.lamports(), 90);
+    }
+
+    #[test]
+    fn materialize_updates_allows_account_creation_for_successful_txs() {
+        let created_account = Pubkey::new_unique();
+        let owner = Pubkey::new_unique();
+        let diff = JobEffectDiff {
+            pre_accounts: vec![(created_account, None)],
+            diffs: vec![vec![AccountDataDiff::Owner(owner), AccountDataDiff::Lamports(1)]],
+            pre_balances: vec![0],
+            account_diff_ops: JobEffectAccountDiffOps::default(),
+        };
+        let effect = build_job_effect(Ok(()), diff);
+
+        let updates = materialize_job_effect_account_updates(&effect);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].0, created_account);
+        assert_eq!(*updates[0].1.owner(), owner);
+        assert_eq!(updates[0].1.lamports(), 1);
+    }
 }

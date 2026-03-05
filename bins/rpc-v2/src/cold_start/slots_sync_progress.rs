@@ -73,8 +73,9 @@ impl SlotsSyncProgress {
     }
 
     /// Record the latest processed slot
-    /// Ensures that slot updates are sequential (each new slot must be exactly
-    /// one more than the previous)
+    /// Ensures that slot updates are monotonic and warns on non-sequential
+    /// progress (each new slot ideally should be exactly one more than the
+    /// previous).
     pub fn record_latest_slot(&self, slot: u64) -> Result<()> {
         let txn = self.db.begin_rw_txn()?;
         let table = txn.open_table(Some(TABLE_NAME))?;
@@ -92,6 +93,13 @@ impl SlotsSyncProgress {
         // Validate sequential update
         match current_latest {
             Some(current) => {
+                if slot <= current {
+                    error!(
+                        "Ignoring non-monotonic latest_slot update: current={}, attempted={}",
+                        current, slot
+                    );
+                    return Ok(());
+                }
                 if slot != current + 1 {
                     error!(
                         "Non-sequential slot update: expected slot {}, got slot {}",

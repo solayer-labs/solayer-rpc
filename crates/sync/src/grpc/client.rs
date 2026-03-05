@@ -1,112 +1,27 @@
 use std::{
     sync::{
         atomic::{AtomicU32, AtomicU64, Ordering},
-        Arc, Arc as StdArc,
+        Arc,
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use base64::Engine;
 use infinisvm_logger::{debug, error, info, warn};
-use infinisvm_types::sync::{CommitBatchNotification, ShredId, SyncBatchShred, SyncFinalization};
+use infinisvm_types::sync::{
+    CommitBatchNotification, GetPeerStatusRequest, PeerStatus, ShredId, SignedFinalization, SyncBatchShred,
+};
 use metrics::counter;
 use tokio::{
-    net::TcpStream,
     sync::{mpsc, RwLock},
     time::sleep,
 };
-use tokio_rustls::{rustls as rustls_conn, TlsConnector};
 use tokio_stream::StreamExt;
 use tonic::{Code, Request, Status};
 
 use crate::grpc::service::{
-    GetBatchShredRequest, GetBlockFinalizerRequest, InfiniSvmServiceClient, SubscribeTransactionBatchRequest,
+    GetBatchShredRequest, GetBlockFinalizerRequest, InfiniSvmServiceClient, InjectCommitBatchRequest,
+    InjectCommitBatchResponse, SubscribeTransactionBatchRequest,
 };
-
-#[derive(Debug)]
-struct AcceptAllServerCertVerifierConn;
-impl rustls_conn::client::danger::ServerCertVerifier for AcceptAllServerCertVerifierConn {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &rustls_conn::pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls_conn::pki_types::CertificateDer<'_>],
-        _server_name: &rustls_conn::pki_types::ServerName<'_>,
-        _ocsp: &[u8],
-        _now: rustls_conn::pki_types::UnixTime,
-    ) -> Result<rustls_conn::client::danger::ServerCertVerified, rustls_conn::Error> {
-        Ok(rustls_conn::client::danger::ServerCertVerified::assertion())
-    }
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls_conn::pki_types::CertificateDer<'_>,
-        _dss: &rustls_conn::DigitallySignedStruct,
-    ) -> Result<rustls_conn::client::danger::HandshakeSignatureValid, rustls_conn::Error> {
-        Ok(rustls_conn::client::danger::HandshakeSignatureValid::assertion())
-    }
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls_conn::pki_types::CertificateDer<'_>,
-        _dss: &rustls_conn::DigitallySignedStruct,
-    ) -> Result<rustls_conn::client::danger::HandshakeSignatureValid, rustls_conn::Error> {
-        Ok(rustls_conn::client::danger::HandshakeSignatureValid::assertion())
-    }
-    fn supported_verify_schemes(&self) -> Vec<rustls_conn::SignatureScheme> {
-        vec![rustls_conn::SignatureScheme::ED25519]
-    }
-}
-
-// Minimal DER scan to extract the Ed25519 SPKI public key (32 bytes) from an
-// X.509 cert
-fn extract_ed25519_spki_pubkey(der: &[u8]) -> Option<[u8; 32]> {
-    // Look for the OID 1.3.101.112 (ed25519): 06 03 2B 65 70
-    const OID: &[u8] = &[0x06, 0x03, 0x2B, 0x65, 0x70];
-    let mut i = 0;
-    while let Some(pos) = memchr::memmem::find(&der[i..], OID) {
-        i += pos + OID.len();
-        // After the algorithm identifier, the next BIT STRING (0x03) should be the SPKI
-        // key Scan forward up to a small window to find 0x03
-        let window = &der[i..der.len().min(i + 256)];
-        if let Some(bit_pos_rel) = window.iter().position(|b| *b == 0x03) {
-            let bit_pos = i + bit_pos_rel;
-            // Parse length
-            if bit_pos + 2 >= der.len() {
-                return None;
-            }
-            let len_byte = der[bit_pos + 1];
-            let (len, hdr) = if len_byte & 0x80 == 0 {
-                (len_byte as usize, 2usize)
-            } else {
-                let n = (len_byte & 0x7F) as usize;
-                if n == 0 || bit_pos + 2 + n > der.len() {
-                    return None;
-                }
-                let mut l: usize = 0;
-                for j in 0..n {
-                    l = (l << 8) | der[bit_pos + 2 + j] as usize;
-                }
-                (l, 2 + n)
-            };
-            if bit_pos + hdr + 1 + 32 > der.len() {
-                return None;
-            }
-            let unused_bits = der[bit_pos + hdr];
-            if unused_bits != 0 {
-                continue;
-            }
-            if len < 33 {
-                continue;
-            }
-            let start = bit_pos + hdr + 1;
-            let end = start + 32;
-            let mut out = [0u8; 32];
-            out.copy_from_slice(&der[start..end]);
-            return Some(out);
-        }
-    }
-    None
-}
 
 /// Retry configuration for gRPC operations
 #[derive(Debug, Clone)]
@@ -224,14 +139,16 @@ pub struct SyncClient {
     retry_config: RetryConfig,
     circuit_breaker: Arc<CircuitBreaker>,
     connection_url: String,
-    // If present, enables TLS with custom Ed25519 pubkey verification on the server certificate
-    allowed_server_pubkeys: Option<Vec<[u8; 32]>>,
 }
 
 impl SyncClient {
+    pub fn connection_url(&self) -> &str {
+        &self.connection_url
+    }
+
     /// Create a new SyncClient with default retry configuration
     pub async fn connect(addr: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        Self::connect_with_tls(addr, RetryConfig::default(), None, None).await
+        Self::connect_with_config(addr, RetryConfig::default()).await
     }
 
     /// Create a new SyncClient with custom retry configuration
@@ -239,47 +156,18 @@ impl SyncClient {
         addr: &str,
         retry_config: RetryConfig,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        Self::connect_with_tls(addr, retry_config, None, None).await
-    }
-
-    /// Create a new SyncClient with custom retry config and allowed server
-    /// pubkeys for TLS.
-    pub async fn connect_with_config_and_pubkeys(
-        addr: &str,
-        retry_config: RetryConfig,
-        allowed_server_pubkeys: Option<Vec<[u8; 32]>>,
-    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        Self::connect_with_tls(addr, retry_config, allowed_server_pubkeys, None).await
-    }
-
-    /// Create a new SyncClient with custom retry config, optional pubkey
-    /// pinning, and optional root CA.
-    pub async fn connect_with_tls(
-        addr: &str,
-        retry_config: RetryConfig,
-        allowed_server_pubkeys: Option<Vec<[u8; 32]>>,
-        root_ca_pem: Option<Vec<u8>>,
-    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let circuit_breaker = Arc::new(CircuitBreaker::new(
             retry_config.circuit_breaker_threshold,
             Duration::from_secs(retry_config.circuit_breaker_timeout_secs),
         ));
 
-        let client = Self::connect_with_retry(
-            addr,
-            &retry_config,
-            &circuit_breaker,
-            &allowed_server_pubkeys,
-            &root_ca_pem,
-        )
-        .await?;
+        let client = Self::connect_with_retry(addr, &retry_config, &circuit_breaker).await?;
 
         Ok(Self {
             client,
             retry_config,
             circuit_breaker,
             connection_url: addr.to_string(),
-            allowed_server_pubkeys,
         })
     }
 
@@ -288,8 +176,6 @@ impl SyncClient {
         addr: &str,
         retry_config: &RetryConfig,
         circuit_breaker: &CircuitBreaker,
-        allowed_server_pubkeys: &Option<Vec<[u8; 32]>>,
-        root_ca_pem: &Option<Vec<u8>>,
     ) -> Result<InfiniSvmServiceClient, Box<dyn std::error::Error + Send + Sync>> {
         let mut attempt = 0;
         let mut last_error: Option<String> = None;
@@ -300,7 +186,7 @@ impl SyncClient {
                 return Err("Circuit breaker is open".into());
             }
 
-            match Self::connect_once(addr, allowed_server_pubkeys, root_ca_pem).await {
+            match Self::connect_once(addr).await {
                 Ok(client) => {
                     let client = client.max_decoding_message_size(1024 * 1024 * 1024); // 1GB
                     info!("Successfully connected to gRPC server at {}", addr);
@@ -351,106 +237,15 @@ impl SyncClient {
         Err(error_msg.into())
     }
 
-    async fn connect_once(
-        addr: &str,
-        allowed_server_pubkeys: &Option<Vec<[u8; 32]>>,
-        root_ca_pem: &Option<Vec<u8>>,
-    ) -> Result<InfiniSvmServiceClient, Box<dyn std::error::Error + Send + Sync>> {
-        // Ensure rustls provider is installed
-        let _ = rustls::crypto::ring::default_provider().install_default();
-
-        info!(
-            "connect_once: addr={}, allowed_keys={}, root_ca={}",
-            addr,
-            allowed_server_pubkeys.as_ref().map(|v| v.len()).unwrap_or(0),
-            if root_ca_pem.as_ref().is_some() { "yes" } else { "no" }
-        );
-
+    async fn connect_once(addr: &str) -> Result<InfiniSvmServiceClient, Box<dyn std::error::Error + Send + Sync>> {
         let uri: http::Uri = addr.parse()?;
-        let host = uri.host().unwrap_or("localhost").to_string();
-        // Track pinned end-entity cert if we probed it for pubkey pinning
-        let mut pinned_end_entity: Option<Vec<u8>> = None;
-
-        if let Some(keys) = allowed_server_pubkeys {
-            // If no explicit CA provided, probe the server's end-entity cert and pin on
-            // SPKI
-            if root_ca_pem.is_none() {
-                let host_str = host.clone();
-                let port = uri.port_u16().unwrap_or(443);
-                info!("probing server cert via TLS to {}:{}", host_str, port);
-                let tcp = match TcpStream::connect((host_str.as_str(), port)).await {
-                    Ok(s) => s,
-                    Err(e) => {
-                        error!("TCP connect for TLS probe failed: {}", e);
-                        return Err(format!("tcp connect failed: {e}").into());
-                    }
-                };
-
-                let mut cfg = rustls_conn::ClientConfig::builder()
-                    .dangerous()
-                    .with_custom_certificate_verifier(StdArc::new(AcceptAllServerCertVerifierConn))
-                    .with_no_client_auth();
-                cfg.alpn_protocols.push(b"h2".to_vec());
-                let connector = TlsConnector::from(StdArc::new(cfg));
-                let server_name = rustls_conn::pki_types::ServerName::try_from(host_str.clone())?;
-                let tls_stream = match connector.connect(server_name, tcp).await {
-                    Ok(s) => s,
-                    Err(e) => {
-                        error!("TLS handshake probe failed: {:?}", e);
-                        return Err(format!("tls probe handshake failed: {e}").into());
-                    }
-                };
-                let (_io, session) = tls_stream.get_ref();
-                let peer_certs = session.peer_certificates().ok_or("no peer certs")?;
-                let end_entity = peer_certs.first().ok_or("empty peer certs")?;
-
-                if let Some(pk) = extract_ed25519_spki_pubkey(end_entity.as_ref()) {
-                    if !keys.contains(&pk) {
-                        error!(
-                            "server ed25519 pubkey mismatch; got={} expected_one_of={}",
-                            hex::encode(pk),
-                            keys.iter().map(hex::encode).collect::<Vec<_>>().join(",")
-                        );
-                        return Err("server ed25519 pubkey mismatch".into());
-                    }
-                    pinned_end_entity = Some(end_entity.as_ref().to_vec());
-                } else {
-                    error!("server cert missing ed25519 spki (not an Ed25519 cert)");
-                    return Err("server cert missing ed25519 spki".into());
-                }
-            }
-        }
-
         let base_uri = format!(
             "{}://{}:{}",
             uri.scheme_str().unwrap_or("http"),
             uri.host().unwrap_or("localhost"),
             uri.port_u16().unwrap_or(5005)
         );
-        // Build a lazy tonic Channel to satisfy the type parameter, but do not
-        // perform an eager handshake here. All actual RPCs use the HTTPS Hyper client.
-
-        // Provide TLS CA/pinned cert to the bincode HTTP client so it can do HTTPS
-        let ca_pem_for_bincode: Option<Vec<u8>> = if let Some(ca) = root_ca_pem {
-            Some(ca.clone())
-        } else {
-            // If we pinned the end-entity, encode to PEM for the hyper-rustls client
-            if let Some(der) = pinned_end_entity.as_ref() {
-                let b64 = base64::engine::general_purpose::STANDARD.encode(der);
-                let mut s = String::new();
-                s.push_str("-----BEGIN CERTIFICATE-----\n");
-                for chunk in b64.as_bytes().chunks(64) {
-                    s.push_str(std::str::from_utf8(chunk).unwrap());
-                    s.push('\n');
-                }
-                s.push_str("-----END CERTIFICATE-----\n");
-                Some(s.into_bytes())
-            } else {
-                None
-            }
-        };
-
-        Ok(InfiniSvmServiceClient::new(base_uri, ca_pem_for_bincode))
+        Ok(InfiniSvmServiceClient::new(base_uri))
     }
 
     /// Calculate exponential backoff with jitter
@@ -557,9 +352,26 @@ impl SyncClient {
     pub async fn get_block_finalizer(
         &mut self,
         slot: u64,
-    ) -> Result<SyncFinalization, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<SignedFinalization, Box<dyn std::error::Error + Send + Sync>> {
         let request = Request::new(GetBlockFinalizerRequest { slot });
         let result = self.client.get_block_finalizer(request).await?;
+        Ok(result.into_inner())
+    }
+
+    pub async fn get_peer_status(&mut self) -> Result<PeerStatus, Box<dyn std::error::Error + Send + Sync>> {
+        let request = Request::new(GetPeerStatusRequest {});
+        let result = self.client.get_peer_status(request).await?;
+        Ok(result.into_inner().status)
+    }
+
+    pub async fn inject_commit_batch_notification(
+        &mut self,
+        request: InjectCommitBatchRequest,
+    ) -> Result<InjectCommitBatchResponse, Box<dyn std::error::Error + Send + Sync>> {
+        let result = self
+            .client
+            .inject_commit_batch_notification(Request::new(request))
+            .await?;
         Ok(result.into_inner())
     }
 
@@ -584,12 +396,10 @@ impl SyncClient {
         let circuit_breaker_for_task = Arc::clone(&circuit_breaker);
 
         // Function to resubscribe the transactions stream on failure
-        let allowed_keys_outer = self.allowed_server_pubkeys.clone();
         let make_new_stream = move || {
-            let allowed = allowed_keys_outer.clone();
             let connection_url = connection_url.clone();
             async move {
-                match SyncClient::connect_once(&connection_url, &allowed, &None).await {
+                match SyncClient::connect_once(&connection_url).await {
                     Ok(client) => {
                         let mut client = client.max_decoding_message_size(1024 * 1024 * 1024);
                         let request = Request::new(SubscribeTransactionBatchRequest {});

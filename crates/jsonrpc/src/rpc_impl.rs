@@ -2929,7 +2929,10 @@ impl RpcServer for RpcServerState {
         config: Option<RpcAccountInfoConfig>,
     ) -> SubscriptionResult {
         let middleware = self.get_middleware();
-        let pending = pending.accept().await.unwrap();
+        let pending = match pending.accept().await {
+            Ok(pending) => pending,
+            Err(_) => return Ok(()),
+        };
         middleware.register_connection(pending.connection_id());
 
         let pubkey = verify_pubkey(&pubkey_str)?;
@@ -2957,7 +2960,10 @@ impl RpcServer for RpcServerState {
         signature_str: String,
         config: Option<RpcSignatureSubscribeConfig>,
     ) -> SubscriptionResult {
-        let pending = pending.accept().await.unwrap();
+        let pending = match pending.accept().await {
+            Ok(pending) => pending,
+            Err(_) => return Ok(()),
+        };
         let middleware = self.get_middleware();
         middleware.register_connection(pending.connection_id());
 
@@ -2999,7 +3005,10 @@ impl RpcServer for RpcServerState {
     }
 
     async fn slot_subscribe(&self, pending: PendingSubscriptionSink) -> SubscriptionResult {
-        let pending = pending.accept().await.unwrap();
+        let pending = match pending.accept().await {
+            Ok(pending) => pending,
+            Err(_) => return Ok(()),
+        };
         let mut receiver = self.subscription_processor.register_all_slots_subscription().unwrap();
         while let Ok(slot) = receiver.recv().await {
             let notif = SubscriptionMessage::from_json(&self.wrap_with_rpc_context(SlotInfo {
@@ -3037,7 +3046,10 @@ impl RpcServer for RpcServerState {
         filter: RpcBlockSubscribeFilter,
         config: Option<RpcBlockSubscribeConfig>,
     ) -> SubscriptionResult {
-        let pending = pending.accept().await.unwrap();
+        let pending = match pending.accept().await {
+            Ok(pending) => pending,
+            Err(_) => return Ok(()),
+        };
         let middleware = self.get_middleware();
         middleware.register_connection(pending.connection_id());
 
@@ -3097,7 +3109,9 @@ impl RpcServer for RpcServerState {
 
     async fn root_subscribe(&self, pending: PendingSubscriptionSink) -> SubscriptionResult {
         // infinisvm never emits a root event
-        let _ = pending.accept().await.unwrap();
+        if pending.accept().await.is_err() {
+            return Ok(());
+        }
 
         Ok(())
     }

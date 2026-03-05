@@ -8,7 +8,10 @@ use std::{
 use eyre::Result as EyreResult;
 use infinisvm_logger::{error, info};
 use infinisvm_sync::slots::{enumerate_archives_in_order, slot_directory};
-use infinisvm_types::sync::{JobEffects, ShredId, ShredIndex, SyncFinalization};
+use infinisvm_types::{
+    convert::materialize_job_effect_account_updates,
+    sync::{JobEffects, ShredId, ShredIndex, SyncFinalization},
+};
 use solana_pubkey::Pubkey;
 use solana_sdk::account::AccountSharedData;
 
@@ -251,12 +254,7 @@ fn apply_job_effects(bank: &mut Bank, effects: Vec<JobEffects>) -> EyreResult<()
 
     let mut changes: HashMap<Pubkey, AccountSharedData> = HashMap::new();
     for effect in effects {
-        let diff = effect.job_effect_diff;
-        for ((pubkey, maybe_pre), diffs) in diff.pre_accounts.into_iter().zip(diff.diffs.into_iter()) {
-            let mut account = maybe_pre.unwrap_or_default();
-            for delta in diffs {
-                delta.apply_to_account(&mut account);
-            }
+        for (pubkey, account) in materialize_job_effect_account_updates(&effect) {
             changes.insert(pubkey, account);
         }
     }

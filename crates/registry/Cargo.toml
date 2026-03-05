@@ -1,0 +1,11 @@
+[package]
+name = "infinisvm-registry"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+async-trait = { workspace = true }
+infinisvm-types = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }

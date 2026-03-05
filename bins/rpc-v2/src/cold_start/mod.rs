@@ -15,17 +15,19 @@ use hashbrown::HashMap;
 use infinisvm_core::{bank::Bank, indexer::Indexer, s3::S3FsClient, subscription::SubscriptionProcessor};
 use infinisvm_db::{db_chain::DBChain, in_memory_db::NoopDB, MemoryDB};
 use infinisvm_logger::info;
-use infinisvm_sync::{grpc::client::SyncClient, http_client::HttpClient};
-use infinisvm_types::sync::CommitBatchNotification;
+use infinisvm_sync::http_client::HttpClient;
 use metrics::{counter, histogram};
-use solana_sdk::{hash::Hash, signature::Signature};
+use solana_sdk::{hash::Hash, pubkey::Pubkey, signature::Signature};
 use tokio::{
     sync::{mpsc, Mutex},
     task::JoinHandle,
 };
 
 use self::backfill::BackfillManager;
-use crate::cold_start::{slots_sync_progress::SlotsSyncProgressRecorder, tx::spawn_tx_processors};
+use crate::{
+    cold_start::{slots_sync_progress::SlotsSyncProgressRecorder, tx::spawn_tx_processors},
+    p2p::{PeerManager, PeerNotification},
+};
 
 #[derive(Clone, Debug)]
 pub enum StartSlot {
@@ -59,15 +61,17 @@ impl std::fmt::Display for StartSlot {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn cold_start(
     http_client: Arc<HttpClient>,
-    tx_receiver: mpsc::Receiver<Arc<CommitBatchNotification>>,
+    tx_receiver: mpsc::Receiver<PeerNotification>,
     indexer: Arc<Mutex<dyn Indexer>>,
     bank: Arc<RwLock<Bank>>,
     subscription_processor: Arc<SubscriptionProcessor>,
-    refetch_pool: Arc<Vec<tokio::sync::Mutex<SyncClient>>>,
+    peer_manager: Arc<PeerManager>,
     progress_recorder: Option<SlotsSyncProgressRecorder>,
     s3_client: Option<S3FsClient>,
+    sequencer_pubkey: Pubkey,
     start_slot: StartSlot,
 ) -> Result<(Vec<JoinHandle<()>>, Arc<RwLock<DBChain<MemoryDB<NoopDB>>>>)> {
     info!("Starting cold start process");
@@ -149,6 +153,7 @@ pub async fn cold_start(
     let blockhash_to_signatures = Arc::new(RwLock::new(HashMap::<Hash, Vec<Signature>>::new()));
     let pending_batches = Arc::new(DashMap::new());
     let finalizer_refetching = Arc::new(DashSet::new());
+    let shred_sources = Arc::new(DashMap::new());
 
     let tx_handle = spawn_tx_processors(
         tx_receiver,
@@ -161,11 +166,13 @@ pub async fn cold_start(
         finalized_slots,
         finalized_timestamps,
         finalized_job_ids,
-        refetch_pool,
+        peer_manager,
         finalizer_refetching,
         blockhash_to_signatures,
         current_slot,
         pending_batches,
+        shred_sources,
+        sequencer_pubkey,
         progress_recorder.clone(),
     );
     handles.extend(tx_handle);

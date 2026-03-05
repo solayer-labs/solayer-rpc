@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 infinisvm-logger = { workspace = true }
 infinisvm-sync = { workspace = true }
+infinisvm-registry = { workspace = true }
 infinisvm-db = { workspace = true }
 infinisvm-core = { workspace = true }
 infinisvm-jsonrpc = { workspace = true }
@@ -55,6 +56,7 @@ url = "2.5.7"
 [features]
 no_index = []
 pyroscope = ["dep:pyroscope", "dep:pyroscope_pprofrs"]
+e2e = ["infinisvm-sync/e2e"]
 
 track_oom = [
     "tikv-jemallocator/profiling",

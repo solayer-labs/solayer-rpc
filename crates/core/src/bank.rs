@@ -13,9 +13,8 @@ use ahash::{HashSet, HashSetExt};
 use crossbeam_channel::{Receiver, Sender};
 use dashmap::DashMap;
 use hashbrown::HashMap;
-use infinisvm_db::{persistence::PersistedInMemoryDB, Database, SlotHashTimestamp};
+use infinisvm_db::{merger, persistence::PersistedInMemoryDB, Database, SlotHashTimestamp};
 use infinisvm_logger::{info, warn};
-use infinisvm_types::consumed_job::ConsumedJob;
 use metrics::gauge;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use solana_bpf_loader_program::syscalls::{
@@ -58,7 +57,7 @@ use solana_svm_transaction::svm_message::SVMMessage;
 
 use crate::{
     blockhash_generator::DummyRpcBlockhashGenerator, fork_graph::EmptyForkGraph, metrics::BankMetrics,
-    subscription::Notifier, wal_writer, SCHEDULER_WORKER_COUNT,
+    scheduler::consumed_job::ConsumedJob, subscription::Notifier, wal_writer, SCHEDULER_WORKER_COUNT,
 };
 
 pub fn get_feature_set() -> FeatureSet {
@@ -68,43 +67,49 @@ pub fn get_feature_set() -> FeatureSet {
 }
 
 #[cfg(feature = "devnet")]
+
 macro_rules! init_v3_program {
-    ($self:ident, $program_id_str:expr, $program_buffer_str:expr, $program_upgrade_authority_str:expr) => {{
-        // create program account
-        let program_id = Pubkey::from_str_const($program_id_str);
-        let program_account_data =
-            include_bytes!(concat!("../../../bins/genesis-generator/elf/", $program_id_str, ".bin"));
-        static_assertions::const_assert!(!include_bytes!(concat!(
-            "../../../bins/genesis-generator/elf/",
-            $program_id_str,
-            ".bin"
-        ))
-        .is_empty());
+    ($self:ident, $program_address_str:expr, $program_buffer_address_str:expr, $deployment_slot:expr, $program_upgrade_authority_address_str:expr) => {{
+        // create program account and point to program buffer
+        let program_id = Pubkey::from_str_const($program_address_str);
+        let program_buffer = Pubkey::from_str_const($program_buffer_address_str);
+        // 2u32 .. program buffer address
+        let mut program_account_data = 2u32.to_le_bytes().to_vec();
+        program_account_data.extend_from_slice(program_buffer.to_bytes().as_ref());
         let program_account = {
             let mut account = AccountSharedData::default();
             account.set_lamports(Rent::default().minimum_balance(program_account_data.len()));
             account.set_owner(Pubkey::from_str_const("BPFLoaderUpgradeab1e11111111111111111111111"));
             account.set_executable(true);
             account.set_rent_epoch(u64::MAX);
-            account.set_data_from_slice(program_account_data);
+            account.set_data_from_slice(&program_account_data);
             account
         };
         $self.db.write().unwrap().write_account(program_id, program_account);
 
         // create program buffer account
-        let program_buffer = Pubkey::from_str_const($program_buffer_str);
-
-        let program_buffer_data = include_bytes!(concat!(
+        // 3u32 .. u64 deployment slot .. 1u8 .. upgrade authority address .. elf bytes
+        let mut program_buffer_data = 3u32.to_le_bytes().to_vec();
+        let deployment_slot: u64 = $deployment_slot;
+        program_buffer_data.extend_from_slice(&deployment_slot.to_le_bytes());
+        program_buffer_data.extend_from_slice(&1u8.to_le_bytes());
+        program_buffer_data.extend_from_slice(
+            Pubkey::from_str_const($program_upgrade_authority_address_str)
+                .to_bytes()
+                .as_ref(),
+        );
+        let elf_bytes = include_bytes!(concat!(
             "../../../bins/genesis-generator/elf/",
-            $program_buffer_str,
-            ".bin"
+            $program_address_str,
+            ".so"
         ));
         static_assertions::const_assert!(!include_bytes!(concat!(
             "../../../bins/genesis-generator/elf/",
-            $program_buffer_str,
-            ".bin"
+            $program_address_str,
+            ".so"
         ))
         .is_empty());
+        program_buffer_data.extend_from_slice(elf_bytes);
 
         let program_buffer_account = {
             let mut account = AccountSharedData::default();
@@ -112,7 +117,7 @@ macro_rules! init_v3_program {
             account.set_owner(Pubkey::from_str_const("BPFLoaderUpgradeab1e11111111111111111111111"));
             account.set_executable(false);
             account.set_rent_epoch(u64::MAX);
-            account.set_data_from_slice(program_buffer_data);
+            account.set_data_from_slice(&program_buffer_data);
             account
         };
         $self
@@ -120,19 +125,6 @@ macro_rules! init_v3_program {
             .write()
             .unwrap()
             .write_account(program_buffer, program_buffer_account);
-
-        // create upgrade authority account (leave it empty)
-        let upgrade_authority = Pubkey::from_str_const($program_upgrade_authority_str);
-        let upgrade_authority_account = {
-            let mut account = AccountSharedData::default();
-            account.set_rent_epoch(u64::MAX);
-            account
-        };
-        $self
-            .db
-            .write()
-            .unwrap()
-            .write_account(upgrade_authority, upgrade_authority_account);
     }};
 }
 
@@ -201,6 +193,199 @@ pub struct Bank {
 unsafe impl Send for Bank {}
 unsafe impl Sync for Bank {}
 
+// =============================== SEQUENCER_METHODS
+impl Bank {
+    pub fn new(exit: Arc<AtomicBool>, genesis_map: BTreeMap<String, AccountSharedData>) -> Self {
+        let mut hash_generator = DummyRpcBlockhashGenerator::new();
+        let (blockhash_pruner_sender, blockhash_pruner_receiver) = crossbeam_channel::unbounded();
+        let status_cache = Arc::new(DashMap::with_capacity(42_000_000));
+
+        let status_cache_clone = status_cache.clone();
+        let exit_clone = exit.clone();
+        std::thread::Builder::new()
+            .name("blockhashPruner".to_string())
+            .spawn(move || {
+                Bank::pruner_thread(blockhash_pruner_receiver, status_cache_clone, exit_clone);
+            })
+            .unwrap();
+
+        let fork_graph = Arc::new(RwLock::new(EmptyForkGraph));
+
+        let (pdb, slot, hash, timestamp) = if cfg!(feature = "in_memory_db") {
+            let pdb = PersistedInMemoryDB::default();
+            (pdb, 0, Hash::default(), 0)
+        } else {
+            let (pdb, slot, _) = PersistedInMemoryDB::persisted_db_from_disk(true);
+            (pdb, slot + 1, hash_generator.next(), 0)
+        };
+
+        let feature_set = Arc::new(get_feature_set());
+        let transaction_processor = TransactionBatchProcessor::new_uninitialized(slot, 0);
+        transaction_processor
+            .program_cache
+            .write()
+            .unwrap()
+            .set_fork_graph(Arc::downgrade(&fork_graph));
+
+        transaction_processor
+            .program_cache
+            .write()
+            .unwrap()
+            .environments
+            .program_runtime_v1 = Arc::new(
+            create_program_runtime_environment_v1(
+                &feature_set,
+                &ComputeBudget::default(), // CHECKED
+                false,                     /* deployment */
+                false,                     /* debugging_features */
+            )
+            .unwrap(),
+        );
+
+        transaction_processor
+            .program_cache
+            .write()
+            .unwrap()
+            .environments
+            .program_runtime_v2 = Arc::new(create_program_runtime_environment_v2(
+            &ComputeBudget::default(), // CHECKED
+            false,                     /* debugging_features */
+        ));
+
+        // added: clock, rent
+        // todo:  epoch_schedule, epoch_rewards, slot_hashes, stake_history,
+        // last_restart_slot may 20: we may not need epoch_schedule,
+        // epoch_rewards, stake_history         but we may need slot_hashes,
+        // last_restart_slot
+        let sysvar_setter = |pubkey: &Pubkey, callback: &mut dyn FnMut(&[u8])| {
+            if pubkey == &Clock::id() {
+                let clock = Clock {
+                    slot,
+                    epoch: 0,
+                    epoch_start_timestamp: 0,
+                    leader_schedule_epoch: 0,
+                    unix_timestamp: timestamp as i64,
+                };
+                callback(&bincode::serialize(&clock).unwrap());
+            } else if pubkey == &EpochSchedule::id() {
+                let epoch_schedule = EpochSchedule::default();
+                callback(&bincode::serialize(&epoch_schedule).unwrap());
+            } else if pubkey == &EpochRewards::id() {
+                let epoch_rewards = EpochRewards::default();
+                callback(&bincode::serialize(&epoch_rewards).unwrap());
+            } else if pubkey == &Rent::id() {
+                let rent = Rent::default();
+                callback(&bincode::serialize(&rent).unwrap());
+            } else if pubkey == &SlotHashes::id() {
+                let slot_hashes = SlotHashes::default();
+                callback(&bincode::serialize(&slot_hashes).unwrap());
+            } else if pubkey == &StakeHistory::id() {
+                let stake_history = StakeHistory::default();
+                callback(&bincode::serialize(&stake_history).unwrap());
+            } else if pubkey == &LastRestartSlot::id() {
+                let last_restart_slot = LastRestartSlot::default();
+                callback(&bincode::serialize(&last_restart_slot).unwrap());
+            }
+        };
+
+        transaction_processor
+            .sysvar_cache_mut()
+            .fill_missing_entries(sysvar_setter);
+
+        let mut slot_blockhashes = BTreeMap::new();
+        slot_blockhashes.insert(slot, hash);
+        let previous_hashes = Arc::new(RwLock::new(VecDeque::with_capacity(150)));
+        {
+            let mut prev = previous_hashes.write().unwrap();
+            prev.push_back(hash);
+        }
+
+        let mut bank = Self {
+            db: Arc::new(RwLock::new(pdb)),
+            // 350000 tps, expire every 150 slots
+            // we need to store 21000000 txs
+            blockhash_signature_map: DashMap::with_capacity(150),
+            previous_hashes,
+            slot_blockhashes,
+            slot_hash_timestamp: (slot, hash, timestamp),
+            hash_generator,
+
+            blockhash_pruner_sender,
+            status_cache,
+            transaction_processor,
+            _feature_set: feature_set,
+            _fork_graph: fork_graph,
+            fee_structure: FeeStructure {
+                lamports_per_signature: 5000,
+                lamports_per_write_lock: 0,
+                compute_fee_bins: vec![FeeBin { limit: 1400000, fee: 0 }],
+            },
+            subscription_processor: None,
+            metrics: BankMetrics::default(),
+        };
+
+        bank.blockhash_signature_map
+            .insert(hash, HashSet::with_capacity(200_000));
+
+        for builtin in BUILTINS {
+            bank.transaction_processor.add_builtin(
+                &bank,
+                builtin.program_id,
+                builtin.name,
+                ProgramCacheEntry::new_builtin(0, builtin.name.len(), builtin.entrypoint),
+            );
+        }
+
+        if slot == 1 || cfg!(feature = "devnet") {
+            bank.init_hardcoded_accounts(genesis_map);
+        }
+
+        // Replay any WAL entries from the last confirmed slot onwards to restore state
+        if cfg!(not(feature = "in_memory_db")) {
+            let from_slot = bank.get_current_slot();
+            match wal_writer::replay(&mut bank, from_slot) {
+                Ok(applied) => {
+                    if applied > 0 {
+                        info!(
+                            "WAL replay applied {} batch files starting from slot {}",
+                            applied, from_slot
+                        );
+
+                        // IMPORTANT: advance runtime head to the slot AFTER the last replayed slot.
+                        // Otherwise Scheduler will restart from `from_slot` and re-flush/re-finalize
+                        // already-finalized slots, rewriting WAL directories.
+                        if let Some((&last_replayed_slot, _)) = bank.slot_blockhashes.iter().next_back() {
+                            let unix_timestamp = std::time::UNIX_EPOCH.elapsed().unwrap().as_secs();
+                            let next_slot = last_replayed_slot.saturating_add(1);
+                            let next_hash = bank.hash_generator.next();
+
+                            // Make sure next_slot has a staged blockhash and is present in the
+                            // blockhash window/signature map.
+                            bank.stage_blockhash(next_slot, next_hash);
+
+                            // Move the Bank head forward so Scheduler starts from next_slot.
+                            bank.slot_hash_timestamp = (next_slot, next_hash, unix_timestamp);
+
+                            // Keep processor slot roughly aligned with the bank head.
+                            bank.transaction_processor.set_slot(next_slot);
+                            bank.transaction_processor
+                                .program_cache
+                                .write()
+                                .unwrap()
+                                .latest_root_slot = next_slot;
+                        }
+                    }
+                }
+                Err(e) => warn!("WAL replay failed: {}", e),
+            }
+        }
+
+        merger::spawn(exit.clone());
+
+        bank
+    }
+}
+// =============================== END_SEQUENCER_METHODS
 
 impl Bank {
     pub fn set_db(&mut self, db: Arc<RwLock<dyn Database>>) {
@@ -346,7 +531,7 @@ impl Bank {
         }
 
         // no genesis map for slave
-        bank.init_hardcoded_accounts(std::collections::HashMap::new());
+        bank.init_hardcoded_accounts(BTreeMap::new());
 
         bank
     }
@@ -612,7 +797,6 @@ impl Bank {
             .sysvar_cache_mut()
             .set_sysvar_for_tests(&clock);
 
-        // self.transaction_processor.increment_slot();
         self.transaction_processor.set_slot(slot);
         self.transaction_processor
             .program_cache
@@ -686,7 +870,8 @@ impl Bank {
             self,
             "rp7km3qAmYb8ciKKS23v5nmyYU9dFTc5RTAyx7zQSAz",
             "4WzoXzrZBidLu1MTj26c1iyLBd7LN3Sj5HkugJ1AKVxw",
-            "SahScoe6eHCbC4a8M6BPp27bHqFVaQiDPqYpFeDCwFb"
+            1u64,
+            "GjtMGFA81gyP5FRX5skKmwKRT3VV4LdhCJLexwyM4Hjd"
         );
     }
 
@@ -763,7 +948,7 @@ impl Bank {
         self.db.write().unwrap().write_account(wsol_ata, wsol_account);
     }
 
-    fn init_hardcoded_accounts(&self, genesis_map: std::collections::HashMap<String, AccountSharedData>) {
+    fn init_hardcoded_accounts(&self, genesis_map: BTreeMap<String, AccountSharedData>) {
         self.add_precompile(&secp256k1_program::id(), b"secp256k1_program".to_vec());
         self.add_precompile(&ed25519_program::id(), b"ed25519_program".to_vec());
 

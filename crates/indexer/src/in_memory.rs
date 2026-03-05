@@ -181,19 +181,19 @@ impl Indexer for InMemoryIndexer {
         }
 
         // Keep existing block storage logic
-        let block_metadata = self.state.block.back_mut().unwrap();
-
-        if block_metadata.0.slot != slot {
-            // push a new block
-            self.state.block.push_back((
-                BlockMetadata {
-                    slot,
-                    ..Default::default()
-                },
-                batch,
-            ));
-        } else {
-            self.state.block.back_mut().unwrap().1.extend(batch);
+        match self.state.block.back_mut() {
+            Some(block_metadata) if block_metadata.0.slot == slot => {
+                block_metadata.1.extend(batch);
+            }
+            _ => {
+                self.state.block.push_back((
+                    BlockMetadata {
+                        slot,
+                        ..Default::default()
+                    },
+                    batch,
+                ));
+            }
         }
     }
 
@@ -289,53 +289,13 @@ impl RpcIndexer for InMemoryIndexer {
 
     async fn get_block_with_transactions(
         &self,
-        slot: u64,
-        offset: u64,
-        limit: u64,
+        _slot: u64,
+        _offset: u64,
+        _limit: u64,
     ) -> eyre::Result<Option<BlockWithTransactions>> {
-        todo!("@zach: rewrite");
-
-        /*
-        let block = self.state.block.iter().find(|(metadata, _)| metadata.slot == slot);
-        if let Some((metadata, inner)) = block {
-            let transactions = inner
-                .iter()
-                .skip(offset as usize)
-                .take(limit as usize)
-                .filter(|job| job.processed_transaction.is_ok())
-                .map(|job| TransactionWithMetadata {
-                    transaction: job.sanitized_transaction.to_versioned_transaction(),
-                    metadata: to_transaction_with_metadata(
-                        job.processed_transaction.as_ref().unwrap(),
-                        &job.sanitized_transaction,
-                    ),
-                    slot: job.slot,
-                    unix_timestamp_in_millis: 0,
-                    // ordering stored in SignatureRow.ordering
-                })
-                .collect();
-
-            let signatures = inner
-                .iter()
-                .skip(offset as usize)
-                .take(limit as usize)
-                .map(|job| job.sanitized_transaction.signature().to_string())
-                .collect();
-
-            Ok(Some(BlockWithTransactions {
-                slot: metadata.slot,
-                parent_blockhash: metadata.parent_blockhash.to_string(),
-                blockhash: metadata.blockhash.to_string(),
-                parent_slot: metadata.parent_slot,
-                block_unix_timestamp: metadata.block_unix_timestamp,
-                transactions,
-                signatures,
-                tx_count: 0,
-            }))
-        } else {
-            Ok(None)
-        }
-        */
+        // Transaction content/block reconstruction is not implemented for the in-memory
+        // indexer.
+        Ok(None)
     }
 
     async fn find_signatures_of_account(
@@ -351,16 +311,11 @@ impl RpcIndexer for InMemoryIndexer {
             .map(|v| v.as_slice())
             .unwrap_or(&[]);
 
-        // Create a sorted vector of references
-        let sorted_indices: Vec<usize> = (0..signatures.len()).collect();
-
-        todo!("@zach: sort by ordering");
-
         // Apply filters
-        let filtered: Vec<Signature> = sorted_indices
-            .into_iter()
+        let filtered: Vec<Signature> = signatures
+            .iter()
             .filter_map(|i| {
-                let sig_row = &signatures[i];
+                let sig_row = i;
                 let sig = Signature::try_from(sig_row.signature.as_ref()).ok()?;
 
                 // Apply time range filter
@@ -409,29 +364,10 @@ impl RpcIndexer for InMemoryIndexer {
 
     async fn get_transaction_with_metadata(
         &self,
-        signature: &Signature,
+        _signature: &Signature,
     ) -> eyre::Result<Option<TransactionWithMetadata>> {
-        todo!("rewrite");
-
-        /*
-        // First try to find in blocks (for backward compatibility and full metadata)
-        for (_, block) in self.state.block.iter() {
-            for job in block.iter() {
-                let (sanitized_transaction, slot, processed_transaction) = !("use a smaller struct");
-                if let Ok(processed_transaction) = processed_transaction {
-                    if sanitized_transaction.signature() == signature {
-                        return Ok(Some(TransactionWithMetadata {
-                            transaction: sanitized_transaction.to_versioned_transaction(),
-                            metadata: to_transaction_with_metadata(processed_transaction, sanitized_transaction),
-                            slot: *slot,
-                            unix_timestamp_in_millis: 0,
-                            // ordering already attached
-                        }));
-                    }
-                }
-            }
-        }
+        // Transaction content reconstruction is not implemented for the in-memory
+        // indexer.
         Ok(None)
-        */
     }
 }

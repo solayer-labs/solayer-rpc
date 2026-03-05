@@ -1,22 +1,35 @@
-use std::{net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{
+    net::SocketAddr,
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use axum::{
     extract::{Path, Query, State},
+    http::StatusCode,
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
     Router,
 };
 use bytes::Bytes;
 use infinisvm_logger::info;
+use infinisvm_registry::{RegistryStore, RpcPeerInfo, RpcRegisterRequest, RpcSetResponse};
 use serde::{Deserialize, Serialize};
+use solana_sdk::{hash::hashv, pubkey::Pubkey, signature::Signature};
 use tower_http::compression::CompressionLayer;
 
-use crate::slots::{self, SlotData};
+use crate::{
+    grpc::client::{RetryConfig, SyncClient},
+    slots::{self, SlotData},
+};
 
 #[derive(Clone)]
 pub struct AppState {
     pub db_path: String,
     pub slots_path: String,
+    pub rpc_registry: RegistryStore,
+    pub sequencer_pubkey: Option<Pubkey>,
 }
 
 #[derive(Serialize)]
@@ -36,8 +49,21 @@ struct BatchSlotQuery {
 }
 
 // Standalone HTTP server function
-pub async fn start_http_server(addr: SocketAddr, db_path: String, slots_path: String) -> eyre::Result<()> {
-    let app_state = Arc::new(AppState { db_path, slots_path });
+pub async fn start_http_server(
+    addr: SocketAddr,
+    db_path: String,
+    slots_path: String,
+    rpc_registry: RegistryStore,
+    sequencer_pubkey: Option<Pubkey>,
+) -> eyre::Result<()> {
+    let app_state = Arc::new(AppState {
+        db_path,
+        slots_path,
+        rpc_registry,
+        sequencer_pubkey,
+    });
+
+    seed_registry_from_env(&app_state.rpc_registry).await;
 
     let app = Router::new()
         .route("/solayer/snapshots", get(handle_snapshots))
@@ -46,6 +72,8 @@ pub async fn start_http_server(addr: SocketAddr, db_path: String, slots_path: St
         .route("/solayer/slots", get(handle_batch_slots))
         .route("/solayer/slots/{slot}/info", get(handle_slot_info))
         .route("/solayer/slots/{slot}/shards/{shard}", get(handle_slot_shard))
+        .route("/rpc/set", get(handle_rpc_set))
+        .route("/rpc/register", post(handle_rpc_register))
         .layer(CompressionLayer::new())
         .with_state(app_state);
 
@@ -55,6 +83,68 @@ pub async fn start_http_server(addr: SocketAddr, db_path: String, slots_path: St
     axum::serve(listener, app).await?;
 
     Ok(())
+}
+
+async fn seed_registry_from_env(registry: &RegistryStore) {
+    if registry.len().await > 0 {
+        return;
+    }
+    let seeds = match std::env::var("RPC_REGISTRY_SEEDS") {
+        Ok(value) => value,
+        Err(_) => return,
+    };
+    let seeds = seeds.trim();
+    if seeds.is_empty() {
+        return;
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let mut peers = Vec::new();
+    for raw in seeds.split(',') {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let normalized = normalize_seed_addr(trimmed);
+        if normalized.is_empty() {
+            continue;
+        }
+        let node_id = hashv(&[normalized.as_bytes()]).to_bytes();
+        peers.push(RpcPeerInfo {
+            node_id,
+            grpc_addr: normalized,
+            last_seen_ts: now,
+            score_hint: 0.0,
+        });
+    }
+    if !peers.is_empty() {
+        registry.set_peers(peers).await;
+    }
+}
+
+fn is_dialable_grpc_addr(addr: &str) -> bool {
+    let trimmed = addr.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let host = trimmed.split_once(':').map(|(h, _)| h).unwrap_or(trimmed).trim();
+
+    // Disallow typical bind-all hosts.
+    if host == "0.0.0.0" || host == "::" || host == "[::]" {
+        return false;
+    }
+
+    true
+}
+
+fn normalize_seed_addr(addr: &str) -> String {
+    addr.trim()
+        .trim_end_matches('/')
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .to_string()
 }
 
 // Handler for snapshots API
@@ -201,6 +291,143 @@ async fn handle_slot_shard(State(state): State<Arc<AppState>>, Path((slot, shard
             )
                 .into_response()
         }
+    }
+}
+
+async fn handle_rpc_set(State(state): State<Arc<AppState>>) -> Response {
+    let peers = state.rpc_registry.list().await;
+    axum::Json(RpcSetResponse { peers }).into_response()
+}
+
+async fn handle_rpc_register(
+    State(state): State<Arc<AppState>>,
+    axum::Json(req): axum::Json<RpcRegisterRequest>,
+) -> Response {
+    let normalized = normalize_seed_addr(&req.grpc_addr);
+    if normalized.is_empty() {
+        return (StatusCode::BAD_REQUEST, "grpc_addr is required").into_response();
+    }
+
+    if !is_dialable_grpc_addr(&normalized) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "grpc_addr must be dialable (not 0.0.0.0 / ::); set --grpc-advertise-addr",
+        )
+            .into_response();
+    }
+
+    let node_id = hashv(&[normalized.as_bytes()]).to_bytes();
+
+    if let Some(sequencer_pubkey) = state.sequencer_pubkey {
+        let timeout_ms = std::env::var("RPC_REGISTRY_REGISTER_PROBE_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(3000);
+        let probe_timeout = Duration::from_millis(timeout_ms);
+        match tokio::time::timeout(probe_timeout, probe_rpc_peer(&normalized, node_id, sequencer_pubkey)).await {
+            Ok(Ok(())) => {}
+            Ok(Err((status, message))) => {
+                infinisvm_logger::warn!(grpc_addr = normalized.as_str(), "Rejected rpc registration: {message}");
+                return (status, message).into_response();
+            }
+            Err(_) => {
+                infinisvm_logger::warn!(
+                    grpc_addr = normalized.as_str(),
+                    timeout_ms,
+                    "Rejected rpc registration: probe timed out"
+                );
+                return (StatusCode::GATEWAY_TIMEOUT, "rpc peer probe timed out").into_response();
+            }
+        }
+    }
+
+    let peer = state
+        .rpc_registry
+        .upsert_peer(node_id, normalized.clone(), req.score_hint)
+        .await;
+    info!(grpc_addr = normalized, "Registered rpc peer");
+    axum::Json(peer).into_response()
+}
+
+async fn probe_rpc_peer(
+    grpc_addr: &str,
+    expected_node_id: [u8; 32],
+    sequencer_pubkey: Pubkey,
+) -> Result<(), (StatusCode, String)> {
+    let addr = normalize_grpc_addr(grpc_addr);
+    let retry_config = RetryConfig {
+        max_retries: 0,
+        enable_circuit_breaker: false,
+        ..RetryConfig::default()
+    };
+
+    let mut client = SyncClient::connect_with_config(&addr, retry_config)
+        .await
+        .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, format!("grpc connect failed: {e}")))?;
+    let status = client
+        .get_peer_status()
+        .await
+        .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, format!("get_peer_status failed: {e}")))?;
+
+    if status.node_id != expected_node_id {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "peer status node_id does not match advertised grpc_addr".to_string(),
+        ));
+    }
+
+    let latest = status.latest_signed_finalization.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "peer not ready (no signed finalization yet)".to_string(),
+        )
+    })?;
+    let slot = latest.finalization.slot;
+
+    let signed = client.get_block_finalizer(slot).await.map_err(|e| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("get_block_finalizer({slot}) failed: {e}"),
+        )
+    })?;
+    if signed.finalization.slot != slot {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "peer returned signed finalization for slot {} (expected {slot})",
+                signed.finalization.slot
+            ),
+        ));
+    }
+    if !verify_signed_finalization(&signed, &sequencer_pubkey) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "invalid signed finalization signature".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn verify_signed_finalization(sf: &infinisvm_types::sync::SignedFinalization, sequencer_pubkey: &Pubkey) -> bool {
+    if sf.sequencer_pubkey != sequencer_pubkey.to_bytes() {
+        return false;
+    }
+    let msg = match bincode::serialize(&sf.finalization) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    let sig = Signature::from(sf.signature);
+    sig.verify(sequencer_pubkey.as_ref(), &msg)
+}
+
+fn normalize_grpc_addr(addr: &str) -> String {
+    if addr.starts_with("http://") {
+        addr.to_string()
+    } else if addr.starts_with("https://") {
+        panic!("https:// gRPC addresses are not supported: {addr}");
+    } else {
+        format!("http://{addr}")
     }
 }
 

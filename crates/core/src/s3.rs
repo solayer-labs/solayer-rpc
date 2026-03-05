@@ -295,5 +295,21 @@ async fn process_upload(client: &AmazonS3, key: String, local_path: PathBuf, dat
         }
     }
 
+    // Try to remove the parent directory if it's empty
+    if let Some(parent_dir) = local_path.parent() {
+        if let Ok(mut entries) = tokio::fs::read_dir(parent_dir).await {
+            // Check if directory is empty
+            if entries.next_entry().await?.is_none() {
+                if let Err(err) = tokio::fs::remove_dir(parent_dir).await {
+                    // Ignore errors when removing empty directory (e.g., directory not empty,
+                    // already removed)
+                    if err.kind() != std::io::ErrorKind::NotFound {
+                        warn!("Failed to remove empty directory {}: {err:#}", parent_dir.display());
+                    }
+                }
+            }
+        }
+    }
+
     Ok(())
 }

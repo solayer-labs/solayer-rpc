@@ -40,8 +40,7 @@ impl TransactionBatchSubscriber {
     async fn connect(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         info!("Connecting to gRPC server at {}", self.endpoint);
 
-        // No custom CA here; rely on webpki roots or plaintext based on endpoint scheme
-        self.client = Some(InfiniSvmServiceClient::new(self.endpoint.clone(), None));
+        self.client = Some(InfiniSvmServiceClient::new(self.endpoint.clone()));
 
         info!("Successfully connected to gRPC server");
         Ok(())

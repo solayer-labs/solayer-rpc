@@ -9,7 +9,7 @@ use std::{
 };
 
 use hashbrown::HashMap;
-use infinisvm_logger::{error, info, warn};
+use infinisvm_logger::{error, info, tracing, warn};
 use infinisvm_types::sync::SyncFinalization;
 use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
 use solana_sdk::{account::AccountSharedData, pubkey::Pubkey};
@@ -274,7 +274,7 @@ impl PersistedInMemoryDB {
         db.persisted = true;
 
         let (slot, files) = if use_wal {
-            db.load_from_disk()
+            db.load_from_disk_before_wal()
         } else {
             db.load_from_disk_no_wal()
         };
@@ -322,6 +322,7 @@ impl PersistedInMemoryDB {
         files
     }
 
+    #[tracing::instrument(skip_all)]
     pub fn load_from_disk_no_wal(&mut self) -> (u64, Vec<PathBuf>) {
         // Create DB_DIRECTORY if it doesn't exist
         if !std::path::Path::new(DB_DIRECTORY).exists() {
@@ -415,17 +416,20 @@ impl PersistedInMemoryDB {
 
         // Load accounts in parallel
         let start = Instant::now();
+        let span = tracing::Span::current();
         let loaded_accounts: Vec<_> = files_to_load
             .par_iter()
             .map(|(slot, path)| {
-                info!("Deserializing additional accounts from slot {}", slot);
-                match Self::load_accounts_from_file(path) {
-                    Ok(accounts) => Some((*slot, accounts)),
-                    Err(e) => {
-                        error!("Failed to load accounts from slot {slot}: {e:#}");
-                        None
+                span.in_scope(|| {
+                    info!("Deserializing additional accounts from slot {}", slot);
+                    match Self::load_accounts_from_file(path) {
+                        Ok(accounts) => Some((*slot, accounts)),
+                        Err(e) => {
+                            error!("Failed to load accounts from slot {slot}: {e:#}");
+                            None
+                        }
                     }
-                }
+                })
             })
             .filter_map(|x| x)
             .collect();
@@ -488,7 +492,8 @@ impl PersistedInMemoryDB {
         (loaded_latest_slot, files)
     }
 
-    pub fn load_from_disk(&mut self) -> (u64, Vec<PathBuf>) {
+    #[tracing::instrument(skip_all)]
+    pub fn load_from_disk_before_wal(&mut self) -> (u64, Vec<PathBuf>) {
         // Create DB_DIRECTORY if it doesn't exist
         if !std::path::Path::new(DB_DIRECTORY).exists() {
             std::fs::create_dir_all(DB_DIRECTORY).unwrap();
@@ -602,17 +607,20 @@ impl PersistedInMemoryDB {
 
         // Load accounts in parallel
         let start = Instant::now();
+        let span = tracing::Span::current();
         let loaded_accounts: Vec<_> = files_to_load
             .par_iter()
             .map(|(slot, path)| {
-                info!("Deserializing additional accounts from slot {}", slot);
-                match Self::load_accounts_from_file(path) {
-                    Ok(accounts) => Some((*slot, accounts)),
-                    Err(e) => {
-                        error!("Failed to load accounts from slot {slot}: {e:#}");
-                        None
+                span.in_scope(|| {
+                    info!("Deserializing additional accounts from slot {}", slot);
+                    match Self::load_accounts_from_file(path) {
+                        Ok(accounts) => Some((*slot, accounts)),
+                        Err(e) => {
+                            error!("Failed to load accounts from slot {slot}: {e:#}");
+                            None
+                        }
                     }
-                }
+                })
             })
             .filter_map(|x| x)
             .collect();
@@ -667,10 +675,7 @@ impl PersistedInMemoryDB {
             std::fs::remove_file(path).expect("Failed to remove not fully committed account file");
         }
 
-        assert!(
-            loaded_latest_slot == load_until,
-            "loaded_latest_slot {loaded_latest_slot} is not equal to load_until {load_until}",
-        );
+        info!("checkpoint at {} and state head at {}", loaded_latest_slot, load_until);
         info!("Finished loading {} accounts", self.accounts.len());
         (loaded_latest_slot, files)
     }

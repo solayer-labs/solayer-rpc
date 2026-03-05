@@ -1,11 +1,13 @@
 use std::{
-    io::BufReader,
+    net::IpAddr,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
+    time::Instant,
 };
 
 use bytes::{Buf, BufMut, Bytes};
+use dashmap::{mapref::entry::Entry, DashMap};
 use futures_core::Stream;
 use http_body::Frame;
 use http_body_util::{BodyExt, Full};
@@ -13,14 +15,17 @@ use hyper_util::{
     client::legacy::{connect::HttpConnector as LegacyHttpConnector, Client as LegacyClient},
     rt::{TokioExecutor, TokioTimer},
 };
-use infinisvm_types::sync::{CommitBatchNotification, ShredId, SyncBatchShred, SyncFinalization};
+use infinisvm_types::sync::{
+    CommitBatchNotification, GetPeerStatusRequest, GetPeerStatusResponse, ShredId, SignedFinalization, SyncBatchShred,
+};
 use metrics::counter;
-use rustls::pki_types::CertificateDer;
 use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
+use tonic::transport::server::TcpConnectInfo;
 
 pub use super::*;
 
-type HttpClient = LegacyClient<hyper_rustls::HttpsConnector<LegacyHttpConnector>, Full<Bytes>>;
+type HttpClient = LegacyClient<LegacyHttpConnector, Full<Bytes>>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubscribeTransactionBatchRequest {}
@@ -33,6 +38,76 @@ pub struct GetBatchShredRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetBlockFinalizerRequest {
     pub slot: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InjectCommitBatchRequest {
+    pub peer_id: [u8; 32],
+    pub peer_addr: String,
+    pub notification: CommitBatchNotification,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InjectCommitBatchResponse {
+    pub ok: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RateLimitConfig {
+    rate_per_sec: u32,
+    burst: u32,
+}
+
+#[derive(Debug)]
+struct RateLimiterState {
+    tokens: u32,
+    last_refill: Instant,
+}
+
+#[derive(Debug)]
+struct RateLimiter {
+    rate_per_sec: u32,
+    burst: u32,
+    state: Mutex<RateLimiterState>,
+}
+
+impl RateLimiter {
+    fn new(rate_per_sec: u32, burst: u32) -> Self {
+        let burst = burst.max(1);
+        Self {
+            rate_per_sec,
+            burst,
+            state: Mutex::new(RateLimiterState {
+                tokens: burst,
+                last_refill: Instant::now(),
+            }),
+        }
+    }
+
+    async fn allow(&self) -> bool {
+        let mut state = self.state.lock().await;
+        let now = Instant::now();
+        let elapsed = now.duration_since(state.last_refill);
+        let refill = (elapsed.as_secs_f64() * self.rate_per_sec as f64) as u32;
+        if refill > 0 {
+            state.tokens = state.tokens.saturating_add(refill).min(self.burst);
+            state.last_refill = now;
+        }
+        if state.tokens == 0 {
+            return false;
+        }
+        state.tokens -= 1;
+        true
+    }
+}
+
+fn extract_remote_ip(parts: &http::request::Parts) -> Option<IpAddr> {
+    if let Some(info) = parts.extensions.get::<TcpConnectInfo>() {
+        if let Some(addr) = info.remote_addr() {
+            return Some(addr.ip());
+        }
+    }
+    None
 }
 
 // Service trait
@@ -55,13 +130,25 @@ pub trait InfiniSvmService: Send + Sync + 'static + Clone {
     async fn get_block_finalizer(
         &self,
         request: tonic::Request<GetBlockFinalizerRequest>,
-    ) -> Result<tonic::Response<SyncFinalization>, tonic::Status>;
+    ) -> Result<tonic::Response<SignedFinalization>, tonic::Status>;
+
+    async fn get_peer_status(
+        &self,
+        request: tonic::Request<GetPeerStatusRequest>,
+    ) -> Result<tonic::Response<GetPeerStatusResponse>, tonic::Status>;
+
+    async fn inject_commit_batch_notification(
+        &self,
+        request: tonic::Request<InjectCommitBatchRequest>,
+    ) -> Result<tonic::Response<InjectCommitBatchResponse>, tonic::Status>;
 }
 
 // Server wrapper
 #[derive(Clone)]
 pub struct InfiniSvmServiceServer<T> {
     inner: T,
+    rate_limit: Option<RateLimitConfig>,
+    rate_limiters: Arc<DashMap<Option<IpAddr>, Arc<RateLimiter>>>,
 }
 
 impl<T> InfiniSvmServiceServer<T>
@@ -69,7 +156,20 @@ where
     T: InfiniSvmService,
 {
     pub fn new(inner: T) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            rate_limit: None,
+            rate_limiters: Arc::new(DashMap::new()),
+        }
+    }
+
+    pub fn with_rate_limit(mut self, rate_per_sec: u32, burst: u32) -> Self {
+        if rate_per_sec == 0 {
+            return self;
+        }
+        let burst = if burst == 0 { rate_per_sec } else { burst };
+        self.rate_limit = Some(RateLimitConfig { rate_per_sec, burst });
+        self
     }
 }
 
@@ -97,6 +197,8 @@ where
         use http_body_util::BodyExt;
 
         let inner = self.inner.clone();
+        let rate_limit = self.rate_limit;
+        let rate_limiters = self.rate_limiters.clone();
         let (parts, body) = req.into_parts();
 
         Box::pin(async move {
@@ -104,6 +206,21 @@ where
                 http::Response<http_body_util::combinators::UnsyncBoxBody<bytes::Bytes, tonic::Status>>,
                 tonic::Status,
             > = async move {
+                if let Some(rate_limit) = rate_limit {
+                    let key = extract_remote_ip(&parts);
+                    let limiter = match rate_limiters.entry(key) {
+                        Entry::Occupied(entry) => entry.get().clone(),
+                        Entry::Vacant(entry) => {
+                            let limiter = Arc::new(RateLimiter::new(rate_limit.rate_per_sec, rate_limit.burst));
+                            entry.insert(limiter.clone());
+                            limiter
+                        }
+                    };
+                    if !limiter.allow().await {
+                        counter!("grpc_server_rate_limited_total").increment(1);
+                        return Err(tonic::Status::resource_exhausted("rate limit exceeded"));
+                    }
+                }
                 // Extract the method name from the path
                 let path = parts.uri.path();
                 let method_name = path.rsplit('/').next().unwrap_or("");
@@ -242,6 +359,62 @@ where
                             .unwrap();
                         Ok(response)
                     }
+                    "GetPeerStatus" => {
+                        let request: GetPeerStatusRequest = bincode::deserialize(message_bytes)
+                            .map_err(|e| tonic::Status::internal(format!("Failed to deserialize request: {e}")))?;
+
+                        let response = inner.get_peer_status(tonic::Request::new(request)).await?;
+                        let response_data = response.into_inner();
+
+                        let serialized = bincode::serialize(&response_data)
+                            .map_err(|e| tonic::Status::internal(format!("Failed to serialize response: {e}")))?;
+
+                        let mut frame = bytes::BytesMut::with_capacity(5 + serialized.len());
+                        frame.put_u8(0);
+                        frame.put_u32(serialized.len() as u32);
+                        frame.extend_from_slice(&serialized);
+
+                        let body = http_body_util::Full::new(frame.freeze())
+                            .map_err(|_: std::convert::Infallible| tonic::Status::internal("impossible error"));
+                        let boxed_body = http_body_util::combinators::UnsyncBoxBody::new(body);
+
+                        let response = http::Response::builder()
+                            .status(200)
+                            .header("content-type", "application/grpc")
+                            .header("grpc-status", "0")
+                            .body(boxed_body)
+                            .unwrap();
+                        Ok(response)
+                    }
+                    "InjectCommitBatchNotification" => {
+                        let request: InjectCommitBatchRequest = bincode::deserialize(message_bytes)
+                            .map_err(|e| tonic::Status::internal(format!("Failed to deserialize request: {e}")))?;
+
+                        let response = inner
+                            .inject_commit_batch_notification(tonic::Request::new(request))
+                            .await?;
+                        let response_data = response.into_inner();
+
+                        let serialized = bincode::serialize(&response_data)
+                            .map_err(|e| tonic::Status::internal(format!("Failed to serialize response: {e}")))?;
+
+                        let mut frame = bytes::BytesMut::with_capacity(5 + serialized.len());
+                        frame.put_u8(0);
+                        frame.put_u32(serialized.len() as u32);
+                        frame.extend_from_slice(&serialized);
+
+                        let body = http_body_util::Full::new(frame.freeze())
+                            .map_err(|_: std::convert::Infallible| tonic::Status::internal("impossible error"));
+                        let boxed_body = http_body_util::combinators::UnsyncBoxBody::new(body);
+
+                        let response = http::Response::builder()
+                            .status(200)
+                            .header("content-type", "application/grpc")
+                            .header("grpc-status", "0")
+                            .body(boxed_body)
+                            .unwrap();
+                        Ok(response)
+                    }
                     _ => {
                         // Unknown method
                         let status = tonic::Status::unimplemented(format!("Unknown method: {method_name}"));
@@ -288,43 +461,14 @@ where
 
 // Simplified client
 pub struct InfiniSvmServiceClient {
-    // HTTPS-capable Hyper client (also supports plain HTTP)
     http_client: HttpClient,
     base_uri: String,
 }
 
 impl InfiniSvmServiceClient {
-    pub fn new(base_uri: String, tls_ca_pem: Option<Vec<u8>>) -> Self {
-        let https = match tls_ca_pem {
-            Some(ca_pem) => {
-                let mut root_store = rustls::RootCertStore::empty();
-                let mut reader = BufReader::new(&ca_pem[..]);
-                let mut parsed_any = false;
-                for cert in rustls_pemfile::certs(&mut reader).flatten() {
-                    let _ = root_store.add(cert);
-                    parsed_any = true;
-                }
-
-                if !parsed_any {
-                    let _ = root_store.add(CertificateDer::from(ca_pem));
-                }
-
-                let tls_config = rustls::ClientConfig::builder()
-                    .with_root_certificates(Arc::new(root_store))
-                    .with_no_client_auth();
-
-                hyper_rustls::HttpsConnectorBuilder::new()
-                    .with_tls_config(tls_config)
-                    .https_or_http()
-                    .enable_http2()
-                    .build()
-            }
-            None => hyper_rustls::HttpsConnectorBuilder::new()
-                .with_webpki_roots()
-                .https_or_http()
-                .enable_http2()
-                .build(),
-        };
+    pub fn new(base_uri: String) -> Self {
+        let mut connector = LegacyHttpConnector::new();
+        connector.enforce_http(false);
 
         let http_client: HttpClient = {
             let mut builder = LegacyClient::builder(TokioExecutor::new());
@@ -333,7 +477,7 @@ impl InfiniSvmServiceClient {
                 .http2_keep_alive_interval(Some(std::time::Duration::from_secs(10)))
                 .http2_keep_alive_timeout(std::time::Duration::from_secs(30))
                 .timer(TokioTimer::new());
-            builder.build(https)
+            builder.build(connector)
         };
 
         Self { http_client, base_uri }
@@ -346,11 +490,8 @@ impl InfiniSvmServiceClient {
     {
         let endpoint = tonic::transport::Endpoint::new(dst)?;
         let uri = endpoint.uri().clone();
-        let https = hyper_rustls::HttpsConnectorBuilder::new()
-            .with_webpki_roots()
-            .https_or_http()
-            .enable_http2()
-            .build();
+        let mut connector = LegacyHttpConnector::new();
+        connector.enforce_http(false);
 
         let http_client: HttpClient = {
             let mut builder = LegacyClient::builder(TokioExecutor::new());
@@ -359,7 +500,7 @@ impl InfiniSvmServiceClient {
                 .http2_keep_alive_interval(Some(std::time::Duration::from_secs(10)))
                 .http2_keep_alive_timeout(std::time::Duration::from_secs(30))
                 .timer(TokioTimer::new());
-            builder.build(https)
+            builder.build(connector)
         };
 
         // Extract base URI from the endpoint
@@ -599,7 +740,7 @@ impl InfiniSvmServiceClient {
     pub async fn get_block_finalizer(
         &mut self,
         request: impl tonic::IntoRequest<GetBlockFinalizerRequest>,
-    ) -> Result<tonic::Response<SyncFinalization>, tonic::Status> {
+    ) -> Result<tonic::Response<SignedFinalization>, tonic::Status> {
         let req = request.into_request();
         let request_data = req.into_inner();
 
@@ -670,7 +811,170 @@ impl InfiniSvmServiceClient {
             return Err(tonic::Status::internal("Response too short"));
         }
         let message_bytes = &body_bytes[5..];
-        let decoded: SyncFinalization = bincode::deserialize(message_bytes)
+        let decoded: SignedFinalization = bincode::deserialize(message_bytes)
+            .map_err(|e| tonic::Status::internal(format!("Failed to deserialize response: {e}")))?;
+
+        Ok(tonic::Response::new(decoded))
+    }
+
+    pub async fn get_peer_status(
+        &mut self,
+        request: impl tonic::IntoRequest<GetPeerStatusRequest>,
+    ) -> Result<tonic::Response<GetPeerStatusResponse>, tonic::Status> {
+        let req = request.into_request();
+        let request_data = req.into_inner();
+
+        let serialized = bincode::serialize(&request_data)
+            .map_err(|e| tonic::Status::internal(format!("Failed to serialize request: {e}")))?;
+
+        let mut frame = bytes::BytesMut::with_capacity(5 + serialized.len());
+        frame.put_u8(0);
+        frame.put_u32(serialized.len() as u32);
+        frame.extend_from_slice(&serialized);
+
+        let uri = format!("{}/infinisvm.sync.InfiniSVMService/GetPeerStatus", self.base_uri)
+            .parse::<hyper::Uri>()
+            .map_err(|e| tonic::Status::internal(format!("Failed to parse URI: {e}")))?;
+
+        let http_request = hyper::Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/grpc")
+            .header("te", "trailers")
+            .body(Full::from(frame.freeze()))
+            .map_err(|e| tonic::Status::internal(format!("Failed to build HTTP request: {e}")))?;
+
+        let mut response = self
+            .http_client
+            .request(http_request)
+            .await
+            .map_err(|e| tonic::Status::internal(format!("HTTP request failed: {e}")))?;
+
+        if response.status() != hyper::StatusCode::OK {
+            return Err(tonic::Status::internal(format!(
+                "Unexpected status: {}",
+                response.status()
+            )));
+        }
+
+        if let Some(gs) = response.headers().get("grpc-status") {
+            let code_i32 = gs.to_str().ok().and_then(|s| s.parse::<i32>().ok()).unwrap_or(2);
+            if code_i32 != 0 {
+                let msg = response
+                    .headers()
+                    .get("grpc-message")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                return Err(tonic::Status::new(tonic::Code::from_i32(code_i32), msg));
+            }
+        }
+
+        let mut body_bytes = bytes::BytesMut::new();
+        while let Some(frame) = response.body_mut().frame().await {
+            match frame {
+                Ok(frame) => {
+                    let bytes = match frame.into_data() {
+                        Ok(bytes) => bytes,
+                        Err(_) => continue,
+                    };
+                    body_bytes.extend_from_slice(&bytes);
+                }
+                Err(e) => {
+                    return Err(tonic::Status::internal(format!("Body read failed: {e}")));
+                }
+            }
+        }
+
+        let body_bytes = body_bytes.freeze();
+        if body_bytes.len() < 5 {
+            return Err(tonic::Status::internal("Response too short"));
+        }
+        let message_bytes = &body_bytes[5..];
+        let decoded: GetPeerStatusResponse = bincode::deserialize(message_bytes)
+            .map_err(|e| tonic::Status::internal(format!("Failed to deserialize response: {e}")))?;
+
+        Ok(tonic::Response::new(decoded))
+    }
+
+    pub async fn inject_commit_batch_notification(
+        &mut self,
+        request: impl tonic::IntoRequest<InjectCommitBatchRequest>,
+    ) -> Result<tonic::Response<InjectCommitBatchResponse>, tonic::Status> {
+        let req = request.into_request();
+        let request_data = req.into_inner();
+
+        let serialized = bincode::serialize(&request_data)
+            .map_err(|e| tonic::Status::internal(format!("Failed to serialize request: {e}")))?;
+
+        let mut frame = bytes::BytesMut::with_capacity(5 + serialized.len());
+        frame.put_u8(0);
+        frame.put_u32(serialized.len() as u32);
+        frame.extend_from_slice(&serialized);
+
+        let uri = format!(
+            "{}/infinisvm.sync.InfiniSVMService/InjectCommitBatchNotification",
+            self.base_uri
+        )
+        .parse::<hyper::Uri>()
+        .map_err(|e| tonic::Status::internal(format!("Failed to parse URI: {e}")))?;
+
+        let http_request = hyper::Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/grpc")
+            .header("te", "trailers")
+            .body(Full::from(frame.freeze()))
+            .map_err(|e| tonic::Status::internal(format!("Failed to build HTTP request: {e}")))?;
+
+        let mut response = self
+            .http_client
+            .request(http_request)
+            .await
+            .map_err(|e| tonic::Status::internal(format!("HTTP request failed: {e}")))?;
+
+        if response.status() != hyper::StatusCode::OK {
+            return Err(tonic::Status::internal(format!(
+                "Unexpected status: {}",
+                response.status()
+            )));
+        }
+
+        if let Some(gs) = response.headers().get("grpc-status") {
+            let code_i32 = gs.to_str().ok().and_then(|s| s.parse::<i32>().ok()).unwrap_or(2);
+            if code_i32 != 0 {
+                let msg = response
+                    .headers()
+                    .get("grpc-message")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                return Err(tonic::Status::new(tonic::Code::from_i32(code_i32), msg));
+            }
+        }
+
+        let mut body_bytes = bytes::BytesMut::new();
+        while let Some(frame) = response.body_mut().frame().await {
+            match frame {
+                Ok(frame) => {
+                    let bytes = match frame.into_data() {
+                        Ok(bytes) => bytes,
+                        Err(_) => continue,
+                    };
+                    body_bytes.extend_from_slice(&bytes);
+                }
+                Err(e) => {
+                    return Err(tonic::Status::internal(format!("Body read failed: {e}")));
+                }
+            }
+        }
+
+        let body_bytes = body_bytes.freeze();
+        if body_bytes.len() < 5 {
+            return Err(tonic::Status::internal("Response too short"));
+        }
+        let message_bytes = &body_bytes[5..];
+        let decoded: InjectCommitBatchResponse = bincode::deserialize(message_bytes)
             .map_err(|e| tonic::Status::internal(format!("Failed to deserialize response: {e}")))?;
 
         Ok(tonic::Response::new(decoded))

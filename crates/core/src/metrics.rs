@@ -12,6 +12,29 @@ pub struct BankMetrics {
     parent_blockhash_missing_last_slot: AtomicU64,
 }
 
+// =============================== SEQUENCER_METHODS
+#[derive(Debug, Default)]
+pub struct SchedulerMetrics {
+    // Transaction counts
+    total_tx_received: AtomicU64,
+    total_bench_tx_received: AtomicU64,
+    total_tx_scheduled: AtomicU64,
+    total_tx_unschedulable: AtomicU64,
+    total_tx_completed: AtomicU64,
+    total_tx_sent: AtomicU64,
+    total_tx_early_expired_receiving: AtomicU64,
+    total_bench_tx_early_expired_receiving: AtomicU64,
+    total_tx_early_expired_scheduling: AtomicU64,
+    // Batch metrics
+    total_batches_sent: AtomicU64,
+    total_empty_batches: AtomicU64,
+
+    // Queue metrics
+    current_container_size: AtomicU64,
+    current_channel_len: AtomicU64,
+}
+
+// =============================== END_SEQUENCER_METHODS
 
 impl BankMetrics {
     pub fn increase_total_tx_checked(&self, count: u64) {
@@ -58,6 +81,117 @@ impl BankMetrics {
     }
 }
 
+// =============================== SEQUENCER_METHODS
+impl SchedulerMetrics {
+    pub fn increase_total_tx_received(&self, count: u64) {
+        self.total_tx_received.fetch_add(count, Ordering::Relaxed);
+    }
+
+    pub fn increase_total_bench_tx_received(&self, count: u64) {
+        self.total_bench_tx_received.fetch_add(count, Ordering::Relaxed);
+    }
+
+    pub fn increase_total_tx_scheduled(&self, count: u64) {
+        self.total_tx_scheduled.fetch_add(count, Ordering::Relaxed);
+    }
+
+    pub fn increase_total_tx_unschedulable(&self, count: u64) {
+        self.total_tx_unschedulable.fetch_add(count, Ordering::Relaxed);
+    }
+
+    pub fn increase_total_tx_completed(&self, count: u64) {
+        self.total_tx_completed.fetch_add(count, Ordering::Relaxed);
+    }
+
+    pub fn increment_total_batches_sent(&self) {
+        self.total_batches_sent.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn increment_total_empty_batches(&self) {
+        self.total_empty_batches.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn increase_total_tx_sent(&self, count: u64) {
+        self.total_tx_sent.fetch_add(count, Ordering::Relaxed);
+    }
+
+    pub fn increase_total_tx_early_expired_receiving(&self, count: u64) {
+        self.total_tx_early_expired_receiving
+            .fetch_add(count, Ordering::Relaxed);
+    }
+
+    pub fn increase_total_bench_tx_early_expired_receiving(&self, count: u64) {
+        self.total_bench_tx_early_expired_receiving
+            .fetch_add(count, Ordering::Relaxed);
+    }
+
+    pub fn increase_total_tx_early_expired_scheduling(&self, count: u64) {
+        self.total_tx_early_expired_scheduling
+            .fetch_add(count, Ordering::Relaxed);
+    }
+
+    pub fn set_current_container_size(&self, size: u64) {
+        self.current_container_size.store(size, Ordering::Relaxed);
+    }
+
+    pub fn set_current_channel_len(&self, len: u64) {
+        self.current_channel_len.store(len, Ordering::Relaxed);
+    }
+
+    pub fn report(&self) {
+        // Total received transactions (from channel)
+        counter!("scheduler_transactions_total", "phase" => "received", "type" => "normal")
+            .absolute(self.total_tx_received.load(Ordering::Relaxed));
+
+        // Total received benchmark transactions (from channel)
+        counter!("scheduler_transactions_total", "phase" => "received", "type" => "bench")
+            .absolute(self.total_bench_tx_received.load(Ordering::Relaxed));
+
+        // Total scheduled transactions (to workers)
+        counter!("scheduler_transactions_total", "phase" => "scheduled")
+            .absolute(self.total_tx_scheduled.load(Ordering::Relaxed));
+
+        // Total unschedulable transactions (due to account lock)
+        counter!("scheduler_transactions_total", "phase" => "unschedulable")
+            .absolute(self.total_tx_unschedulable.load(Ordering::Relaxed));
+
+        // Total early expired transactions (due to time)
+        counter!("scheduler_transactions_total", "phase" => "early_expired_receiving", "type" => "normal")
+            .absolute(self.total_tx_early_expired_receiving.load(Ordering::Relaxed));
+
+        // Total early expired benchmark transactions (due to time)
+        counter!("scheduler_transactions_total", "phase" => "early_expired_receiving", "type" => "bench")
+            .absolute(self.total_bench_tx_early_expired_receiving.load(Ordering::Relaxed));
+
+        counter!("scheduler_transactions_total", "phase" => "early_expired_scheduling")
+            .absolute(self.total_tx_early_expired_scheduling.load(Ordering::Relaxed));
+
+        // Total sent transactions (to workers)
+        counter!("scheduler_transactions_total", "phase" => "sent")
+            .absolute(self.total_tx_sent.load(Ordering::Relaxed));
+
+        // Total completed transactions (callback from workers)
+        counter!("scheduler_transactions_total", "phase" => "completed")
+            .absolute(self.total_tx_completed.load(Ordering::Relaxed));
+
+        // Total batches sent (to workers)
+        counter!("scheduler_batches_total", "kind" => "sent").absolute(self.total_batches_sent.load(Ordering::Relaxed));
+
+        // Total empty batches (due to no transactions)
+        counter!("scheduler_batches_total", "kind" => "empty")
+            .absolute(self.total_empty_batches.load(Ordering::Relaxed));
+
+        // Current tx buffer size (already received; maybe scheduled, not yet processed)
+        gauge!("scheduler_queue_items", "queue" => "container")
+            .set(self.current_container_size.load(Ordering::Relaxed) as f64);
+
+        // Current receiving channel length
+        gauge!("scheduler_queue_items", "queue" => "channel")
+            .set(self.current_channel_len.load(Ordering::Relaxed) as f64);
+    }
+}
+
+// =============================== END_SEQUENCER_METHODS
 
 #[derive(Debug, Default)]
 pub struct QuicTxReceiverMetrics {

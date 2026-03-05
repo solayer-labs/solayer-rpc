@@ -72,7 +72,7 @@ dependencies = [
 [[package]]
 name = "agave-feature-set"
 version = "2.2.20"
-source = "git+ssh://git@github.com/solayer-labs/agave.git?rev=6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a#6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a"
+source = "git+https://github.com/solayer-labs/agave.git?rev=8e8488fc141309652c65c56a00492df49416c312#8e8488fc141309652c65c56a00492df49416c312"
 dependencies = [
  "ahash",
  "solana-epoch-schedule",
@@ -84,7 +84,7 @@ dependencies = [
 [[package]]
 name = "agave-precompiles"
 version = "2.2.20"
-source = "git+ssh://git@github.com/solayer-labs/agave.git?rev=6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a#6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a"
+source = "git+https://github.com/solayer-labs/agave.git?rev=8e8488fc141309652c65c56a00492df49416c312#8e8488fc141309652c65c56a00492df49416c312"
 dependencies = [
  "agave-feature-set",
  "bincode",
@@ -106,7 +106,7 @@ dependencies = [
 [[package]]
 name = "agave-reserved-account-keys"
 version = "2.2.20"
-source = "git+ssh://git@github.com/solayer-labs/agave.git?rev=6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a#6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a"
+source = "git+https://github.com/solayer-labs/agave.git?rev=8e8488fc141309652c65c56a00492df49416c312#8e8488fc141309652c65c56a00492df49416c312"
 dependencies = [
  "agave-feature-set",
  "lazy_static",
@@ -2291,7 +2291,6 @@ dependencies = [
  "http 1.3.1",
  "hyper 1.6.0",
  "hyper-util",
- "log",
  "rustls 0.23.25",
  "rustls-native-certs",
  "rustls-pki-types",
@@ -2749,6 +2748,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "infinisvm-registry"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "infinisvm-types",
+ "rand 0.8.5",
+ "serde",
+ "tokio",
+]
+
+[[package]]
 name = "infinisvm-retirement"
 version = "1.0.0"
 
@@ -2756,37 +2766,31 @@ version = "1.0.0"
 name = "infinisvm-sync"
 version = "1.0.0"
 dependencies = [
+ "async-trait",
  "axum",
- "base64 0.22.1",
  "bincode",
  "bytes",
  "crossbeam-channel",
  "dashmap",
- "ed25519-dalek",
  "eyre",
  "futures-core",
  "futures-util",
  "hashbrown 0.14.5",
- "hex",
  "http 1.3.1",
  "http-body 1.0.1",
  "http-body-util",
  "hyper 1.6.0",
- "hyper-rustls 0.27.5",
  "hyper-util",
  "indicatif",
  "infinisvm-db",
  "infinisvm-logger",
+ "infinisvm-registry",
  "infinisvm-types",
- "memchr",
  "metrics",
  "prost 0.13.5",
  "rand 0.8.5",
  "rayon",
- "rcgen",
  "reqwest 0.12.15",
- "rustls 0.23.25",
- "rustls-pemfile 2.2.0",
  "serde",
  "solana-hash",
  "solana-sdk",
@@ -2796,7 +2800,6 @@ dependencies = [
  "spl-token-2022 4.0.0",
  "tempfile",
  "tokio",
- "tokio-rustls 0.25.0",
  "tokio-stream",
  "tonic",
  "tower 0.4.13",
@@ -2812,6 +2815,7 @@ dependencies = [
  "async-trait",
  "bb8 0.9.0",
  "bincode",
+ "blake3",
  "bytes",
  "cassandra-protocol",
  "cdrs-tokio",
@@ -2823,16 +2827,14 @@ dependencies = [
  "http-body 1.0.1",
  "http-body-util",
  "hyper 1.6.0",
- "hyper-rustls 0.27.5",
  "klickhouse",
  "metrics",
  "num-bigint 0.4.6",
  "prost 0.13.5",
  "rand 0.8.5",
  "regex",
- "rustls 0.23.25",
- "rustls-pemfile 2.2.0",
  "serde",
+ "serde-big-array",
  "serde_json",
  "solana-account-decoder-client-types",
  "solana-hash",
@@ -2994,7 +2996,6 @@ version = "0.24.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "37b26c20e2178756451cfeb0661fb74c47dd5988cb7e3939de7e9241fd604d42"
 dependencies = [
- "jsonrpsee-client-transport",
  "jsonrpsee-core",
  "jsonrpsee-proc-macros",
  "jsonrpsee-server",
@@ -4719,6 +4720,7 @@ dependencies = [
  "infinisvm-indexer",
  "infinisvm-jsonrpc",
  "infinisvm-logger",
+ "infinisvm-registry",
  "infinisvm-retirement",
  "infinisvm-sync",
  "infinisvm-types",
@@ -4812,20 +4814,6 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.22.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bf4ef73721ac7bcd79b2b315da7779d8fc09718c6b3d2d1b2d94850eb8c18432"
-dependencies = [
- "log",
- "ring",
- "rustls-pki-types",
- "rustls-webpki 0.102.8",
- "subtle",
- "zeroize",
-]
-
-[[package]]
-name = "rustls"
 version = "0.23.25"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "822ee9188ac4ec04a2f0531e55d035fb2de73f18b41a63c70c2712503b6fb13c"
@@ -4913,17 +4901,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8b6275d1ee7a1cd780b64aca7726599a1dbc893b1e64144529e55c3c2f745765"
 dependencies = [
  "ring",
- "untrusted",
-]
-
-[[package]]
-name = "rustls-webpki"
-version = "0.102.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "64ca1bc8749bd4cf37b5ce386cc146580777b4e8572c7b97baf22c83f444bee9"
-dependencies = [
- "ring",
- "rustls-pki-types",
  "untrusted",
 ]
 
@@ -5315,7 +5292,7 @@ dependencies = [
 [[package]]
 name = "solana-account-decoder"
 version = "2.2.20"
-source = "git+ssh://git@github.com/solayer-labs/agave.git?rev=6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a#6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a"
+source = "git+https://github.com/solayer-labs/agave.git?rev=8e8488fc141309652c65c56a00492df49416c312#8e8488fc141309652c65c56a00492df49416c312"
 dependencies = [
  "Inflector",
  "base64 0.22.1",
@@ -5353,7 +5330,7 @@ dependencies = [
 [[package]]
 name = "solana-account-decoder-client-types"
 version = "2.2.20"
-source = "git+ssh://git@github.com/solayer-labs/agave.git?rev=6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a#6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a"
+source = "git+https://github.com/solayer-labs/agave.git?rev=8e8488fc141309652c65c56a00492df49416c312#8e8488fc141309652c65c56a00492df49416c312"
 dependencies = [
  "base64 0.22.1",
  "bs58 0.5.1",
@@ -5398,7 +5375,7 @@ dependencies = [
 [[package]]
 name = "solana-address-lookup-table-program"
 version = "2.2.20"
-source = "git+ssh://git@github.com/solayer-labs/agave.git?rev=6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a#6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a"
+source = "git+https://github.com/solayer-labs/agave.git?rev=8e8488fc141309652c65c56a00492df49416c312#8e8488fc141309652c65c56a00492df49416c312"
 dependencies = [
  "agave-feature-set",
  "bincode",
@@ -5490,7 +5467,7 @@ dependencies = [
 [[package]]
 name = "solana-bpf-loader-program"
 version = "2.2.20"
-source = "git+ssh://git@github.com/solayer-labs/agave.git?rev=6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a#6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a"
+source = "git+https://github.com/solayer-labs/agave.git?rev=8e8488fc141309652c65c56a00492df49416c312#8e8488fc141309652c65c56a00492df49416c312"
 dependencies = [
  "agave-feature-set",
  "agave-precompiles",
@@ -5538,7 +5515,7 @@ dependencies = [
 [[package]]
 name = "solana-builtins"
 version = "2.2.20"
-source = "git+ssh://git@github.com/solayer-labs/agave.git?rev=6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a#6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a"
+source = "git+https://github.com/solayer-labs/agave.git?rev=8e8488fc141309652c65c56a00492df49416c312#8e8488fc141309652c65c56a00492df49416c312"
 dependencies = [
  "agave-feature-set",
  "solana-address-lookup-table-program",
@@ -5559,7 +5536,7 @@ dependencies = [
 [[package]]
 name = "solana-builtins-default-costs"
 version = "2.2.20"
-source = "git+ssh://git@github.com/solayer-labs/agave.git?rev=6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a#6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a"
+source = "git+https://github.com/solayer-labs/agave.git?rev=8e8488fc141309652c65c56a00492df49416c312#8e8488fc141309652c65c56a00492df49416c312"
 dependencies = [
  "agave-feature-set",
  "ahash",
@@ -5636,7 +5613,7 @@ dependencies = [
 [[package]]
 name = "solana-compute-budget"
 version = "2.2.20"
-source = "git+ssh://git@github.com/solayer-labs/agave.git?rev=6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a#6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a"
+source = "git+https://github.com/solayer-labs/agave.git?rev=8e8488fc141309652c65c56a00492df49416c312#8e8488fc141309652c65c56a00492df49416c312"
 dependencies = [
  "solana-fee-structure",
  "solana-program-entrypoint",
@@ -5645,7 +5622,7 @@ dependencies = [
 [[package]]
 name = "solana-compute-budget-instruction"
 version = "2.2.20"
-source = "git+ssh://git@github.com/solayer-labs/agave.git?rev=6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a#6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a"
+source = "git+https://github.com/solayer-labs/agave.git?rev=8e8488fc141309652c65c56a00492df49416c312#8e8488fc141309652c65c56a00492df49416c312"
 dependencies = [
  "agave-feature-set",
  "log",
@@ -5678,7 +5655,7 @@ dependencies = [
 [[package]]
 name = "solana-compute-budget-program"
 version = "2.2.20"
-source = "git+ssh://git@github.com/solayer-labs/agave.git?rev=6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a#6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a"
+source = "git+https://github.com/solayer-labs/agave.git?rev=8e8488fc141309652c65c56a00492df49416c312#8e8488fc141309652c65c56a00492df49416c312"
 dependencies = [
  "qualifier_attr",
  "solana-program-runtime",
@@ -5687,7 +5664,7 @@ dependencies = [
 [[package]]
 name = "solana-config-program"
 version = "2.2.20"
-source = "git+ssh://git@github.com/solayer-labs/agave.git?rev=6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a#6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a"
+source = "git+https://github.com/solayer-labs/agave.git?rev=8e8488fc141309652c65c56a00492df49416c312#8e8488fc141309652c65c56a00492df49416c312"
 dependencies = [
  "bincode",
  "chrono",
@@ -5738,7 +5715,7 @@ dependencies = [
 [[package]]
 name = "solana-curve25519"
 version = "2.2.20"
-source = "git+ssh://git@github.com/solayer-labs/agave.git?rev=6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a#6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a"
+source = "git+https://github.com/solayer-labs/agave.git?rev=8e8488fc141309652c65c56a00492df49416c312#8e8488fc141309652c65c56a00492df49416c312"
 dependencies = [
  "bytemuck",
  "bytemuck_derive",
@@ -5894,7 +5871,7 @@ dependencies = [
 [[package]]
 name = "solana-fee"
 version = "2.2.20"
-source = "git+ssh://git@github.com/solayer-labs/agave.git?rev=6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a#6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a"
+source = "git+https://github.com/solayer-labs/agave.git?rev=8e8488fc141309652c65c56a00492df49416c312#8e8488fc141309652c65c56a00492df49416c312"
 dependencies = [
  "agave-feature-set",
  "solana-fee-structure",
@@ -6133,7 +6110,7 @@ dependencies = [
 [[package]]
 name = "solana-loader-v4-program"
 version = "2.2.20"
-source = "git+ssh://git@github.com/solayer-labs/agave.git?rev=6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a#6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a"
+source = "git+https://github.com/solayer-labs/agave.git?rev=8e8488fc141309652c65c56a00492df49416c312#8e8488fc141309652c65c56a00492df49416c312"
 dependencies = [
  "log",
  "qualifier_attr",
@@ -6158,7 +6135,7 @@ dependencies = [
 [[package]]
 name = "solana-log-collector"
 version = "2.2.20"
-source = "git+ssh://git@github.com/solayer-labs/agave.git?rev=6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a#6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a"
+source = "git+https://github.com/solayer-labs/agave.git?rev=8e8488fc141309652c65c56a00492df49416c312#8e8488fc141309652c65c56a00492df49416c312"
 dependencies = [
  "log",
 ]
@@ -6179,7 +6156,7 @@ dependencies = [
 [[package]]
 name = "solana-measure"
 version = "2.2.20"
-source = "git+ssh://git@github.com/solayer-labs/agave.git?rev=6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a#6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a"
+source = "git+https://github.com/solayer-labs/agave.git?rev=8e8488fc141309652c65c56a00492df49416c312#8e8488fc141309652c65c56a00492df49416c312"
 
 [[package]]
 name = "solana-message"
@@ -6207,7 +6184,7 @@ dependencies = [
 [[package]]
 name = "solana-metrics"
 version = "2.2.20"
-source = "git+ssh://git@github.com/solayer-labs/agave.git?rev=6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a#6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a"
+source = "git+https://github.com/solayer-labs/agave.git?rev=8e8488fc141309652c65c56a00492df49416c312#8e8488fc141309652c65c56a00492df49416c312"
 dependencies = [
  "crossbeam-channel",
  "gethostname",
@@ -6305,7 +6282,7 @@ dependencies = [
 [[package]]
 name = "solana-poseidon"
 version = "2.2.20"
-source = "git+ssh://git@github.com/solayer-labs/agave.git?rev=6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a#6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a"
+source = "git+https://github.com/solayer-labs/agave.git?rev=8e8488fc141309652c65c56a00492df49416c312#8e8488fc141309652c65c56a00492df49416c312"
 dependencies = [
  "ark-bn254",
  "light-poseidon",
@@ -6486,7 +6463,7 @@ dependencies = [
 [[package]]
 name = "solana-program-runtime"
 version = "2.2.20"
-source = "git+ssh://git@github.com/solayer-labs/agave.git?rev=6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a#6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a"
+source = "git+https://github.com/solayer-labs/agave.git?rev=8e8488fc141309652c65c56a00492df49416c312#8e8488fc141309652c65c56a00492df49416c312"
 dependencies = [
  "agave-feature-set",
  "agave-precompiles",
@@ -6562,8 +6539,6 @@ dependencies = [
 [[package]]
 name = "solana-rent"
 version = "2.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d1aea8fdea9de98ca6e8c2da5827707fb3842833521b528a713810ca685d2480"
 dependencies = [
  "serde",
  "serde_derive",
@@ -6953,7 +6928,7 @@ dependencies = [
 [[package]]
 name = "solana-stake-program"
 version = "2.2.20"
-source = "git+ssh://git@github.com/solayer-labs/agave.git?rev=6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a#6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a"
+source = "git+https://github.com/solayer-labs/agave.git?rev=8e8488fc141309652c65c56a00492df49416c312#8e8488fc141309652c65c56a00492df49416c312"
 dependencies = [
  "agave-feature-set",
  "bincode",
@@ -6981,7 +6956,7 @@ dependencies = [
 [[package]]
 name = "solana-svm"
 version = "2.2.20"
-source = "git+ssh://git@github.com/solayer-labs/agave.git?rev=6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a#6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a"
+source = "git+https://github.com/solayer-labs/agave.git?rev=8e8488fc141309652c65c56a00492df49416c312#8e8488fc141309652c65c56a00492df49416c312"
 dependencies = [
  "agave-feature-set",
  "agave-precompiles",
@@ -7027,7 +7002,7 @@ dependencies = [
 [[package]]
 name = "solana-svm-rent-collector"
 version = "2.2.20"
-source = "git+ssh://git@github.com/solayer-labs/agave.git?rev=6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a#6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a"
+source = "git+https://github.com/solayer-labs/agave.git?rev=8e8488fc141309652c65c56a00492df49416c312#8e8488fc141309652c65c56a00492df49416c312"
 dependencies = [
  "solana-sdk",
  "solana-transaction-context 2.2.20",
@@ -7036,7 +7011,7 @@ dependencies = [
 [[package]]
 name = "solana-svm-transaction"
 version = "2.2.20"
-source = "git+ssh://git@github.com/solayer-labs/agave.git?rev=6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a#6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a"
+source = "git+https://github.com/solayer-labs/agave.git?rev=8e8488fc141309652c65c56a00492df49416c312#8e8488fc141309652c65c56a00492df49416c312"
 dependencies = [
  "solana-hash",
  "solana-message",
@@ -7065,7 +7040,7 @@ dependencies = [
 [[package]]
 name = "solana-system-program"
 version = "2.2.20"
-source = "git+ssh://git@github.com/solayer-labs/agave.git?rev=6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a#6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a"
+source = "git+https://github.com/solayer-labs/agave.git?rev=8e8488fc141309652c65c56a00492df49416c312#8e8488fc141309652c65c56a00492df49416c312"
 dependencies = [
  "bincode",
  "log",
@@ -7158,7 +7133,7 @@ checksum = "6af261afb0e8c39252a04d026e3ea9c405342b08c871a2ad8aa5448e068c784c"
 [[package]]
 name = "solana-timings"
 version = "2.2.20"
-source = "git+ssh://git@github.com/solayer-labs/agave.git?rev=6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a#6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a"
+source = "git+https://github.com/solayer-labs/agave.git?rev=8e8488fc141309652c65c56a00492df49416c312#8e8488fc141309652c65c56a00492df49416c312"
 dependencies = [
  "eager",
  "enum-iterator",
@@ -7212,7 +7187,7 @@ dependencies = [
 [[package]]
 name = "solana-transaction-context"
 version = "2.2.20"
-source = "git+ssh://git@github.com/solayer-labs/agave.git?rev=6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a#6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a"
+source = "git+https://github.com/solayer-labs/agave.git?rev=8e8488fc141309652c65c56a00492df49416c312#8e8488fc141309652c65c56a00492df49416c312"
 dependencies = [
  "bincode",
  "serde",
@@ -7239,7 +7214,7 @@ dependencies = [
 [[package]]
 name = "solana-transaction-status"
 version = "2.2.20"
-source = "git+ssh://git@github.com/solayer-labs/agave.git?rev=6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a#6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a"
+source = "git+https://github.com/solayer-labs/agave.git?rev=8e8488fc141309652c65c56a00492df49416c312#8e8488fc141309652c65c56a00492df49416c312"
 dependencies = [
  "Inflector",
  "agave-reserved-account-keys",
@@ -7280,7 +7255,7 @@ dependencies = [
 [[package]]
 name = "solana-transaction-status-client-types"
 version = "2.2.20"
-source = "git+ssh://git@github.com/solayer-labs/agave.git?rev=6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a#6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a"
+source = "git+https://github.com/solayer-labs/agave.git?rev=8e8488fc141309652c65c56a00492df49416c312#8e8488fc141309652c65c56a00492df49416c312"
 dependencies = [
  "base64 0.22.1",
  "bincode",
@@ -7302,7 +7277,7 @@ dependencies = [
 [[package]]
 name = "solana-type-overrides"
 version = "2.2.20"
-source = "git+ssh://git@github.com/solayer-labs/agave.git?rev=6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a#6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a"
+source = "git+https://github.com/solayer-labs/agave.git?rev=8e8488fc141309652c65c56a00492df49416c312#8e8488fc141309652c65c56a00492df49416c312"
 dependencies = [
  "lazy_static",
  "rand 0.8.5",
@@ -7341,7 +7316,7 @@ dependencies = [
 [[package]]
 name = "solana-vote-program"
 version = "2.2.20"
-source = "git+ssh://git@github.com/solayer-labs/agave.git?rev=6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a#6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a"
+source = "git+https://github.com/solayer-labs/agave.git?rev=8e8488fc141309652c65c56a00492df49416c312#8e8488fc141309652c65c56a00492df49416c312"
 dependencies = [
  "agave-feature-set",
  "bincode",
@@ -7373,7 +7348,7 @@ dependencies = [
 [[package]]
 name = "solana-zk-elgamal-proof-program"
 version = "2.2.20"
-source = "git+ssh://git@github.com/solayer-labs/agave.git?rev=6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a#6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a"
+source = "git+https://github.com/solayer-labs/agave.git?rev=8e8488fc141309652c65c56a00492df49416c312#8e8488fc141309652c65c56a00492df49416c312"
 dependencies = [
  "agave-feature-set",
  "bytemuck",
@@ -7426,7 +7401,7 @@ dependencies = [
 [[package]]
 name = "solana-zk-sdk"
 version = "2.2.20"
-source = "git+ssh://git@github.com/solayer-labs/agave.git?rev=6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a#6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a"
+source = "git+https://github.com/solayer-labs/agave.git?rev=8e8488fc141309652c65c56a00492df49416c312#8e8488fc141309652c65c56a00492df49416c312"
 dependencies = [
  "aes-gcm-siv",
  "base64 0.22.1",
@@ -7462,7 +7437,7 @@ dependencies = [
 [[package]]
 name = "solana-zk-token-proof-program"
 version = "2.2.20"
-source = "git+ssh://git@github.com/solayer-labs/agave.git?rev=6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a#6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a"
+source = "git+https://github.com/solayer-labs/agave.git?rev=8e8488fc141309652c65c56a00492df49416c312#8e8488fc141309652c65c56a00492df49416c312"
 dependencies = [
  "agave-feature-set",
  "bytemuck",
@@ -7514,7 +7489,7 @@ dependencies = [
 [[package]]
 name = "solana-zk-token-sdk"
 version = "2.2.20"
-source = "git+ssh://git@github.com/solayer-labs/agave.git?rev=6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a#6a7b6c2aa10f22db7914f9212ca9cf6080bbca8a"
+source = "git+https://github.com/solayer-labs/agave.git?rev=8e8488fc141309652c65c56a00492df49416c312#8e8488fc141309652c65c56a00492df49416c312"
 dependencies = [
  "aes-gcm-siv",
  "base64 0.22.1",
@@ -8460,17 +8435,6 @@ dependencies = [
 
 [[package]]
 name = "tokio-rustls"
-version = "0.25.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "775e0c0f0adb3a2f22a00c4745d728b479985fc15ee7ca6a2608388c5569860f"
-dependencies = [
- "rustls 0.22.4",
- "rustls-pki-types",
- "tokio",
-]
-
-[[package]]
-name = "tokio-rustls"
 version = "0.26.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8e727b36a1a0e8b74c376ac2211e40c2c8af09fb4013c60d910495810f008e9b"
@@ -8553,13 +8517,11 @@ dependencies = [
  "prost 0.13.5",
  "socket2",
  "tokio",
- "tokio-rustls 0.26.2",
  "tokio-stream",
  "tower 0.5.2",
  "tower-layer",
  "tower-service",
  "tracing",
- "webpki-roots 0.26.11",
 ]
 
 [[package]]
