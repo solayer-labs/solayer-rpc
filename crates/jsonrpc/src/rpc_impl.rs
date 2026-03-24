@@ -1,7 +1,10 @@
 use std::{borrow::Cow, collections::HashMap, io::Write, str::FromStr, sync::atomic::Ordering};
 
 use base64::{engine::general_purpose::STANDARD as b64, Engine};
-use infinisvm_core::bank::{get_feature_set, TransactionStatus};
+use infinisvm_core::{
+    bank::{get_feature_set, TransactionStatus},
+    BLOCK_TIME_MS,
+};
 use infinisvm_types::{BlockWithTransactions, SignatureFilters, TransactionWithMetadata};
 use jsonrpsee::{
     core::{async_trait, RpcResult, SubscriptionResult},
@@ -50,6 +53,8 @@ use crate::rpc_state::{RpcBank, RpcServerState};
 // TODO: Consider increasing this limit in the future if needed (currently set
 // to 10,000 for safety)
 pub const MAX_TOKEN_ACCOUNTS_QUERY_LIMIT: usize = 10_000;
+
+pub const METAPLEX_METADATA_PROGRAM_ID: Pubkey = Pubkey::from_str_const("metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s");
 
 pub fn deserialize_checked(input: &[u8]) -> Option<VersionedTransaction> {
     match limited_deserialize::<VersionedTransaction>(input) {
@@ -1287,6 +1292,17 @@ pub struct EncodedConfirmedTransactionWithStatusMeta {
     pub block_time: Option<i64>,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcTokenMetadata {
+    pub name: String,
+    pub symbol: String,
+    pub uri: String,
+    pub is_bridged: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub solana_mint: Option<String>,
+}
+
 #[rpc(server)]
 pub trait Rpc {
     #[method(name = "getVersion")]
@@ -1471,6 +1487,9 @@ pub trait Rpc {
 
     #[method(name = "requestAirdrop")]
     async fn request_airdrop(&self, pubkey_str: String, lamports: u64) -> RpcResult<String>;
+
+    #[method(name = "getTokenMetadata")]
+    async fn get_token_metadata(&self, mint_str: String) -> RpcResult<RpcResponse<Option<RpcTokenMetadata>>>;
 
     /////// BEGIN WeBSocket RPC ///////
 
@@ -1692,6 +1711,42 @@ pub fn to_ui_block(config: Option<RpcBlockConfig>, block_data: BlockWithTransact
     })
 }
 
+fn find_metadata_pda(mint: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(
+        &[b"metadata", METAPLEX_METADATA_PROGRAM_ID.as_ref(), mint.as_ref()],
+        &METAPLEX_METADATA_PROGRAM_ID,
+    )
+    .0
+}
+
+fn find_token_info_pda(mint: &Pubkey, bridge_handler: &Pubkey, bridge_program_id: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(
+        &[b"token_info", bridge_handler.as_ref(), mint.as_ref()],
+        bridge_program_id,
+    )
+    .0
+}
+
+fn decode_metadata_account(data: &[u8]) -> Option<(String, String, String)> {
+    let metadata = mpl_token_metadata::accounts::Metadata::safe_deserialize(data).ok()?;
+    Some((
+        metadata.name.trim_end_matches('\0').to_string(),
+        metadata.symbol.trim_end_matches('\0').to_string(),
+        metadata.uri.trim_end_matches('\0').to_string(),
+    ))
+}
+
+/// Decode an Anchor TokenInfo account to extract the `solana_mint` field.
+///
+/// Layout: discriminator (8) | bump: u8 (1) | solana_mint: Pubkey (32) | ...
+fn decode_token_info_solana_mint(data: &[u8]) -> Option<Pubkey> {
+    if data.len() < 8 + 1 + 32 {
+        return None;
+    }
+    let bytes: [u8; 32] = data[9..41].try_into().ok()?;
+    Some(Pubkey::new_from_array(bytes))
+}
+
 #[async_trait]
 impl RpcServer for RpcServerState {
     fn get_version(&self) -> RpcResult<RpcVersionInfo> {
@@ -1784,9 +1839,9 @@ impl RpcServer for RpcServerState {
         let diff = slot.abs_diff(current_slot);
 
         Ok(Some(if slot > current_slot {
-            (timestamp * 1000 + diff * 400) / 1000
+            (timestamp * 1000 + diff * BLOCK_TIME_MS) / 1000
         } else {
-            (timestamp * 1000 - diff * 400) / 1000
+            (timestamp * 1000 - diff * BLOCK_TIME_MS) / 1000
         }))
     }
 
@@ -1986,7 +2041,12 @@ impl RpcServer for RpcServerState {
             return Err(err);
         }
 
-        let _ = self.try_forward_to("sendTransaction", json!([data, config])).await;
+        if self.forward_to.is_some() {
+            return match self.try_forward_to("sendTransaction", json!([data, config])).await {
+                Ok(response) => forwarded_string_result("sendTransaction", response),
+                Err(err) => Err(RpcCustomError::ForwardingError(err.to_string()).into()),
+            };
+        }
 
         self.tx_service.send_transaction(versioned_transaction).map_err(|e| {
             error!("send_transaction error: {:?}", e);
@@ -2912,13 +2972,94 @@ impl RpcServer for RpcServerState {
                 .try_forward_to("requestAirdrop", json!([pubkey_str, lamports]))
                 .await
             {
-                Ok(r) => Ok(r.get("result").and_then(|v| v.as_str()).unwrap_or_default().to_string()),
+                Ok(response) => forwarded_string_result("requestAirdrop", response),
                 Err(e) => Err(RpcCustomError::ForwardingError(e.to_string()).into()),
             }
         } else {
             self.tx_service
                 .request_airdrop(&pubkey, recent_hash, lamports)
                 .map_err(|_| ErrorCode::InternalError.into())
+        }
+    }
+
+    async fn get_token_metadata(&self, mint_str: String) -> RpcResult<RpcResponse<Option<RpcTokenMetadata>>> {
+        counter!("rpc", "method" => "getTokenMetadata").increment(1);
+        let slot = self.get_current_slot()?;
+        let mint = verify_pubkey(&mint_str)?;
+
+        let db_guard = self.db.read().map_err(|e| {
+            error!("get_token_metadata error: {:?}", e);
+            ErrorCode::InternalError
+        })?;
+
+        let mint_account = match db_guard.get_account(mint).map_err(|e| {
+            error!("get_token_metadata error: {:?}", e);
+            ErrorCode::InternalError
+        })? {
+            Some(account) => account,
+            None => {
+                return Ok(RpcResponse {
+                    context: RpcResponseContext { slot },
+                    value: None,
+                })
+            }
+        };
+
+        let is_bridged = self
+            .bridge_handler
+            .map_or(false, |handler| mint_account.owner() == &handler);
+
+        if !is_bridged && mint_account.owner() != &spl_token::id() && mint_account.owner() != &spl_token_2022::id() {
+            return Err(invalid_params_error("Account is not a token mint"));
+        }
+
+        if is_bridged {
+            let bridge_handler = self.bridge_handler.unwrap();
+            let bridge_program_id = self
+                .bridge_program_id
+                .ok_or_else(|| invalid_params_error("Bridge program ID not configured"))?;
+
+            let token_info_pda = find_token_info_pda(&mint, &bridge_handler, &bridge_program_id);
+            let token_info_account = db_guard
+                .get_account(token_info_pda)
+                .map_err(|e| {
+                    error!("get_token_metadata error: {:?}", e);
+                    ErrorCode::InternalError
+                })?
+                .ok_or_else(|| invalid_params_error("TokenInfo account not found for bridged token"))?;
+
+            let solana_mint = decode_token_info_solana_mint(token_info_account.data())
+                .ok_or_else(|| invalid_params_error("Failed to decode TokenInfo account"))?;
+
+            Ok(RpcResponse {
+                context: RpcResponseContext { slot },
+                value: Some(RpcTokenMetadata {
+                    name: String::new(),
+                    symbol: String::new(),
+                    uri: String::new(),
+                    is_bridged: true,
+                    solana_mint: Some(solana_mint.to_string()),
+                }),
+            })
+        } else {
+            let metadata_pda = find_metadata_pda(&mint);
+            let (name, symbol, uri) = db_guard
+                .get_account(metadata_pda)
+                .ok()
+                .flatten()
+                .and_then(|acct| decode_metadata_account(acct.data()))
+                .unwrap_or_default();
+
+            Ok(RpcResponse {
+                context: RpcResponseContext { slot },
+                value: Some(RpcTokenMetadata {
+                    name,
+                    symbol,
+                    uri,
+                    is_bridged: false,
+                    solana_mint: None,
+                }),
+            })
         }
     }
 
@@ -3147,6 +3288,23 @@ fn handle_simulation_err(tx_err: &TransactionError) -> String {
     }
 }
 
+fn forwarded_string_result(method: &str, response: serde_json::Value) -> RpcResult<String> {
+    if let Some(error) = response.get("error") {
+        return match serde_json::from_value::<ErrorObjectOwned>(error.clone()) {
+            Ok(error) => Err(error),
+            Err(err) => {
+                Err(RpcCustomError::ForwardingError(format!("Failed to parse forwarded {method} error: {err}")).into())
+            }
+        };
+    }
+
+    response
+        .get("result")
+        .and_then(|value| value.as_str())
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| RpcCustomError::ForwardingError(format!("Failed to parse forwarded {method} response")).into())
+}
+
 pub fn to_transaction_with_metadata(
     processed_transaction: &ProcessedTransaction,
     sanitized_transaction: &SanitizedTransaction,
@@ -3213,4 +3371,43 @@ pub fn to_encoded_confirmed_transaction_with_status_meta(
         transaction: encoded_transaction_with_status_meta,
         block_time: Some(block_time as i64),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use jsonrpsee::types::{error::ErrorCode, ErrorObjectOwned};
+    use serde_json::json;
+
+    use super::forwarded_string_result;
+
+    #[test]
+    fn forwarded_string_result_returns_result_field() {
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": "abc123",
+        });
+
+        assert_eq!(
+            forwarded_string_result("sendTransaction", response).expect("result"),
+            "abc123"
+        );
+    }
+
+    #[test]
+    fn forwarded_string_result_preserves_forwarded_error() {
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": ErrorObjectOwned::owned(
+                ErrorCode::InvalidParams.code(),
+                "bad params",
+                None::<()>,
+            ),
+        });
+
+        let err = forwarded_string_result("sendTransaction", response).expect_err("forwarded error");
+        assert_eq!(err.code(), ErrorCode::InvalidParams.code());
+        assert_eq!(err.message(), "bad params");
+    }
 }

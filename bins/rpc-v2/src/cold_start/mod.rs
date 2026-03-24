@@ -15,11 +15,12 @@ use hashbrown::HashMap;
 use infinisvm_core::{bank::Bank, indexer::Indexer, s3::S3FsClient, subscription::SubscriptionProcessor};
 use infinisvm_db::{db_chain::DBChain, in_memory_db::NoopDB, MemoryDB};
 use infinisvm_logger::info;
-use infinisvm_sync::http_client::HttpClient;
+use infinisvm_sync::{http_client::HttpClient, snapshot_manifest::SnapshotManifestStore};
+use infinisvm_types::sync::SignedSnapshotManifest;
 use metrics::{counter, histogram};
 use solana_sdk::{hash::Hash, pubkey::Pubkey, signature::Signature};
 use tokio::{
-    sync::{mpsc, Mutex},
+    sync::{mpsc, watch, Mutex},
     task::JoinHandle,
 };
 
@@ -61,8 +62,26 @@ impl std::fmt::Display for StartSlot {
     }
 }
 
+pub(crate) async fn bootstrap_only(
+    http_client: Arc<HttpClient>,
+    initial_manifest: SignedSnapshotManifest,
+    sequencer_pubkey: Pubkey,
+    snapshot_manifest_store: SnapshotManifestStore,
+    signed_finalization_slot: watch::Receiver<u64>,
+) -> Result<bootstrap::BootstrapOutput> {
+    bootstrap::bootstrap(
+        http_client,
+        initial_manifest,
+        sequencer_pubkey,
+        snapshot_manifest_store,
+        signed_finalization_slot,
+    )
+    .await
+}
+
 #[allow(clippy::too_many_arguments)]
-pub async fn cold_start(
+pub(crate) async fn finish_cold_start(
+    bootstrap: bootstrap::BootstrapOutput,
     http_client: Arc<HttpClient>,
     tx_receiver: mpsc::Receiver<PeerNotification>,
     indexer: Arc<Mutex<dyn Indexer>>,
@@ -73,12 +92,8 @@ pub async fn cold_start(
     s3_client: Option<S3FsClient>,
     sequencer_pubkey: Pubkey,
     start_slot: StartSlot,
+    cs_start: Instant,
 ) -> Result<(Vec<JoinHandle<()>>, Arc<RwLock<DBChain<MemoryDB<NoopDB>>>>)> {
-    info!("Starting cold start process");
-    counter!("cold_start_attempts_total").increment(1);
-    let cs_start = Instant::now();
-
-    let bootstrap = bootstrap::bootstrap(http_client.clone()).await?;
     let mut handles = bootstrap.handles;
     let db_chain_ref = bootstrap.db_chain;
     let last_slot_from_bootstrap = bootstrap.last_slot;

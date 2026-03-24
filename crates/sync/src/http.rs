@@ -15,6 +15,7 @@ use axum::{
 use bytes::Bytes;
 use infinisvm_logger::info;
 use infinisvm_registry::{RegistryStore, RpcPeerInfo, RpcRegisterRequest, RpcSetResponse};
+use infinisvm_types::sync::SignedSnapshotManifest;
 use serde::{Deserialize, Serialize};
 use solana_sdk::{hash::hashv, pubkey::Pubkey, signature::Signature};
 use tower_http::compression::CompressionLayer;
@@ -22,6 +23,7 @@ use tower_http::compression::CompressionLayer;
 use crate::{
     grpc::client::{RetryConfig, SyncClient},
     slots::{self, SlotData},
+    snapshot_manifest::SnapshotManifestStore,
 };
 
 #[derive(Clone)]
@@ -30,6 +32,7 @@ pub struct AppState {
     pub slots_path: String,
     pub rpc_registry: RegistryStore,
     pub sequencer_pubkey: Option<Pubkey>,
+    pub snapshot_manifest_store: SnapshotManifestStore,
 }
 
 #[derive(Serialize)]
@@ -55,18 +58,21 @@ pub async fn start_http_server(
     slots_path: String,
     rpc_registry: RegistryStore,
     sequencer_pubkey: Option<Pubkey>,
+    snapshot_manifest_store: SnapshotManifestStore,
 ) -> eyre::Result<()> {
     let app_state = Arc::new(AppState {
         db_path,
         slots_path,
         rpc_registry,
         sequencer_pubkey,
+        snapshot_manifest_store,
     });
 
     seed_registry_from_env(&app_state.rpc_registry).await;
 
     let app = Router::new()
         .route("/solayer/snapshots", get(handle_snapshots))
+        .route("/solayer/snapshot-manifest", get(handle_snapshot_manifest))
         .route("/solayer/files/{filename}", get(handle_files))
         .route("/solayer/slots/{slot}", get(handle_single_slot))
         .route("/solayer/slots", get(handle_batch_slots))
@@ -149,6 +155,10 @@ fn normalize_seed_addr(addr: &str) -> String {
 
 // Handler for snapshots API
 async fn handle_snapshots(State(state): State<Arc<AppState>>) -> Response {
+    if !state.snapshot_manifest_store.is_serving_ready().await {
+        return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "Snapshots not ready").into_response();
+    }
+
     let db_path = PathBuf::from(&state.db_path);
 
     if !db_path.exists() {
@@ -171,6 +181,17 @@ async fn handle_snapshots(State(state): State<Arc<AppState>>) -> Response {
 
     let response = SnapshotsResponse { files };
     axum::Json(response).into_response()
+}
+
+async fn handle_snapshot_manifest(State(state): State<Arc<AppState>>) -> Response {
+    match state.snapshot_manifest_store.get_if_serving().await {
+        Some(manifest) => axum::Json::<SignedSnapshotManifest>(manifest).into_response(),
+        None => (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "Snapshot manifest not ready",
+        )
+            .into_response(),
+    }
 }
 
 // Handler for files API

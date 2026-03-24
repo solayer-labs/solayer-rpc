@@ -22,6 +22,8 @@ bincode = { workspace = true }
 eyre = { workspace = true }
 zstd = { workspace = true }
 metrics = { workspace = true }
+blake3 = { workspace = true }
+hex = { workspace = true }
 
 # HTTP server dependencies
 axum = { workspace = true }

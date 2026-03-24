@@ -39,3 +39,4 @@ agave-feature-set = { workspace = true }
 dashmap = { workspace = true }
 
 paste = { workspace = true }
+mpl-token-metadata = { workspace = true }

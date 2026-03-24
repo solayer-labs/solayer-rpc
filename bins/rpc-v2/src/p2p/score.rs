@@ -130,11 +130,19 @@ mod tests {
                 rate_limit_per_sec: 0,
                 rate_limit_burst: 0,
                 latest_signed_finalization: None,
+                ancestry_canary: None,
+                stream_parent: None,
+                canary_path: Vec::new(),
+                topology_pubkey: [0u8; 32],
+                ancestry_delegations: Vec::new(),
                 observed_head: 0,
                 capabilities: 0,
                 setup: None,
             };
-            Ok(Response::new(GetPeerStatusResponse { status }))
+            Ok(Response::new(GetPeerStatusResponse {
+                status,
+                delegation: None,
+            }))
         }
 
         async fn inject_commit_batch_notification(
@@ -183,6 +191,10 @@ mod tests {
             last_bytes_reset: Instant::now(),
             observed_limits: PeerObservedLimits::default(),
             advertised_setup: None,
+            advertised_stream_parent: None,
+            topology_pubkey: [0u8; 32],
+            ancestry_canary: None,
+            ancestry_delegations: Vec::new(),
         }
     }
 

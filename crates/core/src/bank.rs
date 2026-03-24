@@ -57,7 +57,7 @@ use solana_svm_transaction::svm_message::SVMMessage;
 
 use crate::{
     blockhash_generator::DummyRpcBlockhashGenerator, fork_graph::EmptyForkGraph, metrics::BankMetrics,
-    subscription::Notifier,
+    subscription::Notifier, BLOCKHASH_HISTORY_SLOTS, BLOCKHASH_SIGNATURE_SET_CAPACITY,
 };
 
 pub fn get_feature_set() -> FeatureSet {
@@ -142,8 +142,9 @@ pub struct Bank {
     blockhash_pruner_sender: Sender<(Hash, HashSet<Signature>)>,
     blockhash_signature_map: DashMap<Hash, HashSet<Signature>>,
 
-    previous_hashes: Arc<RwLock<VecDeque<Hash>>>, // 150 valid hashes
+    previous_hashes: Arc<RwLock<VecDeque<Hash>>>, // recent valid blockhashes (50ms -> 1200 blockhashes)
     slot_blockhashes: BTreeMap<u64, Hash>,
+    slot_timestamps: BTreeMap<u64, u64>,
 
     slot_hash_timestamp: SlotHashTimestamp,
     hash_generator: DummyRpcBlockhashGenerator,
@@ -262,7 +263,9 @@ impl Bank {
 
         let mut slot_blockhashes = BTreeMap::new();
         slot_blockhashes.insert(slot, hash);
-        let previous_hashes = Arc::new(RwLock::new(VecDeque::with_capacity(150)));
+        let mut slot_timestamps = BTreeMap::new();
+        slot_timestamps.insert(slot, timestamp);
+        let previous_hashes = Arc::new(RwLock::new(VecDeque::with_capacity(BLOCKHASH_HISTORY_SLOTS)));
         {
             let mut prev = previous_hashes.write().unwrap();
             prev.push_back(hash);
@@ -270,11 +273,11 @@ impl Bank {
 
         let bank = Self {
             db: Arc::new(RwLock::new(pdb)),
-            // 350000 tps, expire every 150 slots
-            // we need to store 21000000 txs
-            blockhash_signature_map: DashMap::with_capacity(150),
+            // Keep signature history aligned with the recent blockhash window.
+            blockhash_signature_map: DashMap::with_capacity(BLOCKHASH_HISTORY_SLOTS),
             previous_hashes,
             slot_blockhashes,
+            slot_timestamps,
             slot_hash_timestamp: (slot, hash, timestamp),
             hash_generator,
 
@@ -293,7 +296,7 @@ impl Bank {
         };
 
         bank.blockhash_signature_map
-            .insert(hash, HashSet::with_capacity(200_000));
+            .insert(hash, HashSet::with_capacity(BLOCKHASH_SIGNATURE_SET_CAPACITY));
 
         for builtin in BUILTINS {
             bank.transaction_processor.add_builtin(
@@ -325,6 +328,13 @@ impl Bank {
 
     pub fn get_latest_slot_hash_timestamp(&self) -> SlotHashTimestamp {
         self.slot_hash_timestamp
+    }
+
+    pub fn get_slot_hash_timestamp_parent(&self, slot: u64) -> Option<(Hash, u64, Hash)> {
+        let hash = self.slot_blockhashes.get(&slot).copied()?;
+        let timestamp = self.slot_timestamps.get(&slot).copied()?;
+        let parent_hash = self.parent_blockhash_of_slot(slot).unwrap_or_default();
+        Some((hash, timestamp, parent_hash))
     }
 
     pub fn parent_blockhash_of_slot(&self, slot: u64) -> Option<Hash> {
@@ -441,20 +451,20 @@ impl Bank {
         self.slot_blockhashes.insert(slot, hash);
         self.blockhash_signature_map
             .entry(hash)
-            .or_insert_with(|| HashSet::with_capacity(200_000));
+            .or_insert_with(|| HashSet::with_capacity(BLOCKHASH_SIGNATURE_SET_CAPACITY));
 
         self.trim_blockhash_history();
         self.rebuild_previous_hashes();
     }
 
     fn trim_blockhash_history(&mut self) {
-        const MAX_HASH_SLOTS: usize = 150;
-        while self.slot_blockhashes.len() > MAX_HASH_SLOTS {
+        while self.slot_blockhashes.len() > BLOCKHASH_HISTORY_SLOTS {
             let oldest_slot = match self.slot_blockhashes.keys().next().copied() {
                 Some(slot) => slot,
                 None => break,
             };
 
+            self.slot_timestamps.remove(&oldest_slot);
             if let Some(old_hash) = self.slot_blockhashes.remove(&oldest_slot) {
                 if let Some((_, signatures)) = self.blockhash_signature_map.remove(&old_hash) {
                     let _ = self.blockhash_pruner_sender.send((old_hash, signatures));
@@ -483,9 +493,9 @@ impl Bank {
             self.blockhash_signature_map
                 .remove(&old_hash)
                 .map(|(_, set)| set)
-                .unwrap_or_else(|| HashSet::with_capacity(200_000))
+                .unwrap_or_else(|| HashSet::with_capacity(BLOCKHASH_SIGNATURE_SET_CAPACITY))
         } else {
-            HashSet::with_capacity(200_000)
+            HashSet::with_capacity(BLOCKHASH_SIGNATURE_SET_CAPACITY)
         };
 
         self.slot_blockhashes.insert(slot, hash);
@@ -499,6 +509,11 @@ impl Bank {
         }
     }
 
+    pub fn set_slot_metadata(&mut self, slot: u64, hash: Hash, timestamp: u64) {
+        self.slot_timestamps.insert(slot, timestamp);
+        self.set_slot_blockhash(slot, hash);
+    }
+
     pub fn tick(&mut self) {
         let slot = self.slot_hash_timestamp.0;
 
@@ -506,6 +521,7 @@ impl Bank {
         let next_slot = self.slot_hash_timestamp.0 + 1;
         let next_hash = self.hash_generator.next();
         self.stage_blockhash(next_slot, next_hash);
+        self.slot_timestamps.insert(next_slot, unix_timestamp);
         self.slot_hash_timestamp = (next_slot, next_hash, unix_timestamp);
 
         self.db.write().unwrap().commit(slot);
@@ -523,7 +539,7 @@ impl Bank {
         for (bh, signatures) in blockhash_to_signatures.into_iter() {
             self.blockhash_signature_map
                 .entry(bh)
-                .or_insert_with(|| HashSet::with_capacity(200_000))
+                .or_insert_with(|| HashSet::with_capacity(BLOCKHASH_SIGNATURE_SET_CAPACITY))
                 .extend(signatures.into_iter());
         }
     }
@@ -531,7 +547,7 @@ impl Bank {
     pub fn tick_as_slave(&mut self, slot: u64, hash: Hash, timestamp: u64) {
         // Advance to the provided slot/hash/timestamp from the sequencer
         self.slot_hash_timestamp = (slot, hash, timestamp);
-        self.set_slot_blockhash(slot, hash);
+        self.set_slot_metadata(slot, hash, timestamp);
         // Update blockhash window and Clock/sysvars for the current slot (not the
         // previous)
         self.post_tick(slot, timestamp, true);

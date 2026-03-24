@@ -89,6 +89,7 @@ infinisvm-retirement = { path = "./crates/retirement" }
 
 spl-token = "=6.0.0"
 spl-token-2022 = "=4.0.0"
+mpl-token-metadata = "5.1.1"
 hashbrown = "0.14.5"
 tikv-jemallocator = "0.6"
 

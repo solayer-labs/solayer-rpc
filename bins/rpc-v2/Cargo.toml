@@ -42,8 +42,6 @@ bs58 = { workspace = true }
 libmdbx = "0.6"
 pyroscope = { workspace = true, optional = true }
 pyroscope_pprofrs = { workspace = true, optional = true }
-
-tikv-jemallocator = { workspace = true }
 cap = { version = "0.1.2", optional = true }
 axum = { workspace = true, optional = true }
 jemalloc_pprof = { version = "0.7", features = [
@@ -51,6 +49,9 @@ jemalloc_pprof = { version = "0.7", features = [
     "symbolize",
 ], optional = true }
 url = "2.5.7"
+
+[target.'cfg(not(all(target_arch = "aarch64", target_env = "musl")))'.dependencies]
+tikv-jemallocator = { workspace = true }
 
 
 [features]

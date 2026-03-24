@@ -4,10 +4,10 @@ use dashmap::DashMap;
 use infinisvm_logger::{error, info};
 use infinisvm_types::sync::{
     CommitBatchNotification, GetPeerStatusRequest, GetPeerStatusResponse, PeerStatus, Setup, ShredId,
-    SignedFinalization, SyncBatchShred,
+    SignedAncestryDelegation, SignedFinalization, SyncBatchShred,
 };
 use metrics::{counter, gauge};
-use solana_sdk::hash::hashv;
+use solana_sdk::{hash::hashv, signature::Keypair, signer::Signer};
 use tokio::sync::{mpsc, RwLock};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
@@ -20,12 +20,51 @@ use crate::grpc::{
     PeerNotification, TransactionBatchBroadcaster,
 };
 
+const RECENT_CACHE_WINDOW_SLOTS: u64 = 8_000;
+
+#[derive(Clone, Default)]
+struct TopologyState {
+    stream_parent: Option<[u8; 32]>,
+    ancestry_canary: Option<SignedFinalization>,
+    ancestry_delegations: Vec<SignedAncestryDelegation>,
+}
+
+#[derive(Clone)]
+pub struct PeerStatusUpdater {
+    peer_status: Arc<RwLock<PeerStatus>>,
+    topology_state: Arc<RwLock<TopologyState>>,
+}
+
+impl PeerStatusUpdater {
+    pub async fn set_authenticated_ancestry(
+        &self,
+        stream_parent: Option<[u8; 32]>,
+        ancestry_canary: Option<SignedFinalization>,
+        ancestry_delegations: Vec<SignedAncestryDelegation>,
+    ) {
+        {
+            let mut topology = self.topology_state.write().await;
+            topology.stream_parent = stream_parent;
+            topology.ancestry_canary = ancestry_canary.clone();
+            topology.ancestry_delegations = ancestry_delegations.clone();
+        }
+
+        let mut status = self.peer_status.write().await;
+        status.stream_parent = stream_parent;
+        status.ancestry_canary = ancestry_canary;
+        status.ancestry_delegations = ancestry_delegations;
+        status.canary_path.clear();
+    }
+}
+
 #[derive(Clone)]
 pub struct InfiniSVMServiceImpl {
     batch_broadcaster: Arc<TransactionBatchBroadcaster>,
     recent_batches: Arc<DashMap<ShredId, SyncBatchShred>>,
     recent_signed_finalizations: Arc<DashMap<u64, SignedFinalization>>,
     peer_status: Arc<RwLock<PeerStatus>>,
+    topology_state: Arc<RwLock<TopologyState>>,
+    topology_keypair: Arc<Keypair>,
     e2e_sender: Option<mpsc::Sender<PeerNotification>>,
 }
 
@@ -34,6 +73,8 @@ impl InfiniSVMServiceImpl {
         batch_broadcaster: Arc<TransactionBatchBroadcaster>,
         grpc_addr: SocketAddr,
         grpc_advertise_addr: Option<String>,
+        root_canary_allowed: bool,
+        topology_keypair: Arc<Keypair>,
         e2e_sender: Option<mpsc::Sender<PeerNotification>>,
     ) -> Self {
         let recent_batches = Arc::new(DashMap::new());
@@ -53,16 +94,23 @@ impl InfiniSVMServiceImpl {
             rate_limit_per_sec,
             rate_limit_burst,
             latest_signed_finalization: None,
+            ancestry_canary: None,
+            stream_parent: None,
+            canary_path: Vec::new(),
+            topology_pubkey: topology_keypair.pubkey().to_bytes(),
+            ancestry_delegations: Vec::new(),
             observed_head: 0,
             capabilities: 0,
             setup: Some(setup),
         }));
+        let topology_state = Arc::new(RwLock::new(TopologyState::default()));
 
         // Build a small cache of recent batches keyed by (slot, job_id)
         {
             let recent_batches_clone = recent_batches.clone();
             let recent_signed_finalizations_clone = recent_signed_finalizations.clone();
             let peer_status_clone = peer_status.clone();
+            let topology_state_clone = topology_state.clone();
             let mut internal_batch_rx = batch_broadcaster.subscribe();
             tokio::spawn(async move {
                 loop {
@@ -77,10 +125,12 @@ impl InfiniSVMServiceImpl {
                                         let mut removed = 0usize;
                                         let last_slot = batch_data.shred_id.slot;
 
-                                        // remove slots older than 1000
+                                        // keep roughly the same wall-clock cache window after 50ms slots
                                         let old_entries: Vec<_> = recent_batches_clone
                                             .iter()
-                                            .filter(|entry| entry.key().slot < last_slot.saturating_sub(1000))
+                                            .filter(|entry| {
+                                                entry.key().slot < last_slot.saturating_sub(RECENT_CACHE_WINDOW_SLOTS)
+                                            })
                                             .map(|entry| entry.key().clone())
                                             .collect();
 
@@ -107,15 +157,34 @@ impl InfiniSVMServiceImpl {
                                     info!("Adding signed finalization to cache: slot={}", finalization.slot);
                                     recent_signed_finalizations_clone.insert(finalization.slot, signed.clone());
                                     {
+                                        let topology = topology_state_clone.read().await.clone();
                                         let mut status = peer_status_clone.write().await;
                                         status.observed_head = status.observed_head.max(finalization.slot);
                                         status.latest_signed_finalization = Some(signed.clone());
+                                        status.stream_parent = topology.stream_parent;
+                                        if topology.stream_parent.is_some() || topology.ancestry_canary.is_some() {
+                                            status.ancestry_canary = topology.ancestry_canary.clone();
+                                            status.ancestry_delegations = topology.ancestry_delegations.clone();
+                                            status.canary_path.clear();
+                                        } else if root_canary_allowed {
+                                            if status.ancestry_canary.is_none() {
+                                                status.ancestry_canary = Some(signed.clone());
+                                            }
+                                            status.ancestry_delegations.clear();
+                                            status.canary_path.clear();
+                                        } else {
+                                            status.ancestry_canary = None;
+                                            status.ancestry_delegations.clear();
+                                            status.canary_path.clear();
+                                        }
                                     }
                                     if recent_signed_finalizations_clone.len() > 10_000 {
                                         let last_slot = finalization.slot;
                                         let old_entries: Vec<_> = recent_signed_finalizations_clone
                                             .iter()
-                                            .filter(|entry| *entry.key() < last_slot.saturating_sub(1000))
+                                            .filter(|entry| {
+                                                *entry.key() < last_slot.saturating_sub(RECENT_CACHE_WINDOW_SLOTS)
+                                            })
                                             .map(|entry| *entry.key())
                                             .collect();
 
@@ -150,12 +219,21 @@ impl InfiniSVMServiceImpl {
             recent_batches,
             recent_signed_finalizations,
             peer_status,
+            topology_state,
+            topology_keypair,
             e2e_sender,
         }
     }
 
     pub fn get_batch_broadcaster(&self) -> Arc<TransactionBatchBroadcaster> {
         self.batch_broadcaster.clone()
+    }
+
+    pub fn status_updater(&self) -> PeerStatusUpdater {
+        PeerStatusUpdater {
+            peer_status: self.peer_status.clone(),
+            topology_state: self.topology_state.clone(),
+        }
     }
 
     pub fn into_service(self) -> InfiniSvmServiceServer<Self> {
@@ -280,10 +358,27 @@ impl InfiniSvmService for InfiniSVMServiceImpl {
 
     async fn get_peer_status(
         &self,
-        _request: Request<GetPeerStatusRequest>,
+        request: Request<GetPeerStatusRequest>,
     ) -> Result<Response<GetPeerStatusResponse>, Status> {
+        let req = request.into_inner();
         let status = self.peer_status.read().await.clone();
-        Ok(Response::new(GetPeerStatusResponse { status }))
+        let delegation = match (
+            status.ancestry_canary.as_ref(),
+            req.requester_node_id,
+            req.requester_topology_pubkey,
+        ) {
+            (Some(canary), Some(child_node_id), Some(child_topology_pubkey)) => Some(SignedAncestryDelegation::sign(
+                canary.finalization.slot,
+                canary.signature,
+                status.node_id,
+                &self.topology_keypair,
+                child_node_id,
+                child_topology_pubkey,
+                current_unix_timestamp().saturating_add(300),
+            )),
+            _ => None,
+        };
+        Ok(Response::new(GetPeerStatusResponse { status, delegation }))
     }
 
     async fn inject_commit_batch_notification(
@@ -297,6 +392,22 @@ impl InfiniSvmService for InfiniSVMServiceImpl {
             };
             let req = request.into_inner();
             let notification = Arc::new(req.notification);
+
+            if let CommitBatchNotification::SignedFinalization(signed) = notification.as_ref() {
+                let mut topology = self.topology_state.write().await;
+                topology.stream_parent = None;
+                topology.ancestry_canary = Some(signed.clone());
+                topology.ancestry_delegations.clear();
+            }
+            if let CommitBatchNotification::SignedFinalization(signed) = notification.as_ref() {
+                let mut status = self.peer_status.write().await;
+                status.latest_signed_finalization = Some(signed.clone());
+                status.ancestry_canary = Some(signed.clone());
+                status.stream_parent = None;
+                status.ancestry_delegations.clear();
+                status.canary_path.clear();
+                status.observed_head = status.observed_head.max(signed.finalization.slot);
+            }
 
             if let Err(e) = self.batch_broadcaster.publish_notification(notification.clone()) {
                 return Err(Status::internal(format!("Failed to publish notification: {e}")));
@@ -321,4 +432,11 @@ impl InfiniSvmService for InfiniSVMServiceImpl {
             Err(Status::unimplemented("e2e feature disabled"))
         }
     }
+}
+
+fn current_unix_timestamp() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default()
 }

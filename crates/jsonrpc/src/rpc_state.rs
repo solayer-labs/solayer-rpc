@@ -8,7 +8,9 @@ use std::{
 use async_trait::async_trait;
 use crossbeam_channel::Sender;
 use eyre::Context;
-use infinisvm_core::{bank::Bank, committer::PerfSample, indexer::Indexer, subscription::SubscriptionProcessor};
+use infinisvm_core::{
+    bank::Bank, committer::PerfSample, indexer::Indexer, subscription::SubscriptionProcessor, BLOCKHASH_HISTORY_SLOTS,
+};
 use infinisvm_db::Database;
 use infinisvm_logger::{error, tracing};
 use infinisvm_types::{BlockWithTransactions, SignatureFilters, TransactionWithMetadata};
@@ -89,6 +91,9 @@ pub struct RpcServerState {
     pub subscription_processor: Arc<SubscriptionProcessor>,
     pub middleware: WebSocketMiddleware,
 
+    pub bridge_handler: Option<Pubkey>,
+    pub bridge_program_id: Option<Pubkey>,
+
     _ctx: RpcContext,
 }
 
@@ -148,7 +153,7 @@ impl TxService {
     }
 }
 
-pub const RECENT_BLOCKHASHES_HISTORY_SIZE: usize = 1024;
+pub const RECENT_BLOCKHASHES_HISTORY_SIZE: usize = BLOCKHASH_HISTORY_SLOTS;
 pub const MAX_PROGRAM_ACCOUNTS_QUERY_LIMIT: usize = 10_000;
 
 #[async_trait]
@@ -212,6 +217,8 @@ impl RpcServerState {
             forward_to,
             subscription_processor,
             middleware: WebSocketMiddleware::new(),
+            bridge_handler: Some(Pubkey::from_str_const("55uVZhH3jk95dLdnsJwMAG72pecMwa8MTjVH4ni7osBy")),
+            bridge_program_id: Some(Pubkey::from_str_const("6kpxYKjqe8z66hnDHbbjhEUxha46cnz2UqrneGECmFBg")),
             _ctx: RpcContext {
                 identity: Keypair::new(),
                 tpu,

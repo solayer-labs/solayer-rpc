@@ -18,7 +18,7 @@ impl Default for FishermanConfig {
     fn default() -> Self {
         Self {
             poll_secs: 60,
-            max_recent_offset: 5,
+            max_recent_offset: 40,
             probe_timeout: Duration::from_millis(3000),
             initial_delay: Duration::from_secs(0),
         }
@@ -190,7 +190,7 @@ mod tests {
             FailingStatusProbe,
             FishermanConfig {
                 poll_secs: 60,
-                max_recent_offset: 5,
+                max_recent_offset: 40,
                 probe_timeout: Duration::from_millis(20),
                 initial_delay: Duration::from_millis(0),
             },

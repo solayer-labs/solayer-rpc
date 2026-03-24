@@ -8,7 +8,8 @@ use std::{
 
 use infinisvm_logger::{debug, error, info, warn};
 use infinisvm_types::sync::{
-    CommitBatchNotification, GetPeerStatusRequest, PeerStatus, ShredId, SignedFinalization, SyncBatchShred,
+    CommitBatchNotification, GetPeerStatusRequest, GetPeerStatusResponse, PeerStatus, ShredId, SignedFinalization,
+    SyncBatchShred,
 };
 use metrics::counter;
 use tokio::{
@@ -359,9 +360,25 @@ impl SyncClient {
     }
 
     pub async fn get_peer_status(&mut self) -> Result<PeerStatus, Box<dyn std::error::Error + Send + Sync>> {
-        let request = Request::new(GetPeerStatusRequest {});
+        let request = Request::new(GetPeerStatusRequest {
+            requester_node_id: None,
+            requester_topology_pubkey: None,
+        });
         let result = self.client.get_peer_status(request).await?;
         Ok(result.into_inner().status)
+    }
+
+    pub async fn get_peer_status_with_request(
+        &mut self,
+        requester_node_id: Option<[u8; 32]>,
+        requester_topology_pubkey: Option<[u8; 32]>,
+    ) -> Result<GetPeerStatusResponse, Box<dyn std::error::Error + Send + Sync>> {
+        let request = Request::new(GetPeerStatusRequest {
+            requester_node_id,
+            requester_topology_pubkey,
+        });
+        let result = self.client.get_peer_status(request).await?;
+        Ok(result.into_inner())
     }
 
     pub async fn inject_commit_batch_notification(

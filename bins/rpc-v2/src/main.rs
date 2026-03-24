@@ -2,9 +2,9 @@ use std::{
     collections::VecDeque,
     error::Error,
     net::{IpAddr, SocketAddr},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, AtomicU64},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, RwLock,
     },
     time::{Duration, Instant},
@@ -15,7 +15,7 @@ use clap::Parser;
 use dashmap::DashSet;
 use eyre::Context as _;
 use infinisvm_core::{bank::Bank, indexer::Indexer, s3::S3FsClient, subscription::SubscriptionProcessor};
-use infinisvm_db::persistence::DB_DIRECTORY;
+use infinisvm_db::persistence::configure_db_root_path;
 #[cfg(not(feature = "no_index"))]
 use infinisvm_indexer::db::MultiDatabaseIndexer;
 use infinisvm_indexer::{db::NoopIndexer, in_memory::InMemoryIndexer};
@@ -23,13 +23,21 @@ use infinisvm_jsonrpc::{rpc_impl::RpcServer, rpc_state::RpcIndexer};
 use infinisvm_logger::{error, info, warn};
 use infinisvm_registry::RegistryStore;
 use infinisvm_sync::{
-    grpc::{client::SyncClient, server::InfiniSVMServiceImpl, TransactionBatchBroadcaster},
+    grpc::{client::SyncClient, server::InfiniSVMServiceImpl, PeerStatusUpdater, TransactionBatchBroadcaster},
     http_client::HttpClient,
+    snapshot_manifest::{
+        manifest_effective_head_slot, snapshot_head_is_fresh, snapshot_head_lag_slots, SnapshotManifestStore,
+    },
 };
-use infinisvm_types::sync::{CommitBatchNotification, SignedFinalization};
+use infinisvm_types::sync::{CommitBatchNotification, SignedFinalization, SignedSnapshotManifest};
 use jsonrpsee::server::Server;
+use metrics::counter;
 use metrics_exporter_prometheus::PrometheusBuilder;
-use solana_sdk::{hash::hashv, pubkey::Pubkey};
+use solana_sdk::{
+    hash::hashv,
+    pubkey::Pubkey,
+    signature::{Keypair, Signer},
+};
 use tokio::sync::{mpsc, watch, Mutex};
 use tonic::{transport::Server as TonicServer, Code};
 
@@ -40,11 +48,15 @@ use crate::cold_start::{
 
 mod cold_start;
 mod memory;
+mod notification_dedupe;
 mod p2p;
 mod pyroscope;
 
+#[cfg(not(all(target_arch = "aarch64", target_env = "musl")))]
 #[global_allocator]
 static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+const FORWARD_NOTIFICATION_BUFFER: usize = 1024;
 #[cfg(feature = "track_oom")]
 #[allow(non_upper_case_globals)]
 #[export_name = "malloc_conf"]
@@ -81,7 +93,10 @@ struct Args {
     #[arg(long, default_value = "", env = "RPC_GRPC_ADVERTISE_ADDR")]
     grpc_advertise_addr: String,
 
-    /// Sequencer HTTP server address, overrides sequencer_host
+    /// Explicit snapshot HTTP bootstrap override.
+    ///
+    /// If set, rpc-v2 uses only this endpoint for snapshot manifest and file
+    /// downloads during cold start.
     #[arg(long, default_value = "")]
     sequencer_http_server_addr: String,
 
@@ -155,6 +170,13 @@ struct Args {
 
     #[arg(long, default_value = "/mnt/data/slots-rpc")]
     pub local_slots_path: PathBuf,
+
+    /// Local mirrored snapshot DB path.
+    ///
+    /// Defaults to a sibling path derived from `local_slots_path`, for example
+    /// `/data/rpc-a` becomes `/data/rpc-a-db`.
+    #[arg(long)]
+    pub local_db_path: Option<PathBuf>,
 
     /// S3 region (optional) for storing slots
     #[arg(long, default_value = "us-west-2", env = "S3_REGION")]
@@ -268,6 +290,16 @@ struct GrpcClientConfig {
     port: u16,
 }
 
+struct StreamForwarderContext {
+    forward_tx: mpsc::Sender<p2p::PeerNotification>,
+    live_forwarding_ready: Arc<AtomicBool>,
+    signed_finalization_slot: watch::Sender<u64>,
+    notification_deduper: notification_dedupe::NotificationDeduper,
+    peer_status_updater: PeerStatusUpdater,
+    self_node_id: [u8; 32],
+    topology_keypair: Arc<Keypair>,
+}
+
 fn config_error(msg: impl Into<String>) -> BoxError {
     std::io::Error::new(std::io::ErrorKind::InvalidInput, msg.into()).into()
 }
@@ -350,10 +382,19 @@ async fn setup_downstream_grpc(
     batch_broadcaster: Arc<TransactionBatchBroadcaster>,
     grpc_listen_addr: SocketAddr,
     grpc_advertise_addr: Option<String>,
+    topology_keypair: Arc<Keypair>,
     e2e_sender: Option<mpsc::Sender<p2p::PeerNotification>>,
-) -> Result<(), BoxError> {
-    let grpc_service_impl =
-        InfiniSVMServiceImpl::new(batch_broadcaster, grpc_listen_addr, grpc_advertise_addr, e2e_sender).await;
+) -> Result<PeerStatusUpdater, BoxError> {
+    let grpc_service_impl = InfiniSVMServiceImpl::new(
+        batch_broadcaster,
+        grpc_listen_addr,
+        grpc_advertise_addr,
+        false,
+        topology_keypair,
+        e2e_sender,
+    )
+    .await;
+    let peer_status_updater = grpc_service_impl.status_updater();
     let grpc_service = grpc_service_impl.into_service();
 
     tokio::spawn(async move {
@@ -368,7 +409,7 @@ async fn setup_downstream_grpc(
         }
     });
 
-    Ok(())
+    Ok(peer_status_updater)
 }
 
 fn normalize_grpc_advertise_addr(addr: &str) -> String {
@@ -377,6 +418,27 @@ fn normalize_grpc_advertise_addr(addr: &str) -> String {
         .trim_start_matches("http://")
         .trim_start_matches("https://")
         .to_string()
+}
+
+fn derive_local_db_path(local_slots_path: &Path) -> PathBuf {
+    let derived_name = local_slots_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .map(|name| format!("{name}-db"))
+        .unwrap_or_else(|| "chaindata-rpc".to_string());
+
+    local_slots_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(|parent| parent.join(&derived_name))
+        .unwrap_or_else(|| PathBuf::from(derived_name))
+}
+
+fn resolve_local_db_path(args: &Args) -> PathBuf {
+    args.local_db_path
+        .clone()
+        .unwrap_or_else(|| derive_local_db_path(&args.local_slots_path))
 }
 
 fn is_loopback_host(host: &str) -> bool {
@@ -416,6 +478,7 @@ fn spawn_registry_registration_task(
     registry_addrs: Vec<String>,
     grpc_addr: Option<String>,
     mut signed_finalization_slot: watch::Receiver<u64>,
+    snapshot_manifest_store: SnapshotManifestStore,
 ) {
     let Some(grpc_addr) = grpc_addr else {
         warn!(
@@ -425,12 +488,36 @@ fn spawn_registry_registration_task(
     };
 
     tokio::spawn(async move {
-        if *signed_finalization_slot.borrow() == 0 {
-            info!("Waiting for signed finalization before registry registration");
-            while signed_finalization_slot.changed().await.is_ok() {
-                if *signed_finalization_slot.borrow() > 0 {
-                    break;
+        let mut last_wait_log = Instant::now()
+            .checked_sub(Duration::from_secs(5))
+            .unwrap_or_else(Instant::now);
+        loop {
+            let signed_slot = *signed_finalization_slot.borrow();
+            let snapshot_serving_ready = snapshot_manifest_store.is_serving_ready().await;
+            if signed_slot > 0 && snapshot_serving_ready {
+                break;
+            }
+
+            if last_wait_log.elapsed() >= Duration::from_secs(5) {
+                info!(
+                    signed_slot,
+                    snapshot_serving_ready,
+                    "Waiting for signed finalization and fresh snapshot mirror readiness before registry registration"
+                );
+                last_wait_log = Instant::now();
+            }
+
+            if signed_slot == 0 {
+                tokio::select! {
+                    changed = signed_finalization_slot.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                    }
+                    _ = tokio::time::sleep(Duration::from_millis(500)) => {}
                 }
+            } else {
+                tokio::time::sleep(Duration::from_millis(500)).await;
             }
         }
 
@@ -440,6 +527,31 @@ fn spawn_registry_registration_task(
         let mut registered = std::collections::HashSet::<String>::new();
         let mut backoff = Duration::from_secs(1);
         loop {
+            let signed_slot = *signed_finalization_slot.borrow();
+            let snapshot_serving_ready = snapshot_manifest_store.is_serving_ready().await;
+            if signed_slot == 0 || !snapshot_serving_ready {
+                if !registered.is_empty() {
+                    registered.clear();
+                }
+                if last_wait_log.elapsed() >= Duration::from_secs(5) {
+                    info!(
+                        signed_slot,
+                        snapshot_serving_ready,
+                        "Skipping registry registration until the snapshot mirror is fresh again"
+                    );
+                    last_wait_log = Instant::now();
+                }
+                tokio::select! {
+                    changed = signed_finalization_slot.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                    }
+                    _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+                }
+                continue;
+            }
+
             let mut all_ok = true;
             for base_url in &registry_addrs {
                 match register_with_registry(base_url, grpc_addr.clone()).await {
@@ -483,7 +595,7 @@ fn spawn_registry_fisherman_task(registry: RegistryStore, sequencer_pubkey: Pubk
         let max_recent_offset = std::env::var("RPC_REGISTRY_FISHERMAN_MAX_OFFSET")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(5);
+            .unwrap_or(infinisvm_core::DEFAULT_RPC_REGISTRY_MAX_OFFSET_SLOTS);
         let probe_timeout_ms = std::env::var("RPC_REGISTRY_FISHERMAN_PROBE_TIMEOUT_MS")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
@@ -508,11 +620,7 @@ fn spawn_registry_fisherman_task(registry: RegistryStore, sequencer_pubkey: Pubk
 }
 
 fn prepare_grpc_client_config(args: &Args) -> Result<GrpcClientConfig, BoxError> {
-    let address = if args.sequencer_grpc_server_addr.is_empty() {
-        format!("http://{}:5005", args.sequencer_host)
-    } else {
-        normalize_grpc_addr(&args.sequencer_grpc_server_addr)
-    };
+    let address = build_sequencer_grpc_addr(args);
 
     let url = address
         .parse::<url::Url>()
@@ -545,11 +653,19 @@ async fn subscribe_and_forward_streams(
     peer_manager: Arc<p2p::PeerManager>,
     sequencer_pubkey: Pubkey,
     batch_broadcaster: Arc<TransactionBatchBroadcaster>,
-    forward_tx: mpsc::Sender<p2p::PeerNotification>,
-    signed_finalization_slot: watch::Sender<u64>,
+    ctx: StreamForwarderContext,
 ) -> Result<(), BoxError> {
     let broadcaster_clone = batch_broadcaster.clone();
     tokio::spawn(async move {
+        let StreamForwarderContext {
+            forward_tx,
+            live_forwarding_ready,
+            signed_finalization_slot,
+            notification_deduper,
+            peer_status_updater,
+            self_node_id,
+            topology_keypair,
+        } = ctx;
         info!("Transaction forwarder started");
         loop {
             let Some(peer) = peer_manager.pick_stream_peer() else {
@@ -561,10 +677,109 @@ async fn subscribe_and_forward_streams(
                 let mut client = peer.stream_client.lock().await;
                 match client.subscribe_commit_batch_notifications().await {
                     Ok(rx) => {
+                        drop(client);
+                        let (status, delegation) = {
+                            let mut rpc_client = peer.rpc_client.lock().await;
+                            match rpc_client
+                                .get_peer_status_with_request(
+                                    Some(self_node_id),
+                                    Some(topology_keypair.pubkey().to_bytes()),
+                                )
+                                .await
+                            {
+                                Ok(response) => (response.status, response.delegation),
+                                Err(e) => {
+                                    peer_status_updater
+                                        .set_authenticated_ancestry(None, None, Vec::new())
+                                        .await;
+                                    error!("Failed to fetch authenticated ancestry from {}: {}", peer.grpc_addr, e);
+                                    peer_manager.mark_failure(peer.node_id);
+                                    tokio::time::sleep(Duration::from_secs(1)).await;
+                                    continue;
+                                }
+                            }
+                        };
+
+                        match peer_manager.validate_peer_status(peer.node_id, Some(&status)) {
+                            p2p::peer_manager::PeerStatusValidation::Valid => {}
+                            p2p::peer_manager::PeerStatusValidation::NotReady(reason) => {
+                                peer_status_updater
+                                    .set_authenticated_ancestry(None, None, Vec::new())
+                                    .await;
+                                warn!(
+                                    grpc_addr = peer.grpc_addr.as_str(),
+                                    "Skipping stream peer until authenticated ancestry is ready: {reason}"
+                                );
+                                tokio::time::sleep(Duration::from_secs(1)).await;
+                                continue;
+                            }
+                            p2p::peer_manager::PeerStatusValidation::Invalid(reason) => {
+                                peer_status_updater
+                                    .set_authenticated_ancestry(None, None, Vec::new())
+                                    .await;
+                                warn!(
+                                    grpc_addr = peer.grpc_addr.as_str(),
+                                    "Rejecting stream peer due to invalid authenticated ancestry: {reason}"
+                                );
+                                peer_manager.penalize_invalid_finalizer(peer.node_id);
+                                tokio::time::sleep(Duration::from_secs(1)).await;
+                                continue;
+                            }
+                        }
+
+                        let Some(delegation) = delegation else {
+                            peer_status_updater
+                                .set_authenticated_ancestry(None, None, Vec::new())
+                                .await;
+                            warn!(
+                                grpc_addr = peer.grpc_addr.as_str(),
+                                "Rejecting stream peer because it did not provide ancestry delegation"
+                            );
+                            peer_manager.penalize_invalid_finalizer(peer.node_id);
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                            continue;
+                        };
+
+                        if !delegation.verify() ||
+                            delegation.parent_topology_pubkey != status.topology_pubkey ||
+                            delegation.child_node_id != self_node_id ||
+                            delegation.child_topology_pubkey != topology_keypair.pubkey().to_bytes() ||
+                            delegation.parent_node_id != peer.node_id ||
+                            delegation.expires_at_unix_secs < current_unix_timestamp() ||
+                            status.ancestry_canary.as_ref().is_none_or(|canary| {
+                                delegation.root_slot != canary.finalization.slot ||
+                                    delegation.root_signature != canary.signature
+                            })
+                        {
+                            peer_status_updater
+                                .set_authenticated_ancestry(None, None, Vec::new())
+                                .await;
+                            warn!(
+                                grpc_addr = peer.grpc_addr.as_str(),
+                                "Rejecting stream peer because ancestry delegation verification failed"
+                            );
+                            peer_manager.penalize_invalid_finalizer(peer.node_id);
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                            continue;
+                        }
+
+                        peer_manager.update_peer_status(peer.node_id, status.clone());
+                        let mut ancestry_delegations = status.ancestry_delegations.clone();
+                        ancestry_delegations.push(delegation);
+                        peer_status_updater
+                            .set_authenticated_ancestry(
+                                Some(peer.node_id),
+                                status.ancestry_canary.clone(),
+                                ancestry_delegations,
+                            )
+                            .await;
                         peer_manager.mark_stream_ready(peer.node_id);
                         rx
                     }
                     Err(e) => {
+                        peer_status_updater
+                            .set_authenticated_ancestry(None, None, Vec::new())
+                            .await;
                         error!("Failed to subscribe to stream from {}: {}", peer.grpc_addr, e);
                         if let Some(status) = e.downcast_ref::<tonic::Status>() {
                             if status.code() == Code::ResourceExhausted {
@@ -608,11 +823,35 @@ async fn subscribe_and_forward_streams(
                         }
 
                         let shared_batch = Arc::new(batch);
+                        if !notification_deduper.observe(shared_batch.as_ref()) {
+                            counter!(
+                                "rpc_cycle_prevented_total",
+                                "kind" => match shared_batch.as_ref() {
+                                    CommitBatchNotification::Batch(_) => "batch",
+                                    CommitBatchNotification::SignedFinalization(_) => "signed_finalization",
+                                    CommitBatchNotification::Finalization(_) => "finalization",
+                                }
+                            )
+                            .increment(1);
+                            continue;
+                        }
                         if let Ok(size) = bincode::serialized_size(shared_batch.as_ref()) {
                             peer_manager.observe_bytes(peer.node_id, size);
                         }
                         if let Err(e) = broadcaster_clone.publish_notification(shared_batch.clone()) {
                             error!("Failed to publish batch: {}", e);
+                        }
+                        if !live_forwarding_ready.load(Ordering::SeqCst) {
+                            counter!(
+                                "rpc_forward_notifications_dropped_during_bootstrap_total",
+                                "kind" => match shared_batch.as_ref() {
+                                    CommitBatchNotification::Batch(_) => "batch",
+                                    CommitBatchNotification::SignedFinalization(_) => "signed_finalization",
+                                    CommitBatchNotification::Finalization(_) => "finalization",
+                                }
+                            )
+                            .increment(1);
+                            continue;
                         }
                         if forward_tx
                             .send(p2p::PeerNotification {
@@ -627,11 +866,17 @@ async fn subscribe_and_forward_streams(
                         }
 
                         if peer_manager.stream_should_failover(peer.node_id) {
+                            peer_status_updater
+                                .set_authenticated_ancestry(None, None, Vec::new())
+                                .await;
                             info!("Failing over from stream peer {}", peer.grpc_addr);
                             break;
                         }
                     }
                     None => {
+                        peer_status_updater
+                            .set_authenticated_ancestry(None, None, Vec::new())
+                            .await;
                         peer_manager.mark_stream_drop(peer.node_id);
                         peer_manager.mark_failure(peer.node_id);
                         break;
@@ -655,12 +900,8 @@ fn verify_signed_finalization(sf: &SignedFinalization, sequencer_pubkey: &Pubkey
     sig.verify(sequencer_pubkey.as_ref(), &msg)
 }
 
-fn build_http_server_addr(args: &Args) -> String {
-    if args.sequencer_http_server_addr.is_empty() {
-        format!("http://{}:6005", args.sequencer_host)
-    } else {
-        args.sequencer_http_server_addr.clone()
-    }
+fn build_default_registry_addr(args: &Args) -> String {
+    format!("http://{}:6005", args.sequencer_host)
 }
 
 fn build_registry_addrs(args: &Args) -> Vec<String> {
@@ -671,7 +912,7 @@ fn build_registry_addrs(args: &Args) -> Vec<String> {
         .cloned()
         .collect();
     if addrs.is_empty() {
-        addrs.push(build_http_server_addr(args));
+        addrs.push(build_default_registry_addr(args));
     }
     addrs
 }
@@ -681,6 +922,14 @@ fn build_sequencer_rpc_addr(args: &Args) -> String {
         format!("http://{}:8899", args.sequencer_host)
     } else {
         args.sequencer_rpc_server_addr.clone()
+    }
+}
+
+fn build_sequencer_grpc_addr(args: &Args) -> String {
+    if args.sequencer_grpc_server_addr.is_empty() {
+        format!("http://{}:5005", args.sequencer_host)
+    } else {
+        normalize_grpc_addr(&args.sequencer_grpc_server_addr)
     }
 }
 
@@ -719,6 +968,220 @@ fn derive_http_addr_from_grpc(grpc: SocketAddr, offset: u16) -> SocketAddr {
     SocketAddr::new(grpc.ip(), port)
 }
 
+fn current_unix_timestamp() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default()
+}
+
+struct BootstrapSource {
+    base_url: String,
+    signed_manifest: SignedSnapshotManifest,
+    snapshot_head_slot: u64,
+    signed_head_slot: Option<u64>,
+}
+
+async fn fetch_verified_snapshot_manifest(
+    base_url: &str,
+    sequencer_pubkey: &Pubkey,
+) -> Result<SignedSnapshotManifest, BoxError> {
+    const MAX_ATTEMPTS: u32 = 6;
+    const INITIAL_BACKOFF_MS: u64 = 500;
+    const MAX_BACKOFF_MS: u64 = 5_000;
+    let client = HttpClient::new(base_url.to_string());
+    for attempt in 1..=MAX_ATTEMPTS {
+        match client.get_snapshot_manifest().await {
+            Ok(manifest) => {
+                if !manifest.verify(sequencer_pubkey) {
+                    return Err(config_error(format!(
+                        "snapshot manifest from {base_url} failed signature verification"
+                    )));
+                }
+                match client.ensure_manifest_files_available(&manifest.manifest).await {
+                    Ok(()) => return Ok(manifest),
+                    Err(err) => {
+                        if attempt == MAX_ATTEMPTS {
+                            return Err(err.into());
+                        }
+
+                        let backoff_ms = (INITIAL_BACKOFF_MS << (attempt - 1)).min(MAX_BACKOFF_MS);
+                        warn!(
+                            base_url,
+                            attempt,
+                            max_attempts = MAX_ATTEMPTS,
+                            backoff_ms,
+                            "Snapshot manifest files not ready yet: {err}"
+                        );
+                        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                    }
+                }
+            }
+            Err(err) => {
+                if attempt == MAX_ATTEMPTS {
+                    return Err(err.into());
+                }
+
+                let backoff_ms = (INITIAL_BACKOFF_MS << (attempt - 1)).min(MAX_BACKOFF_MS);
+                warn!(
+                    base_url,
+                    attempt,
+                    max_attempts = MAX_ATTEMPTS,
+                    backoff_ms,
+                    "Failed to fetch snapshot manifest: {err}"
+                );
+                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+            }
+        }
+    }
+
+    unreachable!("snapshot manifest retry loop must return")
+}
+
+async fn fetch_peer_signed_head_slot(grpc_addr: &str, sequencer_pubkey: &Pubkey) -> Result<u64, BoxError> {
+    let mut client = SyncClient::connect(&normalize_grpc_addr(grpc_addr)).await?;
+    let status = client.get_peer_status().await?;
+    let signed = status.latest_signed_finalization.ok_or_else(|| {
+        config_error(format!(
+            "bootstrap source {grpc_addr} is not ready yet: missing signed finalization in peer status"
+        ))
+    })?;
+    if !verify_signed_finalization(&signed, sequencer_pubkey) {
+        return Err(config_error(format!(
+            "bootstrap source {grpc_addr} returned an invalid signed finalization in peer status"
+        )));
+    }
+    Ok(signed.finalization.slot)
+}
+
+async fn fetch_verified_bootstrap_source(
+    base_url: &str,
+    grpc_addr: Option<&str>,
+    sequencer_pubkey: &Pubkey,
+) -> Result<BootstrapSource, BoxError> {
+    let signed_manifest = fetch_verified_snapshot_manifest(base_url, sequencer_pubkey).await?;
+    let snapshot_head_slot = manifest_effective_head_slot(&signed_manifest.manifest)?;
+    let signed_head_slot = if let Some(grpc_addr) = grpc_addr {
+        Some(fetch_peer_signed_head_slot(grpc_addr, sequencer_pubkey).await?)
+    } else {
+        None
+    };
+
+    if let Some(signed_head_slot) = signed_head_slot {
+        if !snapshot_head_is_fresh(snapshot_head_slot, signed_head_slot) {
+            let lag_slots = snapshot_head_lag_slots(snapshot_head_slot, signed_head_slot);
+            return Err(config_error(format!(
+                "snapshot manifest from {base_url} is stale: snapshot head {snapshot_head_slot}, signed head {signed_head_slot}, lag {lag_slots} slots"
+            )));
+        }
+    }
+
+    Ok(BootstrapSource {
+        base_url: base_url.to_string(),
+        signed_manifest,
+        snapshot_head_slot,
+        signed_head_slot,
+    })
+}
+
+async fn resolve_bootstrap_sources(
+    args: &Args,
+    registry_clients: &[Arc<p2p::registry_client::RegistryClient>],
+    self_node_id: [u8; 32],
+    sequencer_pubkey: &Pubkey,
+) -> Result<Vec<BootstrapSource>, BoxError> {
+    if !args.sequencer_http_server_addr.trim().is_empty() {
+        let base_url = normalize_http_addr(args.sequencer_http_server_addr.trim());
+        let grpc_addr = build_sequencer_grpc_addr(args);
+        return Ok(vec![
+            fetch_verified_bootstrap_source(&base_url, Some(&grpc_addr), sequencer_pubkey).await?,
+        ]);
+    }
+
+    const INITIAL_BACKOFF_MS: u64 = 500;
+    const MAX_BACKOFF_MS: u64 = 5_000;
+    let mut attempt = 1u32;
+    loop {
+        let mut candidates = Vec::new();
+        let seen = DashSet::new();
+        for registry_client in registry_clients {
+            let peers = match registry_client.list().await {
+                Ok(peers) => peers,
+                Err(err) => {
+                    warn!(
+                        base_url = registry_client.base_url(),
+                        "Failed to query registry for bootstrap source: {err}"
+                    );
+                    continue;
+                }
+            };
+            for peer in peers {
+                if peer.node_id == self_node_id {
+                    continue;
+                }
+                let Some(base_url) = derive_registry_base_from_grpc_addr(&peer.grpc_addr, args.registry_port_offset)
+                else {
+                    continue;
+                };
+                if !seen.insert(base_url.clone()) {
+                    continue;
+                }
+                candidates.push((peer.grpc_addr, base_url));
+            }
+        }
+
+        let mut usable_sources = Vec::new();
+        for (grpc_addr, base_url) in candidates {
+            match fetch_verified_bootstrap_source(&base_url, Some(&grpc_addr), sequencer_pubkey).await {
+                Ok(source) => {
+                    info!(
+                        base_url = base_url.as_str(),
+                        grpc_addr = grpc_addr.as_str(),
+                        snapshot_head_slot = source.snapshot_head_slot,
+                        signed_head_slot = source.signed_head_slot.unwrap_or_default(),
+                        "Found bootstrap snapshot source"
+                    );
+                    usable_sources.push(source);
+                }
+                Err(err) => {
+                    warn!(
+                        base_url = base_url.as_str(),
+                        grpc_addr = grpc_addr.as_str(),
+                        "Skipping bootstrap snapshot source: {err}"
+                    );
+                }
+            }
+        }
+
+        if !usable_sources.is_empty() {
+            usable_sources.sort_by(|a, b| {
+                b.snapshot_head_slot
+                    .cmp(&a.snapshot_head_slot)
+                    .then_with(|| {
+                        b.signed_head_slot
+                            .unwrap_or_default()
+                            .cmp(&a.signed_head_slot.unwrap_or_default())
+                    })
+                    .then_with(|| {
+                        b.signed_manifest
+                            .manifest
+                            .checkpoint_slot
+                            .cmp(&a.signed_manifest.manifest.checkpoint_slot)
+                    })
+            });
+            return Ok(usable_sources);
+        }
+
+        let backoff_ms = (INITIAL_BACKOFF_MS << (attempt - 1)).min(MAX_BACKOFF_MS);
+        warn!(
+            attempt,
+            backoff_ms, "No usable registry-discovered snapshot source yet; retrying"
+        );
+        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+        attempt += 1;
+    }
+}
+
 fn main() -> Result<(), BoxError> {
     #[cfg(feature = "track_oom")]
     memory::init_jemalloc_profiling();
@@ -736,6 +1199,9 @@ async fn do_main() -> Result<(), BoxError> {
     pyroscope::init_pyroscope("rpc-v2");
 
     let args = Args::parse();
+    let local_db_path = resolve_local_db_path(&args);
+    configure_db_root_path(local_db_path.clone());
+    info!("Using local snapshot DB path {}", local_db_path.display());
     init_metrics(args.metric_addr)?;
 
     let http_listen_addr = args
@@ -797,55 +1263,38 @@ async fn do_main() -> Result<(), BoxError> {
     spawn_registry_fisherman_task(rpc_registry.clone(), sequencer_pubkey);
 
     let batch_broadcaster = Arc::new(TransactionBatchBroadcaster::new());
-    let (forward_tx, forward_rx) = mpsc::channel(1024);
+    let topology_keypair = Arc::new(Keypair::new());
+    let notification_deduper = notification_dedupe::NotificationDeduper::default();
+    let live_forwarding_ready = Arc::new(AtomicBool::new(false));
+    let (forward_tx, forward_rx) = mpsc::channel(FORWARD_NOTIFICATION_BUFFER);
     let e2e_sender = if args.e2e_enable {
-        Some(forward_tx.clone())
+        let (e2e_tx, mut e2e_rx) = mpsc::channel(1024);
+        let bootstrap_forward_tx = forward_tx.clone();
+        let live_forwarding_ready = live_forwarding_ready.clone();
+        tokio::spawn(async move {
+            while let Some(notification) = e2e_rx.recv().await {
+                if !live_forwarding_ready.load(Ordering::SeqCst) {
+                    continue;
+                }
+                if bootstrap_forward_tx.send(notification).await.is_err() {
+                    break;
+                }
+            }
+        });
+        Some(e2e_tx)
     } else {
         None
     };
-    setup_downstream_grpc(
+    let peer_status_updater = setup_downstream_grpc(
         batch_broadcaster.clone(),
         args.grpc_listen_addr,
         advertised_grpc_addr.clone(),
+        topology_keypair.clone(),
         e2e_sender,
     )
     .await?;
 
     let grpc_config = prepare_grpc_client_config(&args)?;
-    // Start local HTTP server (serves /rpc/set registry + snapshots).
-    let rpc_registry_for_http = rpc_registry.clone();
-    let http_db_path = DB_DIRECTORY.to_string();
-    let http_slots_path = args.local_slots_path.to_string_lossy().to_string();
-    let sequencer_http_addr = build_http_server_addr(&args);
-    tokio::spawn(async move {
-        if let Err(e) = infinisvm_sync::http::start_http_server(
-            http_listen_addr,
-            http_db_path,
-            http_slots_path,
-            rpc_registry_for_http,
-            Some(sequencer_pubkey),
-        )
-        .await
-        {
-            error!("rpc-v2 http server failed: {e}");
-        }
-    });
-
-    let http_client = Arc::new(HttpClient::new(sequencer_http_addr));
-
-    let snapshots = http_client.get_snapshots().await?;
-    info!("Successfully got snapshots: {:?}", snapshots.get_ckpts_to_download());
-
-    let (indexer, indexer_rpc) = create_indexer(&args).await;
-
-    let exit = Arc::new(AtomicBool::new(false));
-    let bank = Arc::new(RwLock::new(Bank::new_slave(exit.clone())));
-
-    // handle subscriptions from others
-    let subscription_processor = Arc::new(SubscriptionProcessor::new());
-    let total_transaction_count = Arc::new(AtomicU64::new(0));
-    let samples = Arc::new(RwLock::new((Instant::now(), VecDeque::new())));
-
     let registry_addrs = build_registry_addrs(&args)
         .into_iter()
         .map(|addr| normalize_http_addr(&addr))
@@ -859,6 +1308,40 @@ async fn do_main() -> Result<(), BoxError> {
         return Err(config_error("No registry addresses configured"));
     }
 
+    let bootstrap_sources =
+        resolve_bootstrap_sources(&args, &registry_clients, self_node_id, &sequencer_pubkey).await?;
+    let snapshot_manifest_store = SnapshotManifestStore::default();
+
+    // Start local HTTP server (serves /rpc/set registry + snapshots).
+    let rpc_registry_for_http = rpc_registry.clone();
+    let http_db_path = local_db_path.to_string_lossy().to_string();
+    let http_slots_path = args.local_slots_path.to_string_lossy().to_string();
+    let snapshot_manifest_store_for_http = snapshot_manifest_store.clone();
+    tokio::spawn(async move {
+        if let Err(e) = infinisvm_sync::http::start_http_server(
+            http_listen_addr,
+            http_db_path,
+            http_slots_path,
+            rpc_registry_for_http,
+            Some(sequencer_pubkey),
+            snapshot_manifest_store_for_http,
+        )
+        .await
+        {
+            error!("rpc-v2 http server failed: {e}");
+        }
+    });
+
+    let (indexer, indexer_rpc) = create_indexer(&args).await;
+
+    let exit = Arc::new(AtomicBool::new(false));
+    let bank = Arc::new(RwLock::new(Bank::new_slave(exit.clone())));
+
+    // handle subscriptions from others
+    let subscription_processor = Arc::new(SubscriptionProcessor::new());
+    let total_transaction_count = Arc::new(AtomicU64::new(0));
+    let samples = Arc::new(RwLock::new((Instant::now(), VecDeque::new())));
+
     // Track known registry endpoints so we can keep discovering peers by asking
     // newly found nodes for their /rpc/set.
     let known_registries: Arc<DashSet<String>> = Arc::new(DashSet::new());
@@ -867,7 +1350,7 @@ async fn do_main() -> Result<(), BoxError> {
     }
 
     let (signed_finalization_slot_tx, signed_finalization_slot_rx) = watch::channel(0u64);
-    let peer_manager = Arc::new(p2p::PeerManager::new(sequencer_pubkey));
+    let peer_manager = Arc::new(p2p::PeerManager::new(self_node_id, sequencer_pubkey));
 
     let peer_manager_registry = peer_manager.clone();
     let registry_poll_clients = registry_clients.clone();
@@ -907,11 +1390,6 @@ async fn do_main() -> Result<(), BoxError> {
                         continue;
                     }
 
-                    // Merge into our local registry so other nodes can learn from us.
-                    local_registry
-                        .upsert_peer(peer.node_id, peer.grpc_addr.clone(), peer.score_hint)
-                        .await;
-
                     // Learn the peer's registry endpoint based on the conventional
                     // gRPC->HTTP offset so we can query its /rpc/set in future polls.
                     if let Some(base) = derive_registry_base_from_grpc_addr(&peer.grpc_addr, args.registry_port_offset)
@@ -930,6 +1408,26 @@ async fn do_main() -> Result<(), BoxError> {
 
                     let status = status_client.get_peer_status().await.ok();
                     let node_id = status.as_ref().map(|s| s.node_id).unwrap_or(peer.node_id);
+                    match peer_manager_registry.validate_peer_status(node_id, status.as_ref()) {
+                        p2p::peer_manager::PeerStatusValidation::Valid => {}
+                        p2p::peer_manager::PeerStatusValidation::NotReady(_reason) => {
+                            continue;
+                        }
+                        p2p::peer_manager::PeerStatusValidation::Invalid(reason) => {
+                            warn!(
+                                grpc_addr = peer.grpc_addr.as_str(),
+                                "Evicting peer from local registry due to invalid canary/status: {reason}"
+                            );
+                            let _ = local_registry.evict(node_id).await;
+                            continue;
+                        }
+                    }
+
+                    // Merge into our local registry so other nodes can learn from us.
+                    local_registry
+                        .upsert_peer(node_id, peer.grpc_addr.clone(), peer.score_hint)
+                        .await;
+
                     if peer_manager_registry.has_peer(node_id) {
                         continue;
                     }
@@ -998,8 +1496,15 @@ async fn do_main() -> Result<(), BoxError> {
         peer_manager.clone(),
         sequencer_pubkey,
         batch_broadcaster.clone(),
-        forward_tx.clone(),
-        signed_finalization_slot_tx,
+        StreamForwarderContext {
+            forward_tx: forward_tx.clone(),
+            live_forwarding_ready: live_forwarding_ready.clone(),
+            signed_finalization_slot: signed_finalization_slot_tx,
+            notification_deduper,
+            peer_status_updater,
+            self_node_id,
+            topology_keypair,
+        },
     )
     .await?;
 
@@ -1051,7 +1556,51 @@ async fn do_main() -> Result<(), BoxError> {
         None
     };
 
-    let (handles, db_chain) = cold_start::cold_start(
+    info!("Starting cold start process");
+    counter!("cold_start_attempts_total").increment(1);
+    let cold_start_started_at = Instant::now();
+
+    let mut selected_http_client = None;
+    let mut bootstrap_output = None;
+    for source in bootstrap_sources {
+        snapshot_manifest_store.set_bootstrap_manifest(None).await;
+        let candidate_client = Arc::new(HttpClient::new(source.base_url.clone()));
+        match cold_start::bootstrap_only(
+            candidate_client.clone(),
+            source.signed_manifest,
+            sequencer_pubkey,
+            snapshot_manifest_store.clone(),
+            signed_finalization_slot_rx.clone(),
+        )
+        .await
+        {
+            Ok(output) => {
+                info!(
+                    base_url = source.base_url.as_str(),
+                    "Selected bootstrap snapshot source"
+                );
+                selected_http_client = Some(candidate_client);
+                bootstrap_output = Some(output);
+                break;
+            }
+            Err(err) => {
+                warn!(
+                    base_url = source.base_url.as_str(),
+                    "Bootstrap failed for snapshot source: {err}"
+                );
+            }
+        }
+    }
+
+    let http_client = selected_http_client.ok_or_else(|| {
+        config_error("all usable snapshot sources failed during bootstrap; check peer snapshot files and signatures")
+    })?;
+    let bootstrap_output = bootstrap_output.ok_or_else(|| {
+        config_error("all usable snapshot sources failed during bootstrap; check peer snapshot files and signatures")
+    })?;
+
+    let (handles, db_chain) = cold_start::finish_cold_start(
+        bootstrap_output,
         http_client,
         forward_rx,
         indexer,
@@ -1062,16 +1611,20 @@ async fn do_main() -> Result<(), BoxError> {
         backfill_s3_client,
         sequencer_pubkey,
         start_slot,
+        cold_start_started_at,
     )
     .await?;
     {
         bank.write().unwrap().set_db(db_chain.clone());
     }
+    live_forwarding_ready.store(true, Ordering::SeqCst);
+    info!("Cold start finished; enabling live notification forwarding");
 
     spawn_registry_registration_task(
         registry_addrs.clone(),
         advertised_grpc_addr.clone(),
         signed_finalization_slot_rx,
+        snapshot_manifest_store.clone(),
     );
 
     let (tx_sender, tx_receiver) = crossbeam_channel::unbounded();

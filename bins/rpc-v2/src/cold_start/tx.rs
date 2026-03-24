@@ -14,6 +14,8 @@ use infinisvm_core::{
     bank::{Bank, TransactionStatus},
     indexer::Indexer,
     subscription::SubscriptionProcessor,
+    DEFAULT_DB_MERGE_SLOT_INTERVAL, DEFAULT_FINALIZED_SLOTS_WINDOW_SLOTS, DEFAULT_PENDING_BATCHES_TTL_SLOTS,
+    DEFAULT_SEEN_SHREDS_WINDOW_SLOTS, DEFAULT_STAGED_BATCHES_TTL_SLOTS,
 };
 use infinisvm_db::{
     db_chain::{DBChain, DBMeta},
@@ -42,8 +44,8 @@ use crate::{
 mod shred_manager;
 use self::shred_manager::ShredManager;
 
-const DB_MERGE_SLOT_INTERVAL: u64 = 4;
-const FINALIZED_SLOTS_WINDOW_SLOTS: u64 = 1000;
+const DB_MERGE_SLOT_INTERVAL: u64 = DEFAULT_DB_MERGE_SLOT_INTERVAL;
+const FINALIZED_SLOTS_WINDOW_SLOTS: u64 = DEFAULT_FINALIZED_SLOTS_WINDOW_SLOTS;
 
 /// Spawn the single transaction processor and the prune task.
 ///
@@ -145,19 +147,19 @@ fn spawn_prune_task(
         let seen_window = std::env::var("SEEN_SHREDS_WINDOW_SLOTS")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(300);
+            .unwrap_or(DEFAULT_SEEN_SHREDS_WINDOW_SLOTS);
         let staged_ttl = std::env::var("STAGED_BATCHES_TTL_SLOTS")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(50);
+            .unwrap_or(DEFAULT_STAGED_BATCHES_TTL_SLOTS);
         let finalized_ids_window = std::env::var("FINALIZED_JOB_IDS_WINDOW_SLOTS")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(1000);
+            .unwrap_or(FINALIZED_SLOTS_WINDOW_SLOTS);
         let pending_batches_ttl = std::env::var("PENDING_BATCHES_TTL_SLOTS")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(100);
+            .unwrap_or(DEFAULT_PENDING_BATCHES_TTL_SLOTS);
 
         let mut ticker = tokio::time::interval(Duration::from_secs(prune_interval_secs));
         loop {
@@ -403,9 +405,7 @@ impl SlotProcessor {
                 if marker.num_shreds == 0 {
                     info!(
                         "Received signed finalization marker for empty slot {}, block_timestamp={}, received_unix_timestamp={}",
-                        marker.slot,
-                        marker.block_unix_timestamp,
-                        received_unix_timestamp
+                        marker.slot, marker.block_unix_timestamp, received_unix_timestamp
                     );
                 } else {
                     info!(
@@ -595,7 +595,7 @@ impl SlotProcessor {
 
             if marker.slot < bank_slot {
                 // Do not move the Bank backwards if we finalize out-of-order.
-                bank_writer.set_slot_blockhash(marker.slot, marker.hash);
+                bank_writer.set_slot_metadata(marker.slot, marker.hash, marker.block_unix_timestamp);
             } else {
                 bank_writer.tick_as_slave(marker.slot, marker.hash, marker.block_unix_timestamp);
             }
@@ -1166,12 +1166,18 @@ mod tests {
     impl FinalizerService {
         fn new(keypair: Arc<Keypair>, grpc_addr: String, status_slot: u64, behavior: FinalizerBehavior) -> Self {
             let status_finalization = build_signed_finalization(&keypair, status_slot);
+            let node_id = hashv(&[grpc_addr.as_bytes()]).to_bytes();
             let status = PeerStatus {
-                node_id: hashv(&[grpc_addr.as_bytes()]).to_bytes(),
+                node_id,
                 grpc_addr,
                 rate_limit_per_sec: 0,
                 rate_limit_burst: 0,
-                latest_signed_finalization: Some(status_finalization),
+                latest_signed_finalization: Some(status_finalization.clone()),
+                ancestry_canary: Some(status_finalization),
+                stream_parent: None,
+                canary_path: vec![node_id],
+                topology_pubkey: keypair.pubkey().to_bytes(),
+                ancestry_delegations: Vec::new(),
                 observed_head: status_slot,
                 capabilities: 0,
                 setup: None,
@@ -1250,6 +1256,7 @@ mod tests {
         ) -> Result<Response<GetPeerStatusResponse>, Status> {
             Ok(Response::new(GetPeerStatusResponse {
                 status: self.status.clone(),
+                delegation: None,
             }))
         }
 
@@ -1305,7 +1312,7 @@ mod tests {
         });
 
         let sequencer_pubkey = keypair.pubkey();
-        let manager = PeerManager::new(sequencer_pubkey);
+        let manager = PeerManager::new([9u8; 32], sequencer_pubkey);
 
         let (stream_bad, rpc_bad, status_bad) = connect_peer(addr_bad).await;
         manager.upsert_peer(
@@ -1364,7 +1371,7 @@ mod tests {
         });
 
         let sequencer_pubkey = keypair.pubkey();
-        let manager = PeerManager::new(sequencer_pubkey);
+        let manager = PeerManager::new([9u8; 32], sequencer_pubkey);
 
         let (stream_err, rpc_err, status_err) = connect_peer(addr_err).await;
         manager.upsert_peer(
@@ -1429,7 +1436,7 @@ mod tests {
         });
 
         let sequencer_pubkey = keypair.pubkey();
-        let manager = PeerManager::new(sequencer_pubkey);
+        let manager = PeerManager::new([9u8; 32], sequencer_pubkey);
 
         let (stream_nf, rpc_nf, status_nf) = connect_peer(addr_not_found).await;
         manager.upsert_peer(
@@ -1471,7 +1478,7 @@ mod tests {
         });
 
         let sequencer_pubkey = keypair.pubkey();
-        let peer_manager = Arc::new(PeerManager::new(sequencer_pubkey));
+        let peer_manager = Arc::new(PeerManager::new([9u8; 32], sequencer_pubkey));
 
         let (stream, rpc, status) = connect_peer(addr_err).await;
         peer_manager.upsert_peer(
@@ -1506,7 +1513,7 @@ mod tests {
         });
 
         let sequencer_pubkey = keypair.pubkey();
-        let peer_manager = Arc::new(PeerManager::new(sequencer_pubkey));
+        let peer_manager = Arc::new(PeerManager::new([9u8; 32], sequencer_pubkey));
 
         let (stream, rpc, status) = connect_peer(addr).await;
         let peer_id = status.node_id;
@@ -1607,7 +1614,7 @@ mod tests {
         let subscription_processor = Arc::new(infinisvm_core::subscription::SubscriptionProcessor::new());
 
         let sequencer_pubkey = Keypair::new().pubkey();
-        let peer_manager = Arc::new(PeerManager::new(sequencer_pubkey));
+        let peer_manager = Arc::new(PeerManager::new([9u8; 32], sequencer_pubkey));
 
         let seen_shreds = Arc::new(DashSet::new());
         let staged_batches: Arc<DashMap<u64, BTreeMap<usize, SyncBatchShred>>> = Arc::new(DashMap::new());

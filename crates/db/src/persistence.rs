@@ -4,6 +4,7 @@ use std::{
     fs::{self, File},
     io::Write,
     path::{Path, PathBuf},
+    sync::OnceLock,
     thread::JoinHandle,
     time::Instant,
 };
@@ -27,8 +28,22 @@ pub struct PersistedInMemoryDB {
 
 pub const DB_DIRECTORY: &str = "/mnt/data/chaindata";
 pub const CHECKPOINT_PREFIX: &str = "ckpt_";
-pub const KEEP_CHECKPOINTS: u64 = 1200;
 const DEFAULT_WAL_PATH: &str = "/mnt/data/slots";
+const BLOCK_TIME_MS: u64 = 50;
+const CHECKPOINT_RETENTION_MS: u64 = 480_000;
+const ACCOUNT_FLUSH_INTERVAL_MS: u64 = 1_600;
+static DB_ROOT_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+const fn slots_for_millis(duration_ms: u64) -> u64 {
+    let mut slots = duration_ms / BLOCK_TIME_MS;
+    if !duration_ms.is_multiple_of(BLOCK_TIME_MS) {
+        slots += 1;
+    }
+    slots
+}
+
+pub const KEEP_CHECKPOINTS: u64 = slots_for_millis(CHECKPOINT_RETENTION_MS);
+const ACCOUNT_FLUSH_INTERVAL_SLOTS: u64 = slots_for_millis(ACCOUNT_FLUSH_INTERVAL_MS);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum DBFile {
@@ -121,10 +136,30 @@ impl Drop for PersistedInMemoryDB {
     }
 }
 
-fn wal_root_path() -> PathBuf {
-    std::env::var("INFINISVM_WAL_PATH")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(DEFAULT_WAL_PATH))
+pub fn configure_db_root_path(path: PathBuf) {
+    if let Some(existing) = DB_ROOT_PATH.get() {
+        assert!(
+            existing == &path,
+            "db root path already configured: {} != {}",
+            existing.display(),
+            path.display()
+        );
+        return;
+    }
+
+    let _ = DB_ROOT_PATH.set(path);
+}
+
+pub fn db_root_path() -> PathBuf {
+    DB_ROOT_PATH
+        .get()
+        .cloned()
+        .unwrap_or_else(|| PathBuf::from(DB_DIRECTORY))
+}
+
+fn should_keep_checkpoint(slot: u64, committed_slot: u64, second_newest_slot: Option<u64>) -> bool {
+    slot >= committed_slot.saturating_sub(KEEP_CHECKPOINTS) ||
+        second_newest_slot.is_some_and(|min_slot| slot >= min_slot)
 }
 
 fn latest_finalized_wal_slot() -> Option<u64> {
@@ -290,7 +325,8 @@ impl PersistedInMemoryDB {
 
     pub fn list_incremental_files(since_slot: u64) -> Vec<PathBuf> {
         let mut files = Vec::new();
-        if let Ok(entries) = std::fs::read_dir(DB_DIRECTORY) {
+        let db_path = db_root_path();
+        if let Ok(entries) = std::fs::read_dir(&db_path) {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if let Some(db_file) = DBFile::from_path(&path) {
@@ -309,7 +345,8 @@ impl PersistedInMemoryDB {
 
     pub fn list_ckpt_files() -> Vec<DBFile> {
         let mut files = Vec::new();
-        if let Ok(entries) = std::fs::read_dir(DB_DIRECTORY) {
+        let db_path = db_root_path();
+        if let Ok(entries) = std::fs::read_dir(&db_path) {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if let Some(db_file) = DBFile::from_path(&path) {
@@ -324,10 +361,11 @@ impl PersistedInMemoryDB {
 
     #[tracing::instrument(skip_all)]
     pub fn load_from_disk_no_wal(&mut self) -> (u64, Vec<PathBuf>) {
+        let db_path = db_root_path();
         // Create DB_DIRECTORY if it doesn't exist
-        if !std::path::Path::new(DB_DIRECTORY).exists() {
-            std::fs::create_dir_all(DB_DIRECTORY).unwrap();
-            info!("Created directory: {}", DB_DIRECTORY);
+        if !db_path.exists() {
+            std::fs::create_dir_all(&db_path).unwrap();
+            info!("Created directory: {}", db_path.display());
             return (0, vec![]); // Return slot 0 for a new database
         }
 
@@ -339,7 +377,7 @@ impl PersistedInMemoryDB {
         let mut latest_slot = 0u64;
         let mut second_latest_slot = 0u64;
 
-        for entry in std::fs::read_dir(DB_DIRECTORY).unwrap().filter_map(Result::ok) {
+        for entry in std::fs::read_dir(&db_path).unwrap().filter_map(Result::ok) {
             let path = entry.path();
             if let Some(db_file) = DBFile::from_path(&path) {
                 let slot = match db_file {
@@ -464,7 +502,7 @@ impl PersistedInMemoryDB {
         info!("aggregated {} accounts in {:?}", self.accounts.len(), start.elapsed());
 
         // Remove files that are newer than load_until
-        let files_to_remove: Vec<_> = std::fs::read_dir(DB_DIRECTORY)
+        let files_to_remove: Vec<_> = std::fs::read_dir(&db_path)
             .unwrap()
             .filter_map(Result::ok)
             .filter_map(|entry| {
@@ -494,10 +532,11 @@ impl PersistedInMemoryDB {
 
     #[tracing::instrument(skip_all)]
     pub fn load_from_disk_before_wal(&mut self) -> (u64, Vec<PathBuf>) {
+        let db_path = db_root_path();
         // Create DB_DIRECTORY if it doesn't exist
-        if !std::path::Path::new(DB_DIRECTORY).exists() {
-            std::fs::create_dir_all(DB_DIRECTORY).unwrap();
-            info!("Created directory: {}", DB_DIRECTORY);
+        if !db_path.exists() {
+            std::fs::create_dir_all(&db_path).unwrap();
+            info!("Created directory: {}", db_path.display());
             return (0, vec![]); // Return slot 0 for a new database
         }
 
@@ -510,7 +549,7 @@ impl PersistedInMemoryDB {
         let mut latest_slot = 0u64;
         let mut second_latest_slot = 0u64;
 
-        for entry in std::fs::read_dir(DB_DIRECTORY).unwrap().filter_map(Result::ok) {
+        for entry in std::fs::read_dir(&db_path).unwrap().filter_map(Result::ok) {
             let path = entry.path();
             if let Some(db_file) = DBFile::from_path(&path) {
                 let slot = match db_file {
@@ -655,7 +694,7 @@ impl PersistedInMemoryDB {
         info!("aggregated {} accounts in {:?}", self.accounts.len(), start.elapsed());
 
         // Remove files that are newer than load_until
-        let files_to_remove: Vec<_> = std::fs::read_dir(DB_DIRECTORY)
+        let files_to_remove: Vec<_> = std::fs::read_dir(&db_path)
             .unwrap()
             .filter_map(Result::ok)
             .filter_map(|entry| {
@@ -682,7 +721,8 @@ impl PersistedInMemoryDB {
 
     pub fn merge_accounts() -> std::io::Result<()> {
         let (mut db, commited_slot, files) = PersistedInMemoryDB::persisted_db_from_disk(false);
-        let checkpoint_path = format!("{DB_DIRECTORY}/{CHECKPOINT_PREFIX}{commited_slot:018}.wip");
+        let db_path = db_root_path();
+        let checkpoint_path = db_path.join(format!("{CHECKPOINT_PREFIX}{commited_slot:018}.wip"));
         let mut file = File::create(&checkpoint_path)?;
 
         // Serialize all accounts to the checkpoint file
@@ -694,22 +734,32 @@ impl PersistedInMemoryDB {
         file.flush()?;
         std::fs::rename(
             &checkpoint_path,
-            format!("{DB_DIRECTORY}/{CHECKPOINT_PREFIX}{commited_slot:018}.bin"),
+            db_path.join(format!("{CHECKPOINT_PREFIX}{commited_slot:018}.bin")),
         )?;
 
         for file in files {
             std::fs::remove_file(file)?;
         }
 
-        for f in PersistedInMemoryDB::list_ckpt_files() {
-            if let DBFile::Checkpoint(slot) = f {
-                if slot < commited_slot.saturating_sub(KEEP_CHECKPOINTS) {
-                    info!("Removing checkpoint file {}", f.to_string());
-                    std::fs::remove_file(format!("{}/{}", DB_DIRECTORY, f.to_string()))?;
-                } else {
-                    info!("Keeping checkpoint file {}", f.to_string());
-                }
+        let mut checkpoint_slots = PersistedInMemoryDB::list_ckpt_files()
+            .into_iter()
+            .filter_map(|f| match f {
+                DBFile::Checkpoint(slot) => Some(slot),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        checkpoint_slots.sort_unstable();
+        let second_newest_slot = checkpoint_slots.iter().rev().nth(1).copied();
+
+        for slot in checkpoint_slots {
+            let file = DBFile::Checkpoint(slot);
+            if should_keep_checkpoint(slot, commited_slot, second_newest_slot) {
+                info!("Keeping checkpoint file {}", file.to_string());
+                continue;
             }
+
+            info!("Removing checkpoint file {}", file.to_string());
+            std::fs::remove_file(db_path.join(file.to_string()))?;
         }
 
         Ok(())
@@ -719,7 +769,7 @@ impl PersistedInMemoryDB {
     /// and persist them to disk if `persisted` is true.
     /// Returns true if there is available changes
     pub fn commit_changes(&mut self, slot: u64) -> bool {
-        if slot.is_multiple_of(4) && !self.uncommitted_accounts.is_empty() {
+        if slot.is_multiple_of(ACCOUNT_FLUSH_INTERVAL_SLOTS) && !self.uncommitted_accounts.is_empty() {
             let accounts = std::mem::take(&mut self.uncommitted_accounts);
 
             // Extend the accounts map with the uncommitted accounts
@@ -729,9 +779,10 @@ impl PersistedInMemoryDB {
 
             if self.persisted {
                 let accounts = accounts;
+                let db_path = db_root_path();
                 // Use std::thread instead of tokio to avoid runtime dependency
                 let task = std::thread::spawn(move || {
-                    let filename = format!("{DB_DIRECTORY}/accounts_{slot:018}.bin");
+                    let filename = db_path.join(format!("accounts_{slot:018}.bin"));
                     info!("Committing accounts to disk for slot {}", slot);
 
                     // Unlikely to fail, unless under critical error
@@ -762,6 +813,14 @@ impl PersistedInMemoryDB {
     }
 }
 
+fn wal_root_path() -> PathBuf {
+    std::env::var("INFINISVM_WAL_PATH")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_WAL_PATH))
+}
+
 impl Database for PersistedInMemoryDB {
     fn get_account(&self, pubkey: Pubkey) -> eyre::Result<Option<AccountSharedData>> {
         Ok(self
@@ -789,5 +848,24 @@ impl Database for PersistedInMemoryDB {
 
     fn commit_changes_raw(&mut self, changes: Vec<(Pubkey, AccountSharedData)>) {
         self.accounts.extend(changes);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{should_keep_checkpoint, KEEP_CHECKPOINTS};
+
+    #[test]
+    fn retains_second_newest_checkpoint_even_when_outside_retention_window() {
+        let committed_slot = KEEP_CHECKPOINTS + 10;
+        let second_newest_slot = Some(1);
+
+        assert!(should_keep_checkpoint(
+            committed_slot,
+            committed_slot,
+            second_newest_slot
+        ));
+        assert!(should_keep_checkpoint(1, committed_slot, second_newest_slot));
+        assert!(!should_keep_checkpoint(0, committed_slot, second_newest_slot));
     }
 }
