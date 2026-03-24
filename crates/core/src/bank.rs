@@ -13,7 +13,7 @@ use ahash::{HashSet, HashSetExt};
 use crossbeam_channel::{Receiver, Sender};
 use dashmap::DashMap;
 use hashbrown::HashMap;
-use infinisvm_db::{merger, persistence::PersistedInMemoryDB, Database, SlotHashTimestamp};
+use infinisvm_db::{persistence::PersistedInMemoryDB, Database, SlotHashTimestamp};
 use infinisvm_logger::{info, warn};
 use metrics::gauge;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
@@ -27,7 +27,7 @@ use solana_hash::Hash;
 use solana_program_runtime::loaded_programs::ProgramCacheEntry;
 use solana_pubkey::Pubkey;
 use solana_sdk::{
-    account::{Account, AccountSharedData, ReadableAccount, WritableAccount},
+    account::{Account, AccountSharedData, ReadableAccount},
     clock::Clock,
     ed25519_program,
     epoch_rewards::EpochRewards,
@@ -57,7 +57,7 @@ use solana_svm_transaction::svm_message::SVMMessage;
 
 use crate::{
     blockhash_generator::DummyRpcBlockhashGenerator, fork_graph::EmptyForkGraph, metrics::BankMetrics,
-    scheduler::consumed_job::ConsumedJob, subscription::Notifier, wal_writer, SCHEDULER_WORKER_COUNT,
+    subscription::Notifier,
 };
 
 pub fn get_feature_set() -> FeatureSet {
@@ -128,39 +128,6 @@ macro_rules! init_v3_program {
     }};
 }
 
-// PDA of FeezfYUeAv85jB7uFEBcg8TVZDe11umr6FVgUqS9KC4F + worker_id(u8)
-pub static FEE_ACCOUNTS: [Pubkey; SCHEDULER_WORKER_COUNT] = [
-    Pubkey::from_str_const("FCvMVqjHcUdHybpc4Gw9epWoevw835UuhWvLv3MKtjr8"),
-    Pubkey::from_str_const("AXegJad62JQ4mEoZgGNAs54SeEce6bQ7iJ1HY72jqAEV"),
-    Pubkey::from_str_const("Gew43KABMFtRwX96iAThs8r9MAuEcdhCGQoQUQy641Xy"),
-    Pubkey::from_str_const("E2N1C4eDVrkR56yJVJYuZcGcDbJ1fy7i59NS6Yirc6DB"),
-    Pubkey::from_str_const("CMAazeiF2ssbFaPEcjhYhPQtkCLcGyaXkM9C18tBFP2N"),
-    Pubkey::from_str_const("EujQFYnwMuGvdeKm5fHztHJYg4TJrGB3Whjy7uy8Pttb"),
-    Pubkey::from_str_const("JDo2i8b11ETQiAvjHS1qChHczjaYN2SDJ7z8ZVKAow28"),
-    Pubkey::from_str_const("5HUvbRyDyQm6MK2bxKc9W6cA3griE2H2Pz34v959KEBe"),
-    Pubkey::from_str_const("Ce5dqkNN171ZfAHJQ7WpDK3zF9ha9sKSzjqXpnpmQB4S"),
-    Pubkey::from_str_const("CE7KJLAJ3soio7QsVNPHWWa7PqkwUViDfK2HCQZhE5ga"),
-    Pubkey::from_str_const("EmEzBFMnFXEBNRAaTdqXRxaVX8TLZg3eFTpKfEaaikm6"),
-    Pubkey::from_str_const("4G2dckVTkzVR5RBWRrpaNFbLqpcDs8zGEYCTsc9mdUvN"),
-];
-
-/*
-when executing we don't care about account version
-
-life cycle of normal tx:
-  1. (scheduler) received from somewhere
-  2. (scheduler) put into scheduler buffer
-  3. (scheduler) wait some time and then a batch is created
-  4. (scheduler) lock accounts and send to worker
-  5. (worker)    batch is executed
-  6. (worker)    send back to scheduler to unlock accounts
-  7. (committer) for every tx, check version
-  8. (committer) if good, commit (status cache + versioned db). if not send back to scheduler
-
-life cycle of tx from pre-exec:
-  1. (committer) check account versions
-  2. (committer) if good, commit (status cache + versioned db). if not send back to scheduler (note: we have a trust assumption here)
-*/
 
 #[derive(Debug, Clone)]
 pub enum TransactionStatus {
@@ -193,199 +160,6 @@ pub struct Bank {
 unsafe impl Send for Bank {}
 unsafe impl Sync for Bank {}
 
-// =============================== SEQUENCER_METHODS
-impl Bank {
-    pub fn new(exit: Arc<AtomicBool>, genesis_map: BTreeMap<String, AccountSharedData>) -> Self {
-        let mut hash_generator = DummyRpcBlockhashGenerator::new();
-        let (blockhash_pruner_sender, blockhash_pruner_receiver) = crossbeam_channel::unbounded();
-        let status_cache = Arc::new(DashMap::with_capacity(42_000_000));
-
-        let status_cache_clone = status_cache.clone();
-        let exit_clone = exit.clone();
-        std::thread::Builder::new()
-            .name("blockhashPruner".to_string())
-            .spawn(move || {
-                Bank::pruner_thread(blockhash_pruner_receiver, status_cache_clone, exit_clone);
-            })
-            .unwrap();
-
-        let fork_graph = Arc::new(RwLock::new(EmptyForkGraph));
-
-        let (pdb, slot, hash, timestamp) = if cfg!(feature = "in_memory_db") {
-            let pdb = PersistedInMemoryDB::default();
-            (pdb, 0, Hash::default(), 0)
-        } else {
-            let (pdb, slot, _) = PersistedInMemoryDB::persisted_db_from_disk(true);
-            (pdb, slot + 1, hash_generator.next(), 0)
-        };
-
-        let feature_set = Arc::new(get_feature_set());
-        let transaction_processor = TransactionBatchProcessor::new_uninitialized(slot, 0);
-        transaction_processor
-            .program_cache
-            .write()
-            .unwrap()
-            .set_fork_graph(Arc::downgrade(&fork_graph));
-
-        transaction_processor
-            .program_cache
-            .write()
-            .unwrap()
-            .environments
-            .program_runtime_v1 = Arc::new(
-            create_program_runtime_environment_v1(
-                &feature_set,
-                &ComputeBudget::default(), // CHECKED
-                false,                     /* deployment */
-                false,                     /* debugging_features */
-            )
-            .unwrap(),
-        );
-
-        transaction_processor
-            .program_cache
-            .write()
-            .unwrap()
-            .environments
-            .program_runtime_v2 = Arc::new(create_program_runtime_environment_v2(
-            &ComputeBudget::default(), // CHECKED
-            false,                     /* debugging_features */
-        ));
-
-        // added: clock, rent
-        // todo:  epoch_schedule, epoch_rewards, slot_hashes, stake_history,
-        // last_restart_slot may 20: we may not need epoch_schedule,
-        // epoch_rewards, stake_history         but we may need slot_hashes,
-        // last_restart_slot
-        let sysvar_setter = |pubkey: &Pubkey, callback: &mut dyn FnMut(&[u8])| {
-            if pubkey == &Clock::id() {
-                let clock = Clock {
-                    slot,
-                    epoch: 0,
-                    epoch_start_timestamp: 0,
-                    leader_schedule_epoch: 0,
-                    unix_timestamp: timestamp as i64,
-                };
-                callback(&bincode::serialize(&clock).unwrap());
-            } else if pubkey == &EpochSchedule::id() {
-                let epoch_schedule = EpochSchedule::default();
-                callback(&bincode::serialize(&epoch_schedule).unwrap());
-            } else if pubkey == &EpochRewards::id() {
-                let epoch_rewards = EpochRewards::default();
-                callback(&bincode::serialize(&epoch_rewards).unwrap());
-            } else if pubkey == &Rent::id() {
-                let rent = Rent::default();
-                callback(&bincode::serialize(&rent).unwrap());
-            } else if pubkey == &SlotHashes::id() {
-                let slot_hashes = SlotHashes::default();
-                callback(&bincode::serialize(&slot_hashes).unwrap());
-            } else if pubkey == &StakeHistory::id() {
-                let stake_history = StakeHistory::default();
-                callback(&bincode::serialize(&stake_history).unwrap());
-            } else if pubkey == &LastRestartSlot::id() {
-                let last_restart_slot = LastRestartSlot::default();
-                callback(&bincode::serialize(&last_restart_slot).unwrap());
-            }
-        };
-
-        transaction_processor
-            .sysvar_cache_mut()
-            .fill_missing_entries(sysvar_setter);
-
-        let mut slot_blockhashes = BTreeMap::new();
-        slot_blockhashes.insert(slot, hash);
-        let previous_hashes = Arc::new(RwLock::new(VecDeque::with_capacity(150)));
-        {
-            let mut prev = previous_hashes.write().unwrap();
-            prev.push_back(hash);
-        }
-
-        let mut bank = Self {
-            db: Arc::new(RwLock::new(pdb)),
-            // 350000 tps, expire every 150 slots
-            // we need to store 21000000 txs
-            blockhash_signature_map: DashMap::with_capacity(150),
-            previous_hashes,
-            slot_blockhashes,
-            slot_hash_timestamp: (slot, hash, timestamp),
-            hash_generator,
-
-            blockhash_pruner_sender,
-            status_cache,
-            transaction_processor,
-            _feature_set: feature_set,
-            _fork_graph: fork_graph,
-            fee_structure: FeeStructure {
-                lamports_per_signature: 5000,
-                lamports_per_write_lock: 0,
-                compute_fee_bins: vec![FeeBin { limit: 1400000, fee: 0 }],
-            },
-            subscription_processor: None,
-            metrics: BankMetrics::default(),
-        };
-
-        bank.blockhash_signature_map
-            .insert(hash, HashSet::with_capacity(200_000));
-
-        for builtin in BUILTINS {
-            bank.transaction_processor.add_builtin(
-                &bank,
-                builtin.program_id,
-                builtin.name,
-                ProgramCacheEntry::new_builtin(0, builtin.name.len(), builtin.entrypoint),
-            );
-        }
-
-        if slot == 1 || cfg!(feature = "devnet") {
-            bank.init_hardcoded_accounts(genesis_map);
-        }
-
-        // Replay any WAL entries from the last confirmed slot onwards to restore state
-        if cfg!(not(feature = "in_memory_db")) {
-            let from_slot = bank.get_current_slot();
-            match wal_writer::replay(&mut bank, from_slot) {
-                Ok(applied) => {
-                    if applied > 0 {
-                        info!(
-                            "WAL replay applied {} batch files starting from slot {}",
-                            applied, from_slot
-                        );
-
-                        // IMPORTANT: advance runtime head to the slot AFTER the last replayed slot.
-                        // Otherwise Scheduler will restart from `from_slot` and re-flush/re-finalize
-                        // already-finalized slots, rewriting WAL directories.
-                        if let Some((&last_replayed_slot, _)) = bank.slot_blockhashes.iter().next_back() {
-                            let unix_timestamp = std::time::UNIX_EPOCH.elapsed().unwrap().as_secs();
-                            let next_slot = last_replayed_slot.saturating_add(1);
-                            let next_hash = bank.hash_generator.next();
-
-                            // Make sure next_slot has a staged blockhash and is present in the
-                            // blockhash window/signature map.
-                            bank.stage_blockhash(next_slot, next_hash);
-
-                            // Move the Bank head forward so Scheduler starts from next_slot.
-                            bank.slot_hash_timestamp = (next_slot, next_hash, unix_timestamp);
-
-                            // Keep processor slot roughly aligned with the bank head.
-                            bank.transaction_processor.set_slot(next_slot);
-                            bank.transaction_processor
-                                .program_cache
-                                .write()
-                                .unwrap()
-                                .latest_root_slot = next_slot;
-                        }
-                    }
-                }
-                Err(e) => warn!("WAL replay failed: {}", e),
-            }
-        }
-
-        merger::spawn(exit.clone());
-
-        bank
-    }
-}
-// =============================== END_SEQUENCER_METHODS
 
 impl Bank {
     pub fn set_db(&mut self, db: Arc<RwLock<dyn Database>>) {
@@ -997,112 +771,6 @@ impl Bank {
         self.db.write().unwrap().write_account(*program_id, account);
     }
 
-    pub(crate) fn commit_transactions(&mut self, consumed_jobs: &[ConsumedJob], worker_id: usize) {
-        let mut total_fees = 0;
-        let mut accounts_changed = HashMap::with_capacity(consumed_jobs.len() * 64);
-
-        for consumed_job in consumed_jobs {
-            let ConsumedJob {
-                processed_transaction: processing_result,
-                sanitized_transaction: tx,
-                slot,
-                ..
-            } = consumed_job;
-
-            if processing_result.is_err() {
-                // load error is not execution error
-                continue;
-            }
-
-            let processing_result = processing_result.as_ref().unwrap();
-
-            total_fees += processing_result.fee_details().total_fee();
-
-            // two things to store/do:
-            // 1. account data
-            // 2. program cache entry
-
-            // https://github.com/solayer-labs/agave/blob/d8f33ca6a339cf3ebff6ae541e4b9c6888d7e694/runtime/src/bank.rs#L3947
-
-            // find all accounts modified by tx
-            let collect_capacity = match &processing_result {
-                ProcessedTransaction::Executed(executed_tx) => match executed_tx.execution_details.status {
-                    Ok(_) => tx.message().num_write_locks() as usize,
-                    Err(_) => executed_tx.loaded_transaction.rollback_accounts.count(),
-                },
-                ProcessedTransaction::FeesOnly(fees_only_tx) => fees_only_tx.rollback_accounts.count(),
-            };
-            let mut accounts = Vec::with_capacity(collect_capacity);
-
-            match &processing_result {
-                ProcessedTransaction::Executed(executed_transaction) => {
-                    if executed_transaction.execution_details.status.is_ok() {
-                        collect_accounts_for_successful_tx(
-                            &mut accounts,
-                            tx,
-                            &executed_transaction.loaded_transaction.accounts,
-                        );
-                    } else {
-                        collect_accounts_for_failed_tx(
-                            &mut accounts,
-                            tx,
-                            &executed_transaction.loaded_transaction.rollback_accounts,
-                        )
-                    }
-                }
-                ProcessedTransaction::FeesOnly(fees_only_transaction) => {
-                    collect_accounts_for_failed_tx(&mut accounts, tx, &fees_only_transaction.rollback_accounts)
-                }
-            }
-
-            // store accounts
-            for (address, account) in accounts {
-                accounts_changed.insert(*address, account);
-            }
-
-            // do we need to store program cache?
-            {
-                let mut cache = None;
-                if let ProcessedTransaction::Executed(executed_tx) = processing_result {
-                    let programs_modified_by_tx = &executed_tx.programs_modified_by_tx;
-                    if executed_tx.was_successful() && !programs_modified_by_tx.is_empty() {
-                        cache
-                            .get_or_insert_with(|| self.transaction_processor.program_cache.write().unwrap())
-                            .merge(programs_modified_by_tx);
-                    }
-                }
-            }
-
-            // set status cache
-            let signature = tx.signature();
-            let status = match processing_result {
-                ProcessedTransaction::Executed(executed_tx) => {
-                    TransactionStatus::Executed(executed_tx.execution_details.status.clone().err(), *slot)
-                }
-                ProcessedTransaction::FeesOnly(fees_only_tx) => {
-                    TransactionStatus::Executed(Some(fees_only_tx.load_error.clone()), *slot)
-                }
-            };
-
-            if let Some(subscription_processor) = self.subscription_processor.as_ref() {
-                subscription_processor.notify_signature_update(signature, &status);
-            }
-            self.status_cache.insert(*signature, status);
-        }
-
-        let mut db: std::sync::RwLockWriteGuard<'_, dyn Database> = self.db.write().unwrap();
-        for (address, account) in accounts_changed.into_iter() {
-            db.write_account(address, account.clone());
-        }
-
-        let fee_account = FEE_ACCOUNTS[worker_id];
-        let mut fee_account_data = match db.get_account(fee_account) {
-            Ok(Some(account)) => account,
-            _ => AccountSharedData::default(),
-        };
-        fee_account_data.checked_add_lamports(total_fees).unwrap();
-        db.write_account(fee_account, fee_account_data);
-    }
 
     pub fn db_cloned(&self) -> Arc<RwLock<dyn Database>> {
         self.db.clone()

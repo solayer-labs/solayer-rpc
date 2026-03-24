@@ -2,7 +2,6 @@ use async_trait::async_trait;
 use infinisvm_types::sync::{JobEffects, ShredId};
 use solana_hash::Hash;
 use solana_sdk::signature::Signature;
-pub mod index_worker;
 
 #[derive(Debug, Clone)]
 pub enum SignatureFilters {
