@@ -1,0 +1,100 @@
+name: Release Static Linux RPC Binary
+
+on:
+  push:
+    tags:
+      - "*"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+  BINARIES: "rpc-v2"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.arch }} static rpc-v2 binary (mainnet + devnet)
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: blacksmith-4vcpu-ubuntu-2404
+            target: x86_64-unknown-linux-musl
+          - arch: arm64
+            runner: blacksmith-4vcpu-ubuntu-2404-arm
+            target: aarch64-unknown-linux-musl
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN || github.token }}
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.90.0
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo artifacts
+        uses: useblacksmith/rust-cache@v3
+
+      - name: Build and stage mainnet + devnet binaries
+        run: |
+          set -euo pipefail
+
+          mkdir -p dist
+
+          for network in mainnet devnet; do
+            cargo build --workspace --bins --release --locked --target ${{ matrix.target }} --features "infinisvm-core/${network}"
+
+            for bin in ${BINARIES}; do
+              path="target/${{ matrix.target }}/release/${bin}"
+              [[ -x "$path" ]] || { echo "missing binary: $path"; exit 1; }
+              file "$path" | grep -E "statically linked|static-pie" >/dev/null
+              out="dist/${bin}-linux-${{ matrix.arch }}-${network}"
+              cp "$path" "$out"
+              chmod +x "$out"
+            done
+          done
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: solayer-rpc-linux-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    permissions:
+      contents: write
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: solayer-rpc-linux-*
+          merge-multiple: true
+
+      - name: Publish release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
